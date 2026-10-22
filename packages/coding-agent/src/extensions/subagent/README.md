@@ -74,7 +74,7 @@ Skills are not pasted into the subagent's prompt. The prompt names the tags avai
 | Mode | Parameters |
 |---|---|
 | Single | `agent`, `task` |
-| Parallel | `tasks: [{ agent, task }, ...]` (at most 8, 4 at a time) |
+| Parallel | `tasks: [{ agent, task }, ...]` (at most 8 per call; how many run at once is set by `maxConcurrent`) |
 | Chain | `chain: [{ agent, task }, ...]`, where `{previous}` in a task is replaced by the previous step's output |
 | Continue | `session` (a subagent's name, or a session file path plus `agent`), `task` |
 
@@ -84,6 +84,24 @@ Every new subagent also takes `name` and `description`, at the top level in sing
 - `description` says what the subagent is doing in 2-4 words, such as `Map auth flow`. Without one, the first words of the task are used.
 
 Every mode accepts `cwd`, `extraTools`, and `extraSkillGroups`, at the top level or per task.
+
+## Configuration
+
+`config.json` in this directory sets defaults for every subagent. A trusted project can override any field in `.pi/subagents/config.json`.
+
+```json
+{
+	"coreTools": ["read", "grep", "find", "ls"],
+	"maxConcurrent": 4
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `coreTools` | Tools every subagent gets (see [Tools](#tools)). |
+| `maxConcurrent` | How many subagent processes may run at once in a session. It must be a positive integer; other values are ignored. |
+
+`maxConcurrent` covers every subagent the session starts: parallel tasks, separate `subagent` calls, `session` continuations, and follow-ups sent from the agent view. A subagent beyond the limit waits in a queue with the status `queued` (`◷`), and starts in order when a running one finishes. Esc in the agent view, or aborting the parent's tool call, removes it from the queue. A queued subagent cannot be steered until it starts. The limit is read again before each run, so editing `config.json` takes effect for the next subagent.
 
 ## Sessions
 
@@ -99,7 +117,7 @@ Press `←` twice within 400 ms while the editor is empty (keybinding `app.agent
 |---|---|---|
 | `↑` / `↓` | Select | |
 | `Enter` | Open the selection (the main session closes the view) | Send the input: steers a running subagent, or starts a follow-up on an idle one |
-| `Esc` | Close the view | Abort a running subagent, or go back to the list |
+| `Esc` | Close the view | Abort a running subagent, cancel a queued one, or go back to the list |
 | `←←` | Close the view | Go back to the list (when the input is empty) |
 | `PgUp` / `PgDn`, mouse wheel | Wheel moves the selection | Scroll the transcript |
 | `Ctrl+Home` / `Ctrl+End` | | Jump to the top or bottom of the transcript |

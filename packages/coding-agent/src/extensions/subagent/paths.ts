@@ -4,8 +4,11 @@
  * Bundled assets live next to this file: `agents/`, `skills/<group>/`, and `config.json`. The build copies
  * them to `dist/extensions/subagent/` and, for standalone binaries, to `subagent/` next to the executable.
  *
- * `config.json` holds `{ "coreTools": [...] }`, the tools every subagent gets. A trusted project can
- * replace it with `.pi/subagents/config.json`.
+ * `config.json` holds:
+ * - `coreTools`: the tools every subagent gets
+ * - `maxConcurrent`: how many subagents may run at once; the rest wait in a queue for a free slot
+ *
+ * A trusted project's `.pi/subagents/config.json` overrides any of these fields.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -27,9 +30,10 @@ export function parseNameList(value: unknown): string[] {
 
 export interface SubagentConfig {
 	coreTools: string[];
+	maxConcurrent: number;
 }
 
-const DEFAULT_CONFIG: SubagentConfig = { coreTools: ["read", "grep", "find", "ls"] };
+const DEFAULT_CONFIG: SubagentConfig = { coreTools: ["read", "grep", "find", "ls"], maxConcurrent: 4 };
 
 /** Directory holding the bundled `agents/`, `skills/`, and `config.json`. */
 export function getSubagentAssetsDir(): string {
@@ -47,8 +51,14 @@ function readConfig(filePath: string): Partial<SubagentConfig> | undefined {
 		return undefined;
 	}
 	if (!raw || typeof raw !== "object") return undefined;
-	const coreTools = (raw as { coreTools?: unknown }).coreTools;
-	return Array.isArray(coreTools) ? { coreTools: parseNameList(coreTools) } : {};
+	const { coreTools, maxConcurrent } = raw as { coreTools?: unknown; maxConcurrent?: unknown };
+	const config: Partial<SubagentConfig> = {};
+	if (Array.isArray(coreTools)) config.coreTools = parseNameList(coreTools);
+	// Anything but a positive integer is ignored, so a typo cannot stop subagents from running at all.
+	if (typeof maxConcurrent === "number" && Number.isInteger(maxConcurrent) && maxConcurrent > 0) {
+		config.maxConcurrent = maxConcurrent;
+	}
+	return config;
 }
 
 /** The bundled config, with a trusted project's `.pi/subagents/config.json` applied on top. */

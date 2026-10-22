@@ -106,6 +106,8 @@ export class DoublePressDetector {
 
 function statusIcon(subagent: Subagent, theme: Theme): string {
 	switch (subagent.status) {
+		case "queued":
+			return theme.fg("muted", "◷");
 		case "running":
 			return theme.fg("warning", "⏳");
 		case "done":
@@ -243,7 +245,7 @@ export class AgentView implements Component {
 			return;
 		}
 		if (kb.matches(data, "app.interrupt")) {
-			if (subagent.isRunning) void subagent.abort();
+			if (subagent.isRunning || subagent.isQueued) void subagent.abort();
 			else this.backToList();
 			return;
 		}
@@ -344,7 +346,11 @@ export class AgentView implements Component {
 		];
 		const below = this.scroll.linesBelow;
 		const hint = [
-			subagent.isRunning ? "enter steer · esc abort · ←← agents" : "enter follow up · esc agents",
+			subagent.isQueued
+				? "waiting for a free slot · esc cancel · ←← agents"
+				: subagent.isRunning
+					? "enter steer · esc abort · ←← agents"
+					: "enter follow up · esc agents",
 			"pgup/pgdn/wheel scroll",
 			...(below > 0 ? [`↓ ${below} more`] : []),
 		].join(" · ");

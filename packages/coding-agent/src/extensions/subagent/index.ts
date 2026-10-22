@@ -38,13 +38,13 @@ import {
 	type SkillCatalog,
 	searchSkills,
 } from "./skills.ts";
+import { SlotPool } from "./slots.ts";
 import { AgentView, DoublePressDetector } from "./view.ts";
 
 export const SKILL_SEARCH_TOOL_NAME = "skill_search";
 export const LOAD_SKILL_TOOL_NAME = "load_skill";
 
 const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
 const RunFields = {
@@ -105,23 +105,6 @@ interface RunRequest {
 
 function unique(values: readonly string[]): string[] {
 	return [...new Set(values)];
-}
-
-async function mapWithConcurrencyLimit<TIn, TOut>(
-	items: TIn[],
-	concurrency: number,
-	fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
-	const results: TOut[] = new Array(items.length);
-	let nextIndex = 0;
-	const workers = new Array(Math.max(1, Math.min(concurrency, items.length))).fill(null).map(async () => {
-		while (nextIndex < items.length) {
-			const current = nextIndex++;
-			results[current] = await fn(items[current], current);
-		}
-	});
-	await Promise.all(workers);
-	return results;
 }
 
 function truncateOutput(output: string): string {
@@ -249,6 +232,8 @@ function loadChildCatalog(pi: ExtensionAPI, ctx: ExtensionContext): SkillCatalog
 
 export default function subagentExtension(pi: ExtensionAPI): void {
 	const registry = new SubagentRegistry();
+	/** Shared by every subagent of this session. Its limit is refreshed from config before each run. */
+	const slots = new SlotPool(loadSubagentConfig(null).maxConcurrent);
 	const reportedDiagnostics = new Set<string>();
 	let stopListening: (() => void) | undefined;
 	/** The subagent last opened in the agent view, where the view starts next time. Undefined is the main session. */
@@ -282,9 +267,14 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			return toDetails(subagent, request.step);
 		};
 
+		const projectDir = ctx.isProjectTrusted() ? findProjectSubagentsDir(ctx.cwd) : null;
+		slots.setLimit(loadSubagentConfig(projectDir).maxConcurrent);
+
 		const existing = request.session ? registry.find(request.session) : undefined;
 		if (existing) {
-			if (existing.isRunning) return failedRun(request, existing.id, `Subagent ${existing.id} is still running`);
+			if (existing.isRunning || existing.isQueued) {
+				return failedRun(request, existing.id, `Subagent ${existing.id} is still ${existing.status}`);
+			}
 			return watch(existing, request.task);
 		}
 
@@ -323,6 +313,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			sessionFile: request.session,
 			projectTrusted: ctx.isProjectTrusted(),
 			ui: ctx.hasUI ? ctx.ui : undefined,
+			slots,
 		});
 		registry.add(subagent);
 		return watch(subagent, request.session ? request.task : `Task: ${request.task}`);
@@ -472,21 +463,24 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 					errorMessage: undefined,
 				}));
 				const emit = () => {
-					const done = live.filter((run) => run.status !== "running" && run.status !== "pending").length;
+					const done = live.filter((run) => !["pending", "queued", "running"].includes(run.status)).length;
 					onUpdate?.({
 						content: [{ type: "text", text: `Parallel: ${done}/${live.length} done...` }],
 						details: { mode: "parallel", results: [...live] },
 					});
 				};
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (task, index) => {
-					const run = await runOne({ ...shared, ...task }, ctx, signal, (partial) => {
-						live[index] = partial;
+				// All tasks start together; the slot pool queues those beyond `maxConcurrent`.
+				const results = await Promise.all(
+					params.tasks.map(async (task, index) => {
+						const run = await runOne({ ...shared, ...task }, ctx, signal, (partial) => {
+							live[index] = partial;
+							emit();
+						});
+						live[index] = run;
 						emit();
-					});
-					live[index] = run;
-					emit();
-					return run;
-				});
+						return run;
+					}),
+				);
 				const succeeded = results.filter((run) => !isFailedRun(run)).length;
 				const summaries = results.map((run) => {
 					const status = isFailedRun(run) ? `failed${run.stopReason ? ` (${run.stopReason})` : ""}` : "completed";

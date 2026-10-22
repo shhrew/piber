@@ -2,6 +2,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { Subagent, type SubagentOptions } from "../../../src/extensions/subagent/child.ts";
 import { SubagentRegistry } from "../../../src/extensions/subagent/registry.ts";
+import { SlotPool } from "../../../src/extensions/subagent/slots.ts";
 import { createTestUiContext } from "../harness.ts";
 
 const fakeChild = fileURLToPath(new URL("./fake-rpc-child.mjs", import.meta.url));
@@ -111,5 +112,48 @@ describe("subagent process", () => {
 		await subagent.run("Task: ask");
 
 		expect(subagent.getFinalOutput()).toBe("confirmed: false");
+	});
+
+	it("queues runs beyond the slot limit and starts them when a slot frees up", async () => {
+		const slots = new SlotPool(1);
+		const first = createSubagent("hang", { id: "first", slots });
+		const second = createSubagent("echo", { id: "second", slots });
+
+		const firstRun = first.run("Task: wait");
+		const secondRun = second.run("Task: next");
+		await vi.waitFor(() => expect(texts(first)).toEqual(["Task: wait"]));
+
+		expect(second.status).toBe("queued");
+		expect(second.isQueued).toBe(true);
+		expect(second.isRunning).toBe(false);
+		await expect(second.send("hello")).rejects.toThrow("queued");
+
+		await first.send("finish");
+		await Promise.all([firstRun, secondRun]);
+
+		expect(first.status).toBe("done");
+		expect(second.status).toBe("done");
+		expect(second.getFinalOutput()).toBe("echo: Task: next");
+		expect([slots.running, slots.queued]).toEqual([0, 0]);
+	});
+
+	it("cancels a queued run without starting its process", async () => {
+		const slots = new SlotPool(1);
+		const first = createSubagent("hang", { id: "first", slots });
+		const second = createSubagent("echo", { id: "second", slots });
+		const firstRun = first.run("Task: wait");
+		const secondRun = second.run("Task: never");
+		await vi.waitFor(() => expect(second.status).toBe("queued"));
+
+		await second.abort();
+		await secondRun;
+
+		expect(second.status).toBe("aborted");
+		expect(second.messages).toEqual([]);
+		expect(second.sessionFile).toBeUndefined();
+
+		await first.abort();
+		await firstRun;
+		expect([slots.running, slots.queued]).toEqual([0, 0]);
 	});
 });

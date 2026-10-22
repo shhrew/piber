@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { discoverAgents } from "../../../src/extensions/subagent/agents.ts";
 import { buildChildArgs, Subagent, type SubagentOptions } from "../../../src/extensions/subagent/child.ts";
 import subagentExtension, { planSubagentRun } from "../../../src/extensions/subagent/index.ts";
+import { loadSubagentConfig } from "../../../src/extensions/subagent/paths.ts";
 import { SubagentRegistry } from "../../../src/extensions/subagent/registry.ts";
 import type { SubagentToolDetails } from "../../../src/extensions/subagent/render.ts";
 import { loadSkillGroups, searchSkills } from "../../../src/extensions/subagent/skills.ts";
@@ -168,6 +169,18 @@ describe("subagent run planning", () => {
 
 		expect(plan.tools).toEqual(["read"]);
 		expect(plan.systemPrompt).not.toContain("## Skills");
+	});
+
+	it("reads maxConcurrent from the bundled config, lets a project override it, and ignores invalid values", () => {
+		expect(loadSubagentConfig(null).maxConcurrent).toBe(4);
+
+		const { subagentsDir } = createProject({ "config.json": JSON.stringify({ maxConcurrent: 2 }) });
+		expect(loadSubagentConfig(subagentsDir)).toEqual({ coreTools: ["read", "grep", "find", "ls"], maxConcurrent: 2 });
+
+		for (const invalid of [0, -1, 1.5, "3"]) {
+			const project = createProject({ "config.json": JSON.stringify({ maxConcurrent: invalid }) });
+			expect(loadSubagentConfig(project.subagentsDir).maxConcurrent).toBe(4);
+		}
 	});
 });
 

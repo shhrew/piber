@@ -132,6 +132,7 @@ function getDisplayItems(messages: readonly Message[]): DisplayItem[] {
 }
 
 function statusIcon(run: SubagentRunDetails, theme: Theme): string {
+	if (run.status === "queued") return theme.fg("muted", "◷");
 	if (run.status === "running" || run.status === "pending") return theme.fg("warning", "⏳");
 	return isFailedRun(run) ? theme.fg("error", "✗") : theme.fg("success", "✓");
 }
@@ -195,6 +196,7 @@ function addExpandedRun(container: Container, run: SubagentRunDetails, theme: Th
 function collapsedRun(run: SubagentRunDetails, theme: Theme, limit: number): string {
 	const items = getDisplayItems(run.messages);
 	if (run.errorMessage && isFailedRun(run)) return theme.fg("error", `Error: ${run.errorMessage}`);
+	if (run.status === "queued") return theme.fg("muted", "(queued, waiting for a free slot)");
 	if (items.length === 0) return theme.fg("muted", run.status === "running" ? "(running...)" : "(no output)");
 	return renderDisplayItems(items, theme, false, limit);
 }
@@ -262,16 +264,21 @@ export function renderSubagentResult(
 		return new Text(text + hint, 0, 0);
 	}
 
+	const queued = runs.filter((run) => run.status === "queued").length;
 	const running = runs.filter((run) => run.status === "running" || run.status === "pending").length;
 	const failed = runs.filter(isFailedRun).length;
-	const succeeded = runs.length - running - failed;
+	const succeeded = runs.length - queued - running - failed;
 	const icon =
-		running > 0 ? theme.fg("warning", "⏳") : failed > 0 ? theme.fg("warning", "◐") : theme.fg("success", "✓");
+		running + queued > 0
+			? theme.fg("warning", "⏳")
+			: failed > 0
+				? theme.fg("warning", "◐")
+				: theme.fg("success", "✓");
 	const status =
 		details.mode === "chain"
 			? `${succeeded}/${runs.length} steps`
-			: running > 0
-				? `${succeeded + failed}/${runs.length} done, ${running} running`
+			: running + queued > 0
+				? `${succeeded + failed}/${runs.length} done, ${running} running${queued > 0 ? `, ${queued} queued` : ""}`
 				: `${succeeded}/${runs.length} tasks`;
 	const header = `${icon} ${theme.fg("toolTitle", theme.bold(`${details.mode} `))}${theme.fg("accent", status)}`;
 	const label = (run: SubagentRunDetails) =>

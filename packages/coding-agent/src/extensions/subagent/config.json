@@ -1,3 +1,4 @@
 {
-	"coreTools": ["read", "grep", "find", "ls"]
+	"coreTools": ["read", "grep", "find", "ls"],
+	"maxConcurrent": 2
 }

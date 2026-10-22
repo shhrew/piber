@@ -16,11 +16,13 @@ import type { JsonAgentSessionEvent } from "../../modes/json-event.ts";
 import type { RpcExtensionUIRequest } from "../../modes/rpc/rpc-types.ts";
 import type { AgentSource } from "./agents.ts";
 import { type ChildEvent, ChildRpc } from "./rpc.ts";
+import type { SlotPool } from "./slots.ts";
 
 /** Extension flag that tells a child which skill groups `skill_search` and `load_skill` serve. */
 export const SKILL_GROUPS_FLAG = "subagent-skill-groups";
 
-export type SubagentStatus = "running" | "done" | "failed" | "aborted";
+/** `queued`: waiting for a free slot in the parent's `SlotPool` before its process starts. */
+export type SubagentStatus = "queued" | "running" | "done" | "failed" | "aborted";
 
 export interface SubagentUsage {
 	input: number;
@@ -55,6 +57,8 @@ export interface SubagentOptions {
 	ui?: ExtensionUIContext;
 	/** Command that starts pi. Default: the command that started this process. */
 	command?: { executable: string; args: string[] };
+	/** Limits concurrent subagent processes. Each run waits for a slot here before its process starts. */
+	slots?: SlotPool;
 }
 
 export function emptyUsage(): SubagentUsage {
@@ -118,6 +122,8 @@ export class Subagent {
 	sessionFile: string | undefined;
 	stderr = "";
 	private client: ChildRpc | null = null;
+	/** Set for the whole of a run, queued or not. `abort()` uses it, so an abort is never lost between steps. */
+	private cancel: AbortController | undefined;
 	private listeners = new Set<() => void>();
 
 	constructor(options: SubagentOptions) {
@@ -130,8 +136,9 @@ export class Subagent {
 		return this.options.id;
 	}
 
+	/** Between taking a slot and settling, including while its process starts. */
 	get isRunning(): boolean {
-		return this.client !== null;
+		return this.cancel !== undefined && this.status !== "queued";
 	}
 
 	/** Subscribe to any change: status, messages, streaming text, or usage. */
@@ -152,16 +159,50 @@ export class Subagent {
 		return "";
 	}
 
+	get isQueued(): boolean {
+		return this.cancel !== undefined && this.status === "queued";
+	}
+
 	/**
-	 * Send `message` and wait until the subagent settles. Starts the child process, continuing the session
-	 * file when there is one, and stops it afterwards. Aborting `signal` aborts the subagent.
+	 * Send `message` and wait until the subagent settles. Waits for a free slot first when the parent limits
+	 * concurrency, then starts the child process, continuing the session file when there is one, and stops it
+	 * afterwards. Aborting `signal`, or `abort()`, cancels the wait or aborts the subagent.
 	 */
 	async run(message: string, signal?: AbortSignal): Promise<void> {
-		if (this.client) throw new Error(`Subagent ${this.id} is already running`);
-		this.status = "running";
+		if (this.cancel) throw new Error(`Subagent ${this.id} is already running`);
+		const cancel = new AbortController();
+		this.cancel = cancel;
+		const runSignal = signal ? AbortSignal.any([signal, cancel.signal]) : cancel.signal;
 		this.stopReason = undefined;
 		this.errorMessage = undefined;
+
+		let release: (() => void) | undefined;
+		try {
+			if (this.options.slots) {
+				this.status = "queued";
+				this.emit();
+				try {
+					release = await this.options.slots.acquire(runSignal);
+				} catch {
+					this.status = "aborted";
+					return;
+				}
+			}
+			await this.runProcess(message, runSignal);
+		} finally {
+			release?.();
+			this.cancel = undefined;
+			this.emit();
+		}
+	}
+
+	private async runProcess(message: string, signal: AbortSignal): Promise<void> {
+		this.status = "running";
 		this.emit();
+		if (signal.aborted) {
+			this.status = "aborted";
+			return;
+		}
 
 		const promptDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
 		const promptFile = path.join(promptDir, "system-prompt.md");
@@ -192,12 +233,16 @@ export class Subagent {
 				rejectExit(this.stderr.trim() ? new Error(`${error.message}: ${this.stderr.trim()}`) : error),
 		});
 		this.client = client;
-		const onAbort = () => void this.abort();
+		const onAbort = () => {
+			client.abort().catch(() => {
+				// The process may already be gone; the exit is reported below.
+			});
+		};
 
 		try {
 			client.start();
-			if (signal?.aborted) throw new Error("Subagent was aborted");
-			signal?.addEventListener("abort", onAbort, { once: true });
+			if (signal.aborted) throw new Error("Subagent was aborted");
+			signal.addEventListener("abort", onAbort, { once: true });
 			const state = await Promise.race([client.getState(), exited]);
 			this.sessionFile = state.sessionFile ?? this.sessionFile;
 			if (state.model) this.model = `${state.model.provider}/${state.model.id}`;
@@ -210,12 +255,12 @@ export class Subagent {
 			const { aborted } = await Promise.race([settled, exited]);
 			this.status = aborted ? "aborted" : this.stopReason === "error" ? "failed" : "done";
 		} catch (error) {
-			this.status = signal?.aborted ? "aborted" : "failed";
+			this.status = signal.aborted ? "aborted" : "failed";
 			if (!this.errorMessage && this.status === "failed") {
 				this.errorMessage = error instanceof Error ? error.message : String(error);
 			}
 		} finally {
-			signal?.removeEventListener("abort", onAbort);
+			signal.removeEventListener("abort", onAbort);
 			this.client = null;
 			this.streaming = undefined;
 			await client.stop();
@@ -226,7 +271,9 @@ export class Subagent {
 
 	/** Steer the running subagent, or start a follow-up run when it is idle. */
 	async send(message: string): Promise<void> {
-		if (this.client) {
+		if (this.isQueued) throw new Error("This subagent is queued and has not started yet");
+		if (this.isRunning) {
+			if (!this.client) throw new Error("This subagent is still starting");
 			await this.client.steer(message);
 			return;
 		}
@@ -234,12 +281,9 @@ export class Subagent {
 		await this.run(message);
 	}
 
+	/** Cancel the current run: leave the queue, or abort the running subagent. */
 	async abort(): Promise<void> {
-		try {
-			await this.client?.abort();
-		} catch {
-			// The process may already be gone; run() reports that.
-		}
+		this.cancel?.abort();
 	}
 
 	private emit(): void {
