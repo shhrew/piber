@@ -1,0 +1,3 @@
+{
+	"coreTools": ["read", "grep", "find", "ls"]
+}
