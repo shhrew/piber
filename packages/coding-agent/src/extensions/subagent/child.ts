@@ -33,9 +33,12 @@ export interface SubagentUsage {
 }
 
 export interface SubagentOptions {
+	/** One-word name given by the caller, unique within the parent session. Also the handle for `session`. */
 	id: string;
 	agentName: string;
 	agentSource: AgentSource;
+	/** Short summary of what this subagent is doing, given by the caller. Shown with the id. */
+	description: string;
 	task: string;
 	cwd: string;
 	systemPrompt: string;
@@ -94,7 +97,7 @@ export function buildChildArgs(
 	if (sessionFile) {
 		args.push("--session", sessionFile);
 	} else if (options.sessionDir) {
-		args.push("--session-dir", options.sessionDir, "--name", `${options.agentName}: ${preview(options.task, 60)}`);
+		args.push("--session-dir", options.sessionDir, "--name", `${options.id}: ${preview(options.description, 60)}`);
 	} else {
 		args.push("--no-session");
 	}

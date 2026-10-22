@@ -76,19 +76,24 @@ Skills are not pasted into the subagent's prompt. The prompt names the tags avai
 | Single | `agent`, `task` |
 | Parallel | `tasks: [{ agent, task }, ...]` (at most 8, 4 at a time) |
 | Chain | `chain: [{ agent, task }, ...]`, where `{previous}` in a task is replaced by the previous step's output |
-| Continue | `session` (a subagent id such as `sa1`, or a session file path, plus `agent`), `task` |
+| Continue | `session` (a subagent's name, or a session file path plus `agent`), `task` |
+
+Every new subagent also takes `name` and `description`, at the top level in single mode or per task:
+
+- `name` is one word, such as `auth-scout`. It is lowercased and reduced to letters, digits, `-`, and `_`, and becomes the subagent's id: the agent view lists it, and `session` uses it to continue the subagent. A name already used in this session gets `-2`, `-3`, and so on. Without a name, the agent name is used.
+- `description` says what the subagent is doing in 2-4 words, such as `Map auth flow`. Without one, the first words of the task are used.
 
 Every mode accepts `cwd`, `extraTools`, and `extraSkillGroups`, at the top level or per task.
 
 ## Sessions
 
-Each subagent keeps a normal Pi session file in `<parent session dir>/subagents/<parent session id>/`, named `<agent>: <task>`. The tool result tells the parent model the subagent's id so it can send a follow-up with `session`. You can open any subagent session later with `pi --session <path>`. When the parent runs without a session file (`--no-session`), subagents do not keep one either.
+Each subagent keeps a normal Pi session file in `<parent session dir>/subagents/<parent session id>/`, named `<name>: <description>`. The tool result tells the parent model the subagent's name so it can send a follow-up with `session`. You can open any subagent session later with `pi --session <path>`. When the parent runs without a session file (`--no-session`), subagents do not keep one either.
 
 The child process runs only while the subagent works. A follow-up starts a new process on the same session file.
 
 ## Agent view
 
-Press `←` twice within 400 ms while the editor is empty (keybinding `app.agents.view`, configurable in `keybindings.json`). The view lists the main session and every subagent started in this session.
+Press `←` twice within 400 ms while the editor is empty (keybinding `app.agents.view`, configurable in `keybindings.json`). The view lists the main session and every subagent started in this session, each subagent by name, description, and agent. It starts on the session you last opened in it: the main session at first, then whichever subagent (or the main session) you opened most recently. Going back from a subagent returns to the list on that subagent.
 
 | Key | List | Subagent |
 |---|---|---|

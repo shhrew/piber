@@ -1,11 +1,15 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { discoverAgents } from "../../../src/extensions/subagent/agents.ts";
-import { buildChildArgs, type SubagentOptions } from "../../../src/extensions/subagent/child.ts";
-import { planSubagentRun } from "../../../src/extensions/subagent/index.ts";
+import { buildChildArgs, Subagent, type SubagentOptions } from "../../../src/extensions/subagent/child.ts";
+import subagentExtension, { planSubagentRun } from "../../../src/extensions/subagent/index.ts";
+import { SubagentRegistry } from "../../../src/extensions/subagent/registry.ts";
+import type { SubagentToolDetails } from "../../../src/extensions/subagent/render.ts";
 import { loadSkillGroups, searchSkills } from "../../../src/extensions/subagent/skills.ts";
+import { createHarness, getMessageText, getToolResult } from "../harness.ts";
 
 const tempDirs: string[] = [];
 
@@ -169,10 +173,11 @@ describe("subagent run planning", () => {
 
 describe("subagent child arguments", () => {
 	const options: SubagentOptions = {
-		id: "sa1",
+		id: "diff-review",
 		agentName: "reviewer",
 		agentSource: "bundled",
-		task: "Review the diff",
+		description: "Review the diff",
+		task: "Review the diff in src/ and report problems",
 		cwd: "/work",
 		systemPrompt: "prompt",
 		tools: ["read", "skill_search", "load_skill"],
@@ -200,7 +205,7 @@ describe("subagent child arguments", () => {
 			"--session-dir",
 			"/sessions/subagents/parent",
 			"--name",
-			"reviewer: Review the diff",
+			"diff-review: Review the diff",
 		]);
 	});
 
@@ -217,5 +222,65 @@ describe("subagent child arguments", () => {
 		expect(ephemeral).toContain("--no-session");
 		expect(ephemeral).toContain("--no-tools");
 		expect(ephemeral).not.toContain("--subagent-skill-groups");
+	});
+});
+
+describe("subagent names", () => {
+	it("turns the caller's name into a unique one-word id", () => {
+		const registry = new SubagentRegistry();
+		expect(registry.createId("Auth Scout!")).toBe("auth-scout");
+		expect(registry.createId("  ")).toBe("subagent");
+
+		const common: Omit<SubagentOptions, "id"> = {
+			agentName: "scout",
+			agentSource: "bundled",
+			description: "d",
+			task: "t",
+			cwd: "/",
+			systemPrompt: "",
+			tools: [],
+			skillGroups: [],
+			projectTrusted: false,
+		};
+		registry.add(new Subagent({ ...common, id: registry.createId("auth-scout") }));
+		registry.add(new Subagent({ ...common, id: registry.createId("auth-scout") }));
+
+		expect(registry.list().map((subagent) => subagent.id)).toEqual(["auth-scout", "auth-scout-2"]);
+		expect(registry.find("auth-scout-2")).toBe(registry.list()[1]);
+	});
+
+	it("passes the caller's name and description, or a fallback from the task, into the tool result", async () => {
+		const harness = await createHarness({ extensionFactories: [{ name: "subagent", factory: subagentExtension }] });
+		try {
+			harness.setResponses([
+				fauxAssistantMessage(
+					fauxToolCall("subagent", {
+						tasks: [
+							{
+								agent: "missing",
+								task: "Map the auth flow end to end",
+								name: "Auth Scout",
+								description: "Map auth flow",
+							},
+							{ agent: "missing", task: "Check every migration file for drift" },
+						],
+					}),
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("done"),
+			]);
+
+			await harness.session.prompt("Delegate");
+
+			const result = getToolResult(harness, "subagent");
+			const runs = (result.details as unknown as SubagentToolDetails).results;
+			expect(runs.map((run) => [run.id, run.description])).toEqual([
+				["auth-scout", "Map auth flow"],
+				["missing", "Check every migration file..."],
+			]);
+			expect(getMessageText(result)).toContain('Unknown agent "missing"');
+		} finally {
+			harness.cleanup();
+		}
 	});
 });

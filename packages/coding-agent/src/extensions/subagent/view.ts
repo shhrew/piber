@@ -119,6 +119,16 @@ function oneLine(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
 }
 
+export interface AgentViewOptions {
+	cwd: string;
+	scrollbar: ScrollViewScrollbar;
+	/** Id of the subagent to select first. Undefined, or an id no longer listed, selects the main session. */
+	initialSelection?: string;
+	/** Called when the user opens a session: a subagent id, or undefined for the main session. */
+	onOpen: (id: string | undefined) => void;
+	close: () => void;
+}
+
 function userText(message: Extract<Message, { role: "user" }>): string {
 	if (typeof message.content === "string") return message.content;
 	return message.content
@@ -134,6 +144,7 @@ export class AgentView implements Component {
 	private readonly registry: SubagentRegistry;
 	private readonly cwd: string;
 	private readonly close: () => void;
+	private readonly onOpen: (id: string | undefined) => void;
 	private readonly scrollbar: ScrollViewScrollbar;
 	private readonly scroll = new TranscriptScroll();
 	private scrollbarTimer: NodeJS.Timeout | undefined;
@@ -152,22 +163,21 @@ export class AgentView implements Component {
 		theme: Theme,
 		keybindings: KeybindingsManager,
 		registry: SubagentRegistry,
-		cwd: string,
-		scrollbar: ScrollViewScrollbar,
-		close: () => void,
+		options: AgentViewOptions,
 	) {
 		this.tui = tui;
 		this.theme = theme;
 		this.keybindings = keybindings;
 		this.registry = registry;
-		this.cwd = cwd;
-		this.close = close;
-		this.scrollbar = scrollbar;
+		this.cwd = options.cwd;
+		this.close = options.close;
+		this.onOpen = options.onOpen;
+		this.scrollbar = options.scrollbar;
 		this.input.focused = true;
 		this.input.onSubmit = (value) => this.submit(value);
 		this.unsubscribe = registry.onChange(() => this.tui.requestRender());
-		// Start on the most recent subagent: that is usually the one to look at.
-		this.selected = registry.list().length;
+		// Start where the user last was, so switching between sessions takes one or two keys.
+		this.selected = registry.list().findIndex((subagent) => subagent.id === options.initialSelection) + 1;
 	}
 
 	dispose(): void {
@@ -214,6 +224,7 @@ export class AgentView implements Component {
 			this.selected = (this.selected + 1) % count;
 		} else if (kb.matches(data, "tui.select.confirm")) {
 			const subagent = this.registry.list()[this.selected - 1];
+			this.onOpen(subagent?.id);
 			if (!subagent) {
 				this.close();
 				return;
@@ -309,9 +320,9 @@ export class AgentView implements Component {
 		lines.push(row(0, `${theme.fg("success", "●")} main session`));
 		subagents.forEach((subagent, index) => {
 			const usage = formatUsageStats(subagent.usage);
-			let text = `${statusIcon(subagent, theme)} ${theme.fg("accent", subagent.options.agentName)}`;
-			text += theme.fg("muted", ` ${subagent.id}`);
-			text += ` ${theme.fg("dim", oneLine(subagent.options.task))}`;
+			let text = `${statusIcon(subagent, theme)} ${theme.fg("accent", subagent.id)}`;
+			text += ` ${oneLine(subagent.options.description)}`;
+			text += theme.fg("muted", ` (${subagent.options.agentName})`);
 			const line = row(index + 1, text);
 			const suffix = usage ? `  ${theme.fg("dim", usage)}` : "";
 			const room = width - visibleWidth(suffix);
@@ -328,7 +339,7 @@ export class AgentView implements Component {
 		const theme = this.theme;
 		const status = subagent.isRunning ? "running" : subagent.status;
 		const header = [
-			`${statusIcon(subagent, theme)} ${theme.fg("accent", theme.bold(subagent.options.agentName))}${theme.fg("muted", ` ${subagent.id} · ${status}`)}  ${theme.fg("dim", formatUsageStats(subagent.usage, subagent.model))}`,
+			`${statusIcon(subagent, theme)} ${theme.fg("accent", theme.bold(subagent.id))} ${subagent.options.description}${theme.fg("muted", ` (${subagent.options.agentName}) · ${status}`)}  ${theme.fg("dim", formatUsageStats(subagent.usage, subagent.model))}`,
 			theme.fg("dim", subagent.sessionFile ? `session: ${subagent.sessionFile}` : "no session file"),
 		];
 		const below = this.scroll.linesBelow;

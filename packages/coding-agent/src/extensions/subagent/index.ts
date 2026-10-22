@@ -57,9 +57,22 @@ const RunFields = {
 	),
 };
 
+const NameFields = {
+	name: Type.Optional(
+		Type.String({
+			description:
+				"One-word name for this subagent, such as auth-scout. It identifies the subagent in the agent view and for session.",
+		}),
+	),
+	description: Type.Optional(
+		Type.String({ description: "What this subagent is doing in 2-4 words, such as 'Map auth flow'" }),
+	),
+};
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate. In a chain, {previous} is replaced by the prior output." }),
+	...NameFields,
 	...RunFields,
 });
 
@@ -71,15 +84,18 @@ const SubagentParams = Type.Object({
 	session: Type.Optional(
 		Type.String({
 			description:
-				"Continue an earlier subagent (single mode): its id, such as sa1, or its session file path. `task` is sent as the next message.",
+				"Continue an earlier subagent (single mode): its name, such as auth-scout, or its session file path. `task` is sent as the next message.",
 		}),
 	),
+	...NameFields,
 	...RunFields,
 });
 
 interface RunRequest {
 	agent?: string;
 	task: string;
+	name?: string;
+	description?: string;
 	cwd?: string;
 	extraTools?: string[];
 	extraSkillGroups?: string[];
@@ -117,9 +133,22 @@ function truncateOutput(output: string): string {
 	return `${truncated}\n\n[Output truncated: ${omitted} bytes omitted. Full output is in the subagent's session.]`;
 }
 
+/** The caller's description, or the first words of the task. */
+function describeRun(request: RunRequest): string {
+	const description = request.description?.trim();
+	if (description) return description;
+	const words = request.task
+		.replace(/\{previous\}/g, "")
+		.trim()
+		.split(/\s+/)
+		.filter(Boolean);
+	return words.length > 4 ? `${words.slice(0, 4).join(" ")}...` : words.join(" ");
+}
+
 function toDetails(subagent: Subagent, step?: number): SubagentRunDetails {
 	return {
 		id: subagent.id,
+		description: subagent.options.description,
 		agent: subagent.options.agentName,
 		agentSource: subagent.options.agentSource,
 		task: subagent.options.task,
@@ -137,6 +166,7 @@ function toDetails(subagent: Subagent, step?: number): SubagentRunDetails {
 function failedRun(request: RunRequest, id: string, errorMessage: string): SubagentRunDetails {
 	return {
 		id,
+		description: describeRun(request),
 		agent: request.agent ?? "?",
 		agentSource: "unknown",
 		task: request.task,
@@ -221,6 +251,8 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 	const registry = new SubagentRegistry();
 	const reportedDiagnostics = new Set<string>();
 	let stopListening: (() => void) | undefined;
+	/** The subagent last opened in the agent view, where the view starts next time. Undefined is the main session. */
+	let lastViewed: string | undefined;
 
 	const reportDiagnostics = (catalog: SkillCatalog, ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
@@ -263,7 +295,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			const reason = request.session
 				? `Unknown subagent session "${request.session}". To continue a session file from an earlier pi run, also pass its agent.`
 				: `Unknown agent "${request.agent ?? ""}". Available agents: ${available}.`;
-			return failedRun(request, registry.createId(), reason);
+			return failedRun(request, registry.createId(request.name ?? request.agent ?? "subagent"), reason);
 		}
 
 		const plan = planSubagentRun(agent, request, discovery.projectDir);
@@ -276,9 +308,10 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			: undefined;
 
 		const subagent = new Subagent({
-			id: registry.createId(),
+			id: registry.createId(request.name ?? agent.name),
 			agentName: agent.name,
 			agentSource: agent.source,
+			description: describeRun(request),
 			task: request.task,
 			cwd: request.cwd ?? ctx.cwd,
 			systemPrompt: plan.systemPrompt,
@@ -361,7 +394,8 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		description: [
 			"Delegate tasks to specialized subagents. Each runs in its own process with its own prompt, tools, and session, so its work stays out of your context.",
 			"Modes: single (agent + task), parallel (tasks), chain (sequential, with {previous} replaced by the prior output).",
-			"Pass session with a subagent id to send it a follow-up.",
+			"Give every subagent a one-word name and a 2-4 word description of what it is doing; both show in the agent view, and the name identifies it.",
+			"Pass session with a subagent's name to send it a follow-up.",
 		].join(" "),
 		promptSnippet: "Delegate tasks to specialized subagents with isolated context",
 		parameters: SubagentParams,
@@ -433,7 +467,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 					};
 				}
 				const live: SubagentRunDetails[] = params.tasks.map((task, index) => ({
-					...failedRun({ ...task }, `#${index + 1}`, ""),
+					...failedRun({ ...task }, task.name ?? `#${index + 1}`, ""),
 					status: "pending",
 					errorMessage: undefined,
 				}));
@@ -470,7 +504,14 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			}
 
 			const run = await runOne(
-				{ ...shared, agent: params.agent, task: params.task ?? "", session: params.session },
+				{
+					...shared,
+					agent: params.agent,
+					task: params.task ?? "",
+					name: params.name,
+					description: params.description,
+					session: params.session,
+				},
 				ctx,
 				signal,
 				(partial) =>
@@ -504,6 +545,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => {
 		registry.clear();
+		lastViewed = undefined;
 		stopListening?.();
 		stopListening = undefined;
 		if (ctx.mode !== "tui" || !ctx.hasUI) return;
@@ -517,15 +559,15 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			void ctx.ui
 				.custom<void>(
 					(tui, theme, keybindings, done) =>
-						new AgentView(
-							tui,
-							theme,
-							keybindings,
-							registry,
-							ctx.cwd,
-							pi.getSettings().fullscreenScrollbar ?? "auto",
-							() => done(undefined),
-						),
+						new AgentView(tui, theme, keybindings, registry, {
+							cwd: ctx.cwd,
+							scrollbar: pi.getSettings().fullscreenScrollbar ?? "auto",
+							initialSelection: lastViewed,
+							onOpen: (id) => {
+								lastViewed = id;
+							},
+							close: () => done(undefined),
+						}),
 					{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left" } },
 				)
 				.finally(() => {

@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from "node:util";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it } from "vitest";
@@ -7,7 +8,15 @@ import { SubagentRegistry } from "../../../src/extensions/subagent/registry.ts";
 import { AgentView, TranscriptScroll } from "../../../src/extensions/subagent/view.ts";
 import { initTheme, theme } from "../../../src/modes/interactive/theme/theme.ts";
 
-const KEYS = { enter: "\r", pageUp: "\x1b[5~", pageDown: "\x1b[6~", ctrlHome: "\x1b[1;5H", ctrlEnd: "\x1b[1;5F" };
+const KEYS = {
+	enter: "\r",
+	down: "\x1b[B",
+	left: "\x1b[D",
+	pageUp: "\x1b[5~",
+	pageDown: "\x1b[6~",
+	ctrlHome: "\x1b[1;5H",
+	ctrlEnd: "\x1b[1;5F",
+};
 
 function assistant(text: string): AssistantMessage {
 	return {
@@ -46,13 +55,13 @@ function wheel(delta: number): TuiMouseEvent {
 	};
 }
 
-/** An agent view opened on a finished subagent with `count` messages, in a 20-row terminal. */
-function openView(count: number, scrollbar: "hidden" | "auto" | "always" = "hidden") {
+function createSubagent(id: string, description: string, agentName = "worker"): Subagent {
 	const subagent = new Subagent({
-		id: "sa1",
-		agentName: "worker",
+		id,
+		agentName,
 		agentSource: "bundled",
-		task: "Long task",
+		description,
+		task: `${description} in detail`,
 		cwd: process.cwd(),
 		systemPrompt: "",
 		tools: [],
@@ -60,11 +69,36 @@ function openView(count: number, scrollbar: "hidden" | "auto" | "always" = "hidd
 		projectTrusted: false,
 	});
 	subagent.status = "done";
-	for (let i = 0; i < count; i++) subagent.messages.push(assistant(`msg-${i}`));
+	return subagent;
+}
+
+/** An agent view over `subagents` in an 80x20 terminal. `opened` records each `onOpen` call. */
+function createView(
+	subagents: Subagent[],
+	options: { scrollbar?: "hidden" | "auto" | "always"; initialSelection?: string } = {},
+) {
 	const registry = new SubagentRegistry();
-	registry.add(subagent);
+	for (const subagent of subagents) registry.add(subagent);
+	const opened: Array<string | undefined> = [];
 	const tui = { terminal: { rows: 20 }, requestRender: () => {} } as unknown as TUI;
-	const view = new AgentView(tui, theme, new KeybindingsManager(), registry, process.cwd(), scrollbar, () => {});
+	const view = new AgentView(tui, theme, new KeybindingsManager(), registry, {
+		cwd: process.cwd(),
+		scrollbar: options.scrollbar ?? "hidden",
+		initialSelection: options.initialSelection,
+		onOpen: (id) => opened.push(id),
+		close: () => {},
+	});
+	const lines = () => view.render(80).map((line) => stripVTControlCharacters(line));
+	/** The list row marked as selected. */
+	const selectedRow = () => lines().find((line) => line.startsWith("› "));
+	return { view, lines, selectedRow, opened };
+}
+
+/** An agent view opened on a finished subagent with `count` messages, in a 20-row terminal. */
+function openView(count: number, scrollbar: "hidden" | "auto" | "always" = "hidden") {
+	const subagent = createSubagent("long-run", "Long task");
+	for (let i = 0; i < count; i++) subagent.messages.push(assistant(`msg-${i}`));
+	const { view } = createView([subagent], { scrollbar, initialSelection: "long-run" });
 	view.handleInput(KEYS.enter);
 	const screen = () => view.render(80).join("\n");
 	/** Message numbers visible on screen. */
@@ -145,5 +179,45 @@ describe("subagent agent view scrolling", () => {
 
 		expect(lines.some((line) => line.includes("┃"))).toBe(true);
 		expect(lines.some((line) => line.includes("│"))).toBe(true);
+	});
+});
+
+describe("subagent agent view list", () => {
+	it("lists subagents by name and description, with the agent alongside", () => {
+		const { lines } = createView([createSubagent("auth-scout", "Map auth flow", "scout")]);
+
+		const row = lines().find((line) => line.includes("auth-scout"));
+		expect(row).toContain("auth-scout Map auth flow (scout)");
+		expect(row).not.toContain("in detail");
+	});
+
+	it("starts on the main session until a subagent is opened, then on the last opened session", () => {
+		const subagents = [createSubagent("alpha", "First job"), createSubagent("beta", "Second job")];
+		const first = createView(subagents);
+		expect(first.selectedRow()).toContain("main session");
+
+		first.view.handleInput(KEYS.down);
+		first.view.handleInput(KEYS.down);
+		first.view.handleInput(KEYS.enter);
+		expect(first.opened).toEqual(["beta"]);
+
+		const second = createView(subagents, { initialSelection: "beta" });
+		expect(second.selectedRow()).toContain("beta");
+
+		const missing = createView(subagents, { initialSelection: "gone" });
+		expect(missing.selectedRow()).toContain("main session");
+		missing.view.handleInput(KEYS.enter);
+		expect(missing.opened).toEqual([undefined]);
+	});
+
+	it("returns to the list on the subagent that was open", () => {
+		const subagents = [createSubagent("alpha", "First job"), createSubagent("beta", "Second job")];
+		const { view, selectedRow } = createView(subagents, { initialSelection: "alpha" });
+		view.handleInput(KEYS.enter);
+
+		view.handleInput(KEYS.left);
+		view.handleInput(KEYS.left);
+
+		expect(selectedRow()).toContain("alpha");
 	});
 });

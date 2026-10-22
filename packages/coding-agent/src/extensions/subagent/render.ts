@@ -14,7 +14,10 @@ const COLLAPSED_ITEM_COUNT = 10;
 
 /** One subagent run as stored in the tool result. Plain data, so it survives the session file. */
 export interface SubagentRunDetails {
+	/** The caller-given one-word name. Results stored before names existed hold ids such as `sa1`. */
 	id: string;
+	/** What the subagent is doing, in a few words. Absent in results stored before descriptions existed. */
+	description?: string;
 	agent: string;
 	agentSource: AgentSource | "unknown";
 	task: string;
@@ -162,8 +165,9 @@ function renderDisplayItems(items: DisplayItem[], theme: Theme, expanded: boolea
 }
 
 function runHeader(run: SubagentRunDetails, theme: Theme): string {
-	let header = `${statusIcon(run, theme)} ${theme.fg("toolTitle", theme.bold(run.agent))}`;
-	header += theme.fg("muted", ` (${run.id}, ${run.agentSource})`);
+	let header = `${statusIcon(run, theme)} ${theme.fg("toolTitle", theme.bold(run.id))}`;
+	if (run.description) header += ` ${theme.fg("dim", run.description)}`;
+	header += theme.fg("muted", ` (${run.agent}, ${run.agentSource})`);
 	if (isFailedRun(run)) header += ` ${theme.fg("error", `[${run.stopReason ?? run.status}]`)}`;
 	return header;
 }
@@ -195,11 +199,20 @@ function collapsedRun(run: SubagentRunDetails, theme: Theme, limit: number): str
 	return renderDisplayItems(items, theme, false, limit);
 }
 
+interface SubagentCallStep {
+	agent: string;
+	task: string;
+	name?: string;
+	description?: string;
+}
+
 interface SubagentCallArgs {
 	agent?: string;
 	task?: string;
-	tasks?: Array<{ agent: string; task: string }>;
-	chain?: Array<{ agent: string; task: string }>;
+	name?: string;
+	description?: string;
+	tasks?: SubagentCallStep[];
+	chain?: SubagentCallStep[];
 	session?: string;
 }
 
@@ -211,16 +224,17 @@ export function renderSubagentCall(args: SubagentCallArgs, theme: Theme): Compon
 		const label = args.chain ? `chain (${steps.length} steps)` : `parallel (${steps.length} tasks)`;
 		let text = title + theme.fg("accent", label);
 		steps.slice(0, 3).forEach((step, index) => {
-			const task = preview(step.task.replace(/\{previous\}/g, "").trim(), 40);
+			const summary = step.description ?? preview(step.task.replace(/\{previous\}/g, "").trim(), 40);
 			const prefix = args.chain ? `${theme.fg("muted", `${index + 1}.`)} ` : "";
-			text += `\n  ${prefix}${theme.fg("accent", step.agent)}${theme.fg("dim", ` ${task}`)}`;
+			text += `\n  ${prefix}${theme.fg("accent", step.name ?? step.agent)}${theme.fg("dim", ` ${summary}`)}`;
 		});
 		if (steps.length > 3) text += `\n  ${theme.fg("muted", `... +${steps.length - 3} more`)}`;
 		return new Text(text, 0, 0);
 	}
-	let text = title + theme.fg("accent", args.agent || "...");
-	if (args.session) text += theme.fg("muted", ` (continue ${args.session})`);
-	text += `\n  ${theme.fg("dim", args.task ? preview(args.task, 60) : "...")}`;
+	let text = title + theme.fg("accent", args.session ?? args.name ?? args.agent ?? "...");
+	if (args.session) text += theme.fg("muted", " (continue)");
+	else if (args.agent) text += theme.fg("muted", ` (${args.agent})`);
+	text += `\n  ${theme.fg("dim", args.description ?? (args.task ? preview(args.task, 60) : "..."))}`;
 	return new Text(text, 0, 0);
 }
 

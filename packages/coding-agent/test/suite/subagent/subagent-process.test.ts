@@ -11,6 +11,7 @@ function createSubagent(mode: string, overrides: Partial<SubagentOptions> = {}):
 		id: "sa1",
 		agentName: "worker",
 		agentSource: "bundled",
+		description: "Do the thing",
 		task: "Do the thing",
 		cwd: process.cwd(),
 		systemPrompt: "You are a test agent.",
