@@ -120,6 +120,9 @@ export class Subagent {
 	stopReason: string | undefined;
 	errorMessage: string | undefined;
 	sessionFile: string | undefined;
+	/** When the latest run's process started, and when the latest run ended (also when cancelled while queued). */
+	startedAt: number | undefined;
+	finishedAt: number | undefined;
 	stderr = "";
 	private client: ChildRpc | null = null;
 	/** Set for the whole of a run, queued or not. `abort()` uses it, so an abort is never lost between steps. */
@@ -175,6 +178,7 @@ export class Subagent {
 		const runSignal = signal ? AbortSignal.any([signal, cancel.signal]) : cancel.signal;
 		this.stopReason = undefined;
 		this.errorMessage = undefined;
+		this.finishedAt = undefined;
 
 		let release: (() => void) | undefined;
 		try {
@@ -192,12 +196,14 @@ export class Subagent {
 		} finally {
 			release?.();
 			this.cancel = undefined;
+			this.finishedAt = Date.now();
 			this.emit();
 		}
 	}
 
 	private async runProcess(message: string, signal: AbortSignal): Promise<void> {
 		this.status = "running";
+		this.startedAt = Date.now();
 		this.emit();
 		if (signal.aborted) {
 			this.status = "aborted";
@@ -397,7 +403,10 @@ export class Subagent {
 				return;
 			}
 			case "notify":
-				ui?.notify(label(request.message), request.notifyType);
+				// Info notices (such as per-run token stats) are noise in the parent; warnings and errors still matter.
+				if (request.notifyType === "warning" || request.notifyType === "error") {
+					ui?.notify(label(request.message), request.notifyType);
+				}
 				return;
 			default:
 				// Status, widget, title, and editor-text requests have no meaning outside the child's own UI.

@@ -3,6 +3,7 @@
 // - confirm: ask the parent to confirm, then answer "confirmed: <answer>"
 // - crash: exit with code 3 when prompted
 // - hang: wait after a prompt until a steer ("steered: <message>") or an abort
+// - notify: send an info and a warning notification, then answer like echo
 import { createInterface } from "node:readline";
 
 const mode = process.argv[2];
@@ -60,7 +61,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			if (mode === "crash") process.exit(3);
 			respond(command.id, "prompt", { disposition: "started" });
 			addMessage({ role: "user", content: command.message, timestamp: Date.now() });
-			if (mode === "echo") reply(`echo: ${command.message}`);
+			if (mode === "notify") {
+				write({ type: "extension_ui_request", id: "n-1", method: "notify", message: "TPS 24.8 tok/s", notifyType: "info" });
+				write({ type: "extension_ui_request", id: "n-2", method: "notify", message: "careful", notifyType: "warning" });
+			}
+			if (mode === "echo" || mode === "notify") reply(`echo: ${command.message}`);
 			if (mode === "confirm") {
 				pendingConfirm = "ui-1";
 				write({ type: "extension_ui_request", id: pendingConfirm, method: "confirm", title: "Proceed?", message: "Run it" });

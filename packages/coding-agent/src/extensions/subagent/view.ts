@@ -31,7 +31,7 @@ import { UserMessageComponent } from "../../modes/interactive/components/user-me
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { Subagent } from "./child.ts";
 import type { SubagentRegistry } from "./registry.ts";
-import { formatUsageStats, SPINNER_INTERVAL_MS, spinnerFrame } from "./render.ts";
+import { formatUsageStats, SPINNER_INTERVAL_MS, statusIcon } from "./render.ts";
 
 /** Two presses of the agent-view key within this many milliseconds open or leave the view. */
 export const DOUBLE_PRESS_MS = 400;
@@ -104,19 +104,6 @@ export class DoublePressDetector {
 	}
 }
 
-function statusIcon(subagent: Subagent, theme: Theme): string {
-	switch (subagent.status) {
-		case "queued":
-			return theme.fg("muted", "◷");
-		case "running":
-			return theme.fg("accent", spinnerFrame());
-		case "done":
-			return theme.fg("success", "✓");
-		default:
-			return theme.fg("error", "✗");
-	}
-}
-
 interface ListSection {
 	title: string;
 	subagents: Subagent[];
@@ -140,6 +127,8 @@ export interface AgentViewOptions {
 	scrollbar: ScrollViewScrollbar;
 	/** Id of the subagent to select first. Undefined, or an id no longer listed, selects the main session. */
 	initialSelection?: string;
+	/** Id of a subagent to open straight away, as when chosen from the dock under the composer. */
+	openId?: string;
 	/** Called when the user opens a session: a subagent id, or undefined for the main session. */
 	onOpen: (id: string | undefined) => void;
 	close: () => void;
@@ -202,8 +191,9 @@ export class AgentView implements Component {
 		}, SPINNER_INTERVAL_MS);
 		this.animation.unref();
 		// Start where the user last was, so switching between sessions takes one or two keys.
-		const initial = options.initialSelection;
+		const initial = options.openId ?? options.initialSelection;
 		this.selectedId = initial !== undefined && registry.find(initial) ? initial : undefined;
+		this.open = options.openId === undefined ? undefined : registry.find(options.openId);
 	}
 
 	dispose(): void {
@@ -371,7 +361,7 @@ export class AgentView implements Component {
 			);
 			for (const subagent of section.subagents) {
 				const usage = formatUsageStats(subagent.usage);
-				let text = `${statusIcon(subagent, theme)} ${theme.fg("accent", subagent.id)}`;
+				let text = `${statusIcon(subagent.isRunning ? "running" : subagent.status, theme)} ${theme.fg("accent", subagent.id)}`;
 				text += ` ${oneLine(subagent.options.description)}`;
 				text += theme.fg("muted", ` (${subagent.options.agentName})`);
 				const line = row(subagent.id, text);
@@ -391,7 +381,7 @@ export class AgentView implements Component {
 		const theme = this.theme;
 		const status = subagent.isRunning ? "running" : subagent.status;
 		const header = [
-			`${statusIcon(subagent, theme)} ${theme.fg("accent", theme.bold(subagent.id))} ${subagent.options.description}${theme.fg("muted", ` (${subagent.options.agentName}) · ${status}`)}  ${theme.fg("dim", formatUsageStats(subagent.usage, subagent.model))}`,
+			`${statusIcon(subagent.isRunning ? "running" : subagent.status, theme)} ${theme.fg("accent", theme.bold(subagent.id))} ${subagent.options.description}${theme.fg("muted", ` (${subagent.options.agentName}) · ${status}`)}  ${theme.fg("dim", formatUsageStats(subagent.usage, subagent.model))}`,
 			theme.fg("dim", subagent.sessionFile ? `session: ${subagent.sessionFile}` : "no session file"),
 		];
 		const below = this.scroll.linesBelow;

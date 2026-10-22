@@ -106,6 +106,15 @@ describe("subagent process", () => {
 		expect(subagent.getFinalOutput()).toBe("confirmed: true");
 	});
 
+	it("forwards the child's warnings and errors but not its info notifications", async () => {
+		const notify = vi.fn();
+		const subagent = createSubagent("notify", { ui: createTestUiContext({ notify }) });
+
+		await subagent.run("Task: report");
+
+		expect(notify.mock.calls).toEqual([["[worker] careful", "warning"]]);
+	});
+
 	it("cancels the child's dialogs when there is no parent UI", async () => {
 		const subagent = createSubagent("confirm");
 

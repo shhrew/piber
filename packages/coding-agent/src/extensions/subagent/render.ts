@@ -1,16 +1,22 @@
 /**
- * Transcript rendering for the `subagent` tool.
+ * Compact rendering of subagents: the `subagent` tool in the transcript, and the rows shared with the dock under
+ * the composer. Subagent output never appears here; it lives in the subagent's own session and the agent view.
+ *
+ *     ● Subagent(auth-scout) Map auth flow
+ *       ⎿  ✓ Done · 4 turns · 23s · $0.0123
+ *
+ *     ● Subagents · 2 in parallel
+ *       ⎿  ✓ a-scout  Read a.txt · Done · 3 turns · 12s
+ *          ⠋ b-scout  Read b.txt · read b.txt · 2 turns · 8s
  */
 
 import * as os from "node:os";
-import type { Message } from "@earendil-works/pi-ai";
-import { type Component, Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
+import { type Component, truncateToWidth } from "@earendil-works/pi-tui";
 import { formatReadLineRange } from "../../core/tools/render-utils.ts";
-import { getMarkdownTheme, type Theme } from "../../modes/interactive/theme/theme.ts";
+import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { AgentSource } from "./agents.ts";
 import type { SubagentStatus, SubagentUsage } from "./child.ts";
-
-const COLLAPSED_ITEM_COUNT = 10;
 
 /** The frames and timing of pi-tui's `Loader`, the spinner next to "Working", which does not export them. */
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -38,6 +44,11 @@ export interface SubagentRunDetails {
 	errorMessage?: string;
 	sessionFile?: string;
 	step?: number;
+	/** What a running subagent is doing, from its streaming message. Absent once it stops. */
+	phase?: SubagentPhase;
+	/** When the latest run's process started and settled, in epoch milliseconds. */
+	startedAt?: number;
+	finishedAt?: number;
 }
 
 export interface SubagentToolDetails {
@@ -45,10 +56,22 @@ export interface SubagentToolDetails {
 	results: SubagentRunDetails[];
 }
 
-type ThemeFg = Theme["fg"];
-type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, unknown> };
+/** What one subagent row shows, built from a stored run or a live subagent. */
+export interface SubagentRow {
+	id: string;
+	description?: string;
+	status: SubagentStatus | "pending";
+	usage: SubagentUsage;
+	errorMessage?: string;
+	startedAt?: number;
+	finishedAt?: number;
+	/** The latest tool call, already formatted. */
+	activity?: string;
+}
 
-export function isFailedRun(run: SubagentRunDetails): boolean {
+type ThemeFg = Theme["fg"];
+
+export function isFailedRun(run: { status: SubagentStatus | "pending" }): boolean {
 	return run.status === "failed" || run.status === "aborted";
 }
 
@@ -81,6 +104,15 @@ export function formatUsageStats(usage: Partial<SubagentUsage>, model?: string):
 	if (usage.contextTokens && usage.contextTokens > 0) parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
 	if (model) parts.push(model);
 	return parts.join(" ");
+}
+
+/** `8s`, `1m 05s`, `1h 02m`. */
+export function formatDuration(ms: number): string {
+	const seconds = Math.max(0, Math.floor(ms / 1000));
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+	return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
 }
 
 function shortenPath(p: string): string {
@@ -128,86 +160,107 @@ export function formatToolCall(toolName: string, args: Record<string, unknown>, 
 	}
 }
 
-function getDisplayItems(messages: readonly Message[]): DisplayItem[] {
-	const items: DisplayItem[] = [];
-	for (const message of messages) {
+/** The latest finished tool call, formatted, for rows that show what a subagent last did. */
+export function latestToolCall(messages: readonly Message[], theme: Theme): string | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
 		if (message.role !== "assistant") continue;
-		for (const part of message.content) {
-			if (part.type === "text") items.push({ type: "text", text: part.text });
-			else if (part.type === "toolCall") items.push({ type: "toolCall", name: part.name, args: part.arguments });
+		for (let j = message.content.length - 1; j >= 0; j--) {
+			const part = message.content[j];
+			if (part?.type === "toolCall") return formatToolCall(part.name, part.arguments, theme.fg.bind(theme));
 		}
 	}
-	return items;
+	return undefined;
 }
 
-function statusIcon(run: SubagentRunDetails, theme: Theme): string {
-	if (run.status === "queued") return theme.fg("muted", "◷");
-	if (run.status === "running" || run.status === "pending") return theme.fg("accent", spinnerFrame());
-	return isFailedRun(run) ? theme.fg("error", "✗") : theme.fg("success", "✓");
+/** What a running subagent is doing, coarsely: shown instead of its commands. */
+export type SubagentPhase = "thinking" | "responding" | "working";
+
+/**
+ * The phase from the streaming message's latest part: `thinking` or `responding`, otherwise `working` (calling
+ * tools, or between turns).
+ */
+export function currentPhase(streaming: AssistantMessage | undefined): SubagentPhase {
+	const current = streaming?.content.at(-1);
+	if (current?.type === "thinking") return "thinking";
+	if (current?.type === "text") return "responding";
+	return "working";
 }
 
-function aggregateUsage(runs: readonly SubagentRunDetails[]): Partial<SubagentUsage> {
-	const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
-	for (const run of runs) {
-		total.input += run.usage.input;
-		total.output += run.usage.output;
-		total.cacheRead += run.usage.cacheRead;
-		total.cacheWrite += run.usage.cacheWrite;
-		total.cost += run.usage.cost;
-		total.turns += run.usage.turns;
+export function formatPhase(phase: SubagentPhase, theme: Theme): string {
+	return theme.fg("muted", phase === "thinking" ? "Thinking" : phase === "responding" ? "Responding" : "Working");
+}
+
+export function statusIcon(status: SubagentStatus | "pending", theme: Theme): string {
+	switch (status) {
+		case "queued":
+			return theme.fg("muted", "◷");
+		case "running":
+		case "pending":
+			return theme.fg("accent", spinnerFrame());
+		case "done":
+			return theme.fg("success", "✓");
+		default:
+			return theme.fg("error", "✗");
 	}
-	return total;
 }
 
-function renderDisplayItems(items: DisplayItem[], theme: Theme, expanded: boolean, limit?: number): string {
-	const toShow = limit ? items.slice(-limit) : items;
-	const skipped = limit && items.length > limit ? items.length - limit : 0;
-	let text = skipped > 0 ? theme.fg("muted", `... ${skipped} earlier items\n`) : "";
-	for (const item of toShow) {
-		if (item.type === "text") {
-			const preview = expanded ? item.text : item.text.split("\n").slice(0, 3).join("\n");
-			text += `${theme.fg("toolOutput", preview)}\n`;
-		} else {
-			text += `${theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme))}\n`;
+/**
+ * The status part of a row: `Done · 3 turns · 12s · $0.0100`, `read a.txt · 2 turns · 8s`, `Queued`, ...
+ *
+ * A running row shows its elapsed time up to `now`. Compute the row at render time and pass the render's time;
+ * without `now`, a running row leaves the time out.
+ */
+export function describeRowStatus(row: SubagentRow, theme: Theme, now?: number): string {
+	const dim = (text: string) => theme.fg("dim", text);
+	const stats: string[] = [];
+	if (row.usage.turns) stats.push(`${row.usage.turns} turn${row.usage.turns > 1 ? "s" : ""}`);
+	const end = row.finishedAt ?? now;
+	if (row.startedAt && end !== undefined) stats.push(formatDuration(end - row.startedAt));
+	const suffix = (extra: string[] = []) => {
+		const parts = [...stats, ...extra];
+		return parts.length > 0 ? dim(` · ${parts.join(" · ")}`) : "";
+	};
+	switch (row.status) {
+		case "queued":
+			return theme.fg("muted", "Queued");
+		case "pending":
+			return theme.fg("muted", "Starting");
+		case "running":
+			return (row.activity ?? theme.fg("muted", "Working")) + suffix();
+		case "done":
+			return theme.fg("success", "Done") + suffix(row.usage.cost ? [`$${row.usage.cost.toFixed(4)}`] : []);
+		case "aborted":
+			return theme.fg("error", "Aborted") + suffix();
+		default: {
+			const reason = row.errorMessage?.split("\n")[0]?.trim();
+			return theme.fg("error", reason ? `Failed: ${reason}` : "Failed") + suffix();
 		}
 	}
-	return text.trimEnd();
 }
 
-function runHeader(run: SubagentRunDetails, theme: Theme): string {
-	let header = `${statusIcon(run, theme)} ${theme.fg("toolTitle", theme.bold(run.id))}`;
-	if (run.description) header += ` ${theme.fg("dim", run.description)}`;
-	header += theme.fg("muted", ` (${run.agent}, ${run.agentSource})`);
-	if (isFailedRun(run)) header += ` ${theme.fg("error", `[${run.stopReason ?? run.status}]`)}`;
-	return header;
+export function rowFromRun(run: SubagentRunDetails, theme: Theme): SubagentRow {
+	return { ...run, activity: run.status === "running" ? formatPhase(run.phase ?? "working", theme) : undefined };
 }
 
-/** A run's tool calls, final output as Markdown, and usage. */
-function addExpandedRun(container: Container, run: SubagentRunDetails, theme: Theme): void {
-	if (run.errorMessage) container.addChild(new Text(theme.fg("error", `Error: ${run.errorMessage}`), 0, 0));
-	container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", run.task), 0, 0));
-	for (const item of getDisplayItems(run.messages)) {
-		if (item.type !== "toolCall") continue;
-		container.addChild(
-			new Text(theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)), 0, 0),
-		);
+/** Lines that never wrap: each is cut to the width with an ellipsis. */
+class SingleLines implements Component {
+	private readonly lines: string[] | (() => string[]);
+
+	/**
+	 * `lines` as a function is called on every render. Rows with a spinner or a running timer need that: the TUI
+	 * redraws often while a subagent runs, but the tool's renderers run only when the subagent reports progress.
+	 */
+	constructor(lines: string[] | (() => string[])) {
+		this.lines = lines;
 	}
-	const finalOutput = getFinalOutput(run.messages);
-	if (finalOutput) {
-		container.addChild(new Spacer(1));
-		container.addChild(new Markdown(finalOutput.trim(), 0, 0, getMarkdownTheme()));
-	}
-	const usage = formatUsageStats(run.usage, run.model);
-	if (usage) container.addChild(new Text(theme.fg("dim", usage), 0, 0));
-	if (run.sessionFile) container.addChild(new Text(theme.fg("dim", `session: ${shortenPath(run.sessionFile)}`), 0, 0));
-}
 
-function collapsedRun(run: SubagentRunDetails, theme: Theme, limit: number): string {
-	const items = getDisplayItems(run.messages);
-	if (run.errorMessage && isFailedRun(run)) return theme.fg("error", `Error: ${run.errorMessage}`);
-	if (run.status === "queued") return theme.fg("muted", "(queued, waiting for a free slot)");
-	if (items.length === 0) return theme.fg("muted", run.status === "running" ? "(running...)" : "(no output)");
-	return renderDisplayItems(items, theme, false, limit);
+	render(width: number): string[] {
+		const lines = typeof this.lines === "function" ? this.lines() : this.lines;
+		return lines.map((line) => truncateToWidth(line, width));
+	}
+
+	invalidate(): void {}
 }
 
 interface SubagentCallStep {
@@ -227,93 +280,79 @@ interface SubagentCallArgs {
 	session?: string;
 }
 
-export function renderSubagentCall(args: SubagentCallArgs, theme: Theme): Component {
-	const preview = (text: string, length: number) => (text.length > length ? `${text.slice(0, length)}...` : text);
-	const title = theme.fg("toolTitle", theme.bold("subagent "));
-	const steps = args.chain ?? args.tasks;
-	if (steps && steps.length > 0) {
-		const label = args.chain ? `chain (${steps.length} steps)` : `parallel (${steps.length} tasks)`;
-		let text = title + theme.fg("accent", label);
-		steps.slice(0, 3).forEach((step, index) => {
-			const summary = step.description ?? preview(step.task.replace(/\{previous\}/g, "").trim(), 40);
-			const prefix = args.chain ? `${theme.fg("muted", `${index + 1}.`)} ` : "";
-			text += `\n  ${prefix}${theme.fg("accent", step.name ?? step.agent)}${theme.fg("dim", ` ${summary}`)}`;
-		});
-		if (steps.length > 3) text += `\n  ${theme.fg("muted", `... +${steps.length - 3} more`)}`;
-		return new Text(text, 0, 0);
-	}
-	let text = title + theme.fg("accent", args.session ?? args.name ?? args.agent ?? "...");
-	if (args.session) text += theme.fg("muted", " (continue)");
-	else if (args.agent) text += theme.fg("muted", ` (${args.agent})`);
-	text += `\n  ${theme.fg("dim", args.description ?? (args.task ? preview(args.task, 60) : "..."))}`;
-	return new Text(text, 0, 0);
+interface CallState {
+	isPartial: boolean;
+	isError: boolean;
+	outputPad: number;
 }
 
+function preview(text: string, length: number): string {
+	const line = text
+		.replace(/\{previous\}/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+	return line.length > length ? `${line.slice(0, length)}...` : line;
+}
+
+/** `● Subagent(name) description`, with the bullet colored by state. */
+export function renderSubagentCall(args: SubagentCallArgs, theme: Theme, state: CallState): Component {
+	const bullet = state.isPartial
+		? theme.fg("accent", "●")
+		: state.isError
+			? theme.fg("error", "●")
+			: theme.fg("success", "●");
+	const pad = " ".repeat(state.outputPad);
+	const steps = args.chain ?? args.tasks;
+	if (steps && steps.length > 0) {
+		const shape = args.chain ? `${steps.length} in a chain` : `${steps.length} in parallel`;
+		return new SingleLines([`${pad}${bullet} ${theme.bold("Subagents")} ${theme.fg("dim", `· ${shape}`)}`]);
+	}
+	const name = args.session ?? args.name ?? args.agent ?? "...";
+	const summary = args.session
+		? `follow-up: ${preview(args.task ?? "", 50)}`
+		: (args.description ?? preview(args.task ?? "", 50));
+	const title = `${theme.bold("Subagent")}${theme.fg("muted", "(")}${theme.fg("accent", name)}${theme.fg("muted", ")")}`;
+	return new SingleLines([`${pad}${bullet} ${title} ${theme.fg("dim", summary)}`]);
+}
+
+/**
+ * `⎿` lines under the call: the status of the run, or one row per run for parallel and chain calls. Running rows
+ * show a phase, not commands. Expanded (by clicking the call or pressing the expand key), each row gets one more
+ * line with its latest command. Subagent output never appears; it lives in the agent view.
+ */
 export function renderSubagentResult(
 	details: SubagentToolDetails | undefined,
 	fallbackText: string,
-	expanded: boolean,
+	options: { expanded: boolean; isError: boolean; outputPad: number },
 	theme: Theme,
 ): Component {
-	if (!details || details.results.length === 0) return new Text(fallbackText || "(no output)", 0, 0);
-	const runs = details.results;
-	const hint = `\n${theme.fg("muted", "(Ctrl+O to expand, ←← for the agent view)")}`;
-
-	if (details.mode === "single") {
-		const run = runs[0];
-		if (expanded) {
-			const container = new Container();
-			container.addChild(new Text(runHeader(run, theme), 0, 0));
-			addExpandedRun(container, run, theme);
-			return container;
-		}
-		let text = `${runHeader(run, theme)}\n${collapsedRun(run, theme, COLLAPSED_ITEM_COUNT)}`;
-		const usage = formatUsageStats(run.usage, run.model);
-		if (usage) text += `\n${theme.fg("dim", usage)}`;
-		return new Text(text + hint, 0, 0);
+	const pad = " ".repeat(options.outputPad);
+	const elbow = `${pad}  ${theme.fg("muted", "⎿")}  `;
+	const indent = `${pad}     `;
+	const runs = details?.results ?? [];
+	if (runs.length === 0) {
+		const line = fallbackText.split("\n")[0] || "(no result)";
+		return new SingleLines([elbow + theme.fg(options.isError ? "error" : "dim", line)]);
 	}
 
-	const queued = runs.filter((run) => run.status === "queued").length;
-	const running = runs.filter((run) => run.status === "running" || run.status === "pending").length;
-	const failed = runs.filter(isFailedRun).length;
-	const succeeded = runs.length - queued - running - failed;
-	const icon =
-		running + queued > 0
-			? theme.fg("accent", spinnerFrame())
-			: failed > 0
-				? theme.fg("warning", "◐")
-				: theme.fg("success", "✓");
-	const status =
-		details.mode === "chain"
-			? `${succeeded}/${runs.length} steps`
-			: running + queued > 0
-				? `${succeeded + failed}/${runs.length} done, ${running} running${queued > 0 ? `, ${queued} queued` : ""}`
-				: `${succeeded}/${runs.length} tasks`;
-	const header = `${icon} ${theme.fg("toolTitle", theme.bold(`${details.mode} `))}${theme.fg("accent", status)}`;
-	const label = (run: SubagentRunDetails) =>
-		`${theme.fg("muted", details.mode === "chain" ? `─── Step ${run.step}: ` : "─── ")}${runHeader(run, theme)}`;
-
-	if (expanded && running === 0) {
-		const container = new Container();
-		container.addChild(new Text(header, 0, 0));
-		for (const run of runs) {
-			container.addChild(new Spacer(1));
-			container.addChild(new Text(label(run), 0, 0));
-			addExpandedRun(container, run, theme);
-		}
-		const usage = formatUsageStats(aggregateUsage(runs));
-		if (usage) {
-			container.addChild(new Spacer(1));
-			container.addChild(new Text(theme.fg("dim", `Total: ${usage}`), 0, 0));
-		}
-		return container;
-	}
-
-	let text = header;
-	for (const run of runs) text += `\n\n${label(run)}\n${collapsedRun(run, theme, 5)}`;
-	if (running === 0) {
-		const usage = formatUsageStats(aggregateUsage(runs));
-		if (usage) text += `\n\n${theme.fg("dim", `Total: ${usage}`)}`;
-	}
-	return new Text(text + hint, 0, 0);
+	const multi = details?.mode !== "single";
+	const nameWidth = Math.max(...runs.map((run) => run.id.length));
+	// Built on every render, so spinners and running timers advance with each frame.
+	return new SingleLines(() => {
+		const now = Date.now();
+		return runs.flatMap((run, index) => {
+			const row = rowFromRun(run, theme);
+			let line = `${statusIcon(row.status, theme)} `;
+			if (multi) {
+				const step = details?.mode === "chain" ? theme.fg("muted", `${run.step ?? index + 1}. `) : "";
+				line += `${step}${theme.fg("accent", run.id.padEnd(nameWidth))}  `;
+				if (run.description) line += `${theme.fg("dim", run.description)} ${theme.fg("dim", "·")} `;
+			}
+			const lines = [(index === 0 ? elbow : indent) + line + describeRowStatus(row, theme, now)];
+			const command = options.expanded ? latestToolCall(run.messages, theme) : undefined;
+			// Align under the text after the status icon.
+			if (command) lines.push(`${indent}  ${theme.fg("muted", "→ ")}${command}`);
+			return lines;
+		});
+	});
 }

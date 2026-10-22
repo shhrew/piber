@@ -109,6 +109,38 @@ Each subagent keeps a normal Pi session file in `<parent session dir>/subagents/
 
 The child process runs only while the subagent works. A follow-up starts a new process on the same session file.
 
+## In the main session
+
+The main chat shows each `subagent` call as a compact line with one status row per subagent. Subagent output never appears in the main chat; read it in the [agent view](#agent-view).
+
+```
+● Subagents · 2 in parallel
+  ⎿  ✓ scout-a  Read a.txt · Done · 3 turns · 26s
+     ⠋ scout-b  Read b.txt · Thinking · 2 turns · 8s
+```
+
+The bullet turns green when the call succeeds and red when it fails. A running row shows only a phase, as in the dock: `Thinking`, `Responding`, or `Working`. Clicking the call or pressing Ctrl+O adds the latest command each subagent ran (`→ read a.txt`) under its row. A subagent's task, session, and output are in the agent view.
+
+### Dock
+
+A short list under the composer shows what is happening now: running subagents, then subagents that finished in the last 10 seconds, at most 4 rows. A running row shows only a phase: `Thinking`, `Responding`, or `Working` (calling tools, or between turns). Queued subagents are only counted. The dock renders nothing when there is nothing to show.
+
+```
+  ⠋ scout-a  Read a.txt · Thinking · 2 turns · 8s
+  ✓ scout-b  Read b.txt · Done · 2 turns · 36s
+  +1 more · ◷ 2 queued
+```
+
+| Key | Action |
+|---|---|
+| `↓` in an empty composer | Select the first row |
+| `↑` / `↓` | Move; `↑` on the first row returns to the composer |
+| `Enter` | Open the selected subagent in the agent view |
+| `Esc` | Return to the composer |
+| Any other key | Return to the composer, which then handles the key |
+
+Rows beyond the fourth are reached by moving the selection; the dock shows how many are hidden.
+
 ## Agent view
 
 Press `←` twice within 400 ms while the editor is empty (keybinding `app.agents.view`, configurable in `keybindings.json`). The view lists the main session at the top, then the subagents started in this session under **In progress**, **Queued**, and **Completed** (empty sections are hidden), each by name, description, and agent. Running subagents show a spinner, queued ones `◷`, and finished ones `✓`, or `✗` when they failed or were aborted. Section headers are not selectable: ↑ and ↓ move between rows, and the selection stays on a subagent as it moves from one section to the next. It starts on the session you last opened in it: the main session at first, then whichever subagent (or the main session) you opened most recently. Going back from a subagent returns to the list on that subagent.
@@ -124,7 +156,7 @@ Press `←` twice within 400 ms while the editor is empty (keybinding `app.agent
 
 The transcript scrolls like the fullscreen transcript. It uses the same configurable `tui.altScreen.*` keys (page, half-page, and line actions; the half-page and line actions have no default key). It follows new output until you scroll up, then holds its position and shows how many lines are below. Scrolling back to the bottom resumes following. The scrollbar follows the `fullscreenScrollbar` setting.
 
-Dialogs from a subagent's extensions (confirm, select, input) appear in the parent, prefixed with the agent name.
+Dialogs from a subagent's extensions (confirm, select, input) appear in the parent, prefixed with the agent name. So do their warning and error notifications; info notifications, such as per-run token statistics, are dropped.
 
 ## Files
 
@@ -137,6 +169,8 @@ Dialogs from a subagent's extensions (confirm, select, input) appear in the pare
 | `rpc.ts` | RPC client for the child process |
 | `registry.ts` | Subagents started in this session |
 | `view.ts` | The agent view |
+| `dock.ts` | The dock under the composer |
+| `slots.ts` | The `maxConcurrent` slot queue |
 | `render.ts` | Tool call and result rendering |
 | `paths.ts` | Bundled asset location and `config.json` |
 

@@ -21,9 +21,11 @@ import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types
 import { stripFrontmatter } from "../../utils/frontmatter.ts";
 import { type AgentConfig, discoverAgents, findProjectSubagentsDir } from "./agents.ts";
 import { emptyUsage, SKILL_GROUPS_FLAG, Subagent } from "./child.ts";
+import { SubagentDock } from "./dock.ts";
 import { loadSubagentConfig, parseNameList } from "./paths.ts";
 import { SubagentRegistry } from "./registry.ts";
 import {
+	currentPhase,
 	getFinalOutput,
 	isFailedRun,
 	renderSubagentCall,
@@ -43,6 +45,8 @@ import { AgentView, DoublePressDetector } from "./view.ts";
 
 export const SKILL_SEARCH_TOOL_NAME = "skill_search";
 export const LOAD_SKILL_TOOL_NAME = "load_skill";
+/** Widget key of the subagent dock under the composer. */
+const DOCK_WIDGET_KEY = "subagents";
 
 const MAX_PARALLEL_TASKS = 8;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
@@ -143,6 +147,9 @@ function toDetails(subagent: Subagent, step?: number): SubagentRunDetails {
 		errorMessage: subagent.errorMessage,
 		sessionFile: subagent.sessionFile,
 		step,
+		startedAt: subagent.startedAt,
+		finishedAt: subagent.finishedAt,
+		phase: subagent.isRunning ? currentPhase(subagent.streaming) : undefined,
 	};
 }
 
@@ -527,13 +534,21 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			};
 		},
 
-		renderCall(args, theme) {
-			return renderSubagentCall(args, theme);
+		// Draw a compact `● Subagent(name)` line with `⎿` status rows instead of the boxed tool block.
+		renderShell: "self",
+
+		renderCall(args, theme, context) {
+			return renderSubagentCall(args, theme, context);
 		},
 
-		renderResult(result, { expanded }, theme) {
+		renderResult(result, { expanded }, theme, context) {
 			const first = result.content[0];
-			return renderSubagentResult(result.details, first?.type === "text" ? first.text : "", expanded, theme);
+			return renderSubagentResult(
+				result.details,
+				first?.type === "text" ? first.text : "",
+				{ expanded, isError: context.isError, outputPad: context.outputPad },
+				theme,
+			);
 		},
 	});
 
@@ -544,12 +559,21 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		stopListening = undefined;
 		if (ctx.mode !== "tui" || !ctx.hasUI) return;
 
+		let dock: SubagentDock | undefined;
+		ctx.ui.setWidget(
+			DOCK_WIDGET_KEY,
+			(tui, theme) => {
+				dock = new SubagentDock(tui, theme, registry);
+				return dock;
+			},
+			{ placement: "belowEditor" },
+		);
+
 		const detector = new DoublePressDetector();
 		let viewOpen = false;
-		stopListening = ctx.ui.onTerminalInput((data) => {
-			if (viewOpen || ctx.ui.getEditorText() !== "") return undefined;
-			if (!detector.isDoublePress(data, getKeybindings())) return undefined;
+		const openView = (openId?: string) => {
 			viewOpen = true;
+			if (openId !== undefined) lastViewed = openId;
 			void ctx.ui
 				.custom<void>(
 					(tui, theme, keybindings, done) =>
@@ -557,6 +581,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 							cwd: ctx.cwd,
 							scrollbar: pi.getSettings().fullscreenScrollbar ?? "auto",
 							initialSelection: lastViewed,
+							openId,
 							onOpen: (id) => {
 								lastViewed = id;
 							},
@@ -567,13 +592,37 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 				.finally(() => {
 					viewOpen = false;
 				});
+		};
+
+		stopListening = ctx.ui.onTerminalInput((data) => {
+			if (viewOpen) return undefined;
+			const keybindings = getKeybindings();
+			if (dock?.isFocused) {
+				const result = dock.handleKey(data, keybindings);
+				if (result.type === "open") {
+					openView(result.id);
+					return { consume: true };
+				}
+				if (result.type === "consumed") return { consume: true };
+				// "pass": the dock let go of focus, and the key goes on to the composer below.
+			} else if (
+				ctx.ui.getEditorText() === "" &&
+				keybindings.matches(data, "tui.editor.cursorDown") &&
+				dock?.focus()
+			) {
+				return { consume: true };
+			}
+			if (ctx.ui.getEditorText() !== "") return undefined;
+			if (!detector.isDoublePress(data, keybindings)) return undefined;
+			openView();
 			return { consume: true };
 		});
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (_event, ctx) => {
 		registry.clear();
 		stopListening?.();
 		stopListening = undefined;
+		if (ctx.hasUI) ctx.ui.setWidget(DOCK_WIDGET_KEY, undefined);
 	});
 }
