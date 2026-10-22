@@ -25,7 +25,8 @@ function createSubagent(mode: string, overrides: Partial<SubagentOptions> = {}):
 function texts(subagent: Subagent): string[] {
 	return subagent.messages.map((message) => {
 		if (message.role === "user") return typeof message.content === "string" ? message.content : "";
-		if (message.role === "assistant") return message.content.map((part) => (part.type === "text" ? part.text : "")).join("");
+		if (message.role === "assistant")
+			return message.content.map((part) => (part.type === "text" ? part.text : "")).join("");
 		return "";
 	});
 }

@@ -4,15 +4,23 @@
  * List: up/down select, Enter opens, Esc or the agent-view double press closes.
  * Subagent: live transcript with an input line. Enter steers a running subagent or starts a follow-up
  * run on an idle one; Esc aborts a running subagent or returns to the list; the agent-view double press
- * returns to the list; page up/down scroll.
+ * returns to the list.
+ *
+ * The transcript scrolls like the fullscreen transcript: the `tui.altScreen.*` page, half-page, line,
+ * top, and bottom keys and the mouse wheel. It follows new output until scrolled up, then holds its
+ * position. The scrollbar follows the `fullscreenScrollbar` setting.
  */
 
 import type { Message } from "@earendil-works/pi-ai";
 import {
 	type Component,
 	Input,
+	type Keybinding,
 	type KeybindingsManager,
+	type ScrollViewScrollbar,
 	type TUI,
+	type TuiMouseEvent,
+	type TuiMouseEventResult,
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
@@ -27,6 +35,54 @@ import { formatUsageStats } from "./render.ts";
 
 /** Two presses of the agent-view key within this many milliseconds open or leave the view. */
 export const DOUBLE_PRESS_MS = 400;
+
+/** Lines kept from the previous page when paging, as in the fullscreen transcript. */
+const PAGE_SCROLL_OVERLAP = 4;
+/** How long an `auto` scrollbar stays visible after scrolling. */
+const SCROLLBAR_HIDE_DELAY_MS = 1000;
+
+/** Scroll position of a transcript that follows its end until scrolled up. */
+export class TranscriptScroll {
+	/** First visible line, or undefined while following the end. */
+	private top: number | undefined;
+	private maxTop = 0;
+	private lastActivity = 0;
+	viewportHeight = 0;
+
+	/** Fit `totalLines` into `viewportHeight` rows and return the first visible line. */
+	layout(totalLines: number, viewportHeight: number): number {
+		this.viewportHeight = viewportHeight;
+		this.maxTop = Math.max(0, totalLines - viewportHeight);
+		const top = Math.min(this.top ?? this.maxTop, this.maxTop);
+		this.top = top >= this.maxTop ? undefined : top;
+		return top;
+	}
+
+	/** Positive values scroll toward the end. Reaching the end resumes following it. */
+	scrollBy(lines: number): void {
+		const next = Math.max(0, Math.min(this.maxTop, (this.top ?? this.maxTop) + lines));
+		this.top = next >= this.maxTop ? undefined : next;
+		this.lastActivity = Date.now();
+	}
+
+	scrollToTop(): void {
+		this.top = this.maxTop > 0 ? 0 : undefined;
+		this.lastActivity = Date.now();
+	}
+
+	scrollToBottom(): void {
+		this.top = undefined;
+		this.lastActivity = Date.now();
+	}
+
+	get linesBelow(): number {
+		return this.top === undefined ? 0 : this.maxTop - this.top;
+	}
+
+	get recentlyScrolled(): boolean {
+		return Date.now() - this.lastActivity < SCROLLBAR_HIDE_DELAY_MS;
+	}
+}
 
 /** Tracks presses of `app.agents.view` and reports the second press of a quick pair. */
 export class DoublePressDetector {
@@ -78,13 +134,15 @@ export class AgentView implements Component {
 	private readonly registry: SubagentRegistry;
 	private readonly cwd: string;
 	private readonly close: () => void;
+	private readonly scrollbar: ScrollViewScrollbar;
+	private readonly scroll = new TranscriptScroll();
+	private scrollbarTimer: NodeJS.Timeout | undefined;
 	private readonly doublePress = new DoublePressDetector();
 	private readonly input = new Input({ prompt: "› " });
 	private readonly unsubscribe: () => void;
 	/** 0 is the main session; 1..n are subagents in registry order. */
 	private selected = 0;
 	private open: Subagent | undefined;
-	private scrollFromBottom = 0;
 	/** Status line above the input. Info notices show only while the subagent runs; errors stay until the next action. */
 	private notice: { text: string; isError: boolean } | undefined;
 	private transcript: { subagent: Subagent; count: number; components: Component[] } | undefined;
@@ -95,6 +153,7 @@ export class AgentView implements Component {
 		keybindings: KeybindingsManager,
 		registry: SubagentRegistry,
 		cwd: string,
+		scrollbar: ScrollViewScrollbar,
 		close: () => void,
 	) {
 		this.tui = tui;
@@ -103,6 +162,7 @@ export class AgentView implements Component {
 		this.registry = registry;
 		this.cwd = cwd;
 		this.close = close;
+		this.scrollbar = scrollbar;
 		this.input.focused = true;
 		this.input.onSubmit = (value) => this.submit(value);
 		this.unsubscribe = registry.onChange(() => this.tui.requestRender());
@@ -112,6 +172,7 @@ export class AgentView implements Component {
 
 	dispose(): void {
 		this.unsubscribe();
+		if (this.scrollbarTimer) clearTimeout(this.scrollbarTimer);
 	}
 
 	invalidate(): void {
@@ -122,6 +183,17 @@ export class AgentView implements Component {
 		if (this.open) this.handleSessionInput(data, this.open);
 		else this.handleListInput(data);
 		this.tui.requestRender();
+	}
+
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (event.type !== "wheel" || !event.wheelDelta) return undefined;
+		if (this.open) {
+			this.scrollTranscript(() => this.scroll.scrollBy(event.wheelDelta ?? 0));
+		} else {
+			const last = this.registry.list().length;
+			this.selected = Math.max(0, Math.min(last, this.selected + Math.sign(event.wheelDelta)));
+		}
+		return { handled: true };
 	}
 
 	render(width: number): string[] {
@@ -147,7 +219,7 @@ export class AgentView implements Component {
 				return;
 			}
 			this.open = subagent;
-			this.scrollFromBottom = 0;
+			this.scroll.scrollToBottom();
 			this.notice = undefined;
 			this.input.setValue("");
 		}
@@ -164,15 +236,43 @@ export class AgentView implements Component {
 			else this.backToList();
 			return;
 		}
-		if (kb.matches(data, "tui.select.pageUp")) {
-			this.scrollFromBottom += Math.max(1, this.tui.terminal.rows - 6);
+		const page = Math.max(1, this.scroll.viewportHeight - PAGE_SCROLL_OVERLAP);
+		const halfPage = Math.max(1, Math.floor(this.scroll.viewportHeight / 2));
+		const steps: Array<[Keybinding, number]> = [
+			["tui.altScreen.pageUp", -page],
+			["tui.altScreen.pageDown", page],
+			["tui.altScreen.halfPageUp", -halfPage],
+			["tui.altScreen.halfPageDown", halfPage],
+			["tui.altScreen.lineUp", -1],
+			["tui.altScreen.lineDown", 1],
+		];
+		for (const [keybinding, lines] of steps) {
+			if (kb.matches(data, keybinding)) {
+				this.scrollTranscript(() => this.scroll.scrollBy(lines));
+				return;
+			}
+		}
+		if (kb.matches(data, "tui.altScreen.top")) {
+			this.scrollTranscript(() => this.scroll.scrollToTop());
 			return;
 		}
-		if (kb.matches(data, "tui.select.pageDown")) {
-			this.scrollFromBottom = Math.max(0, this.scrollFromBottom - Math.max(1, this.tui.terminal.rows - 6));
+		if (kb.matches(data, "tui.altScreen.bottom")) {
+			this.scrollTranscript(() => this.scroll.scrollToBottom());
 			return;
 		}
 		this.input.handleInput(data);
+	}
+
+	/** Apply a scroll and, for an `auto` scrollbar, render again once it should hide. */
+	private scrollTranscript(apply: () => void): void {
+		apply();
+		if (this.scrollbar !== "auto") return;
+		if (this.scrollbarTimer) clearTimeout(this.scrollbarTimer);
+		this.scrollbarTimer = setTimeout(() => {
+			this.scrollbarTimer = undefined;
+			this.tui.requestRender();
+		}, SCROLLBAR_HIDE_DELAY_MS);
+		this.scrollbarTimer.unref();
 	}
 
 	private backToList(): void {
@@ -186,7 +286,7 @@ export class AgentView implements Component {
 		const text = value.trim();
 		if (!subagent || !text) return;
 		this.input.setValue("");
-		this.scrollFromBottom = 0;
+		this.scroll.scrollToBottom();
 		this.notice = { text: subagent.isRunning ? "Steering message sent" : "Follow-up started", isError: false };
 		subagent.send(text).catch((error: unknown) => {
 			this.notice = { text: `Error: ${error instanceof Error ? error.message : String(error)}`, isError: true };
@@ -231,9 +331,12 @@ export class AgentView implements Component {
 			`${statusIcon(subagent, theme)} ${theme.fg("accent", theme.bold(subagent.options.agentName))}${theme.fg("muted", ` ${subagent.id} · ${status}`)}  ${theme.fg("dim", formatUsageStats(subagent.usage, subagent.model))}`,
 			theme.fg("dim", subagent.sessionFile ? `session: ${subagent.sessionFile}` : "no session file"),
 		];
-		const hint = subagent.isRunning
-			? "enter steer · esc abort · ←← agents · pgup/pgdn scroll"
-			: "enter follow up · esc agents · pgup/pgdn scroll";
+		const below = this.scroll.linesBelow;
+		const hint = [
+			subagent.isRunning ? "enter steer · esc abort · ←← agents" : "enter follow up · esc agents",
+			"pgup/pgdn/wheel scroll",
+			...(below > 0 ? [`↓ ${below} more`] : []),
+		].join(" · ");
 		const footer = [
 			...(this.notice && (this.notice.isError || subagent.isRunning)
 				? [theme.fg(this.notice.isError ? "error" : "dim", this.notice.text)]
@@ -242,12 +345,40 @@ export class AgentView implements Component {
 			theme.fg("dim", hint),
 		];
 		const bodyHeight = Math.max(1, height - header.length - footer.length - 1);
-		const body = this.renderTranscript(width, subagent);
-		this.scrollFromBottom = Math.min(this.scrollFromBottom, Math.max(0, body.length - bodyHeight));
-		const end = body.length - this.scrollFromBottom;
-		const visible = body.slice(Math.max(0, end - bodyHeight), end);
+		// Keep a column for the scrollbar unless it is hidden, so lines do not reflow when it appears.
+		const bodyWidth = this.scrollbar === "hidden" || width < 2 ? width : width - 1;
+		const body = this.renderTranscript(bodyWidth, subagent);
+		const top = this.scroll.layout(body.length, bodyHeight);
+		const visible = body.slice(top, top + bodyHeight);
+		// Short transcripts sit at the bottom, next to the input, like the main transcript.
 		while (visible.length < bodyHeight) visible.unshift("");
-		return [...header, ...visible, theme.fg("borderMuted", "─".repeat(width)), ...footer];
+		const bar = this.renderScrollbar(body.length, bodyHeight, top);
+		const rows = bar
+			? visible.map(
+					(line, index) =>
+						`${truncateToWidth(line, bodyWidth)}${" ".repeat(Math.max(0, bodyWidth - visibleWidth(line)))}${bar[index]}`,
+				)
+			: visible;
+		return [...header, ...rows, theme.fg("borderMuted", "─".repeat(width)), ...footer];
+	}
+
+	/** One scrollbar cell per body row, or undefined when no scrollbar shows. Geometry matches the fullscreen one. */
+	private renderScrollbar(totalLines: number, trackHeight: number, top: number): string[] | undefined {
+		if (this.scrollbar === "hidden") return undefined;
+		const overflows = totalLines > trackHeight;
+		if (this.scrollbar === "auto" && !(overflows && this.scroll.recentlyScrolled)) return undefined;
+		if (!overflows) return new Array(trackHeight).fill(this.theme.fg("scrollbarTrack", "│"));
+		const thumbHeight = Math.max(
+			Math.min(2, trackHeight),
+			Math.min(trackHeight, Math.round((trackHeight * trackHeight) / totalLines)),
+		);
+		const maxTop = totalLines - trackHeight;
+		const thumbTop = Math.round((top / maxTop) * (trackHeight - thumbHeight));
+		return Array.from({ length: trackHeight }, (_, row) =>
+			row >= thumbTop && row < thumbTop + thumbHeight
+				? this.theme.fg("scrollbarThumb", "┃")
+				: this.theme.fg("scrollbarTrack", "│"),
+		);
 	}
 
 	private renderTranscript(width: number, subagent: Subagent): string[] {

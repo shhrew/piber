@@ -517,7 +517,15 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			void ctx.ui
 				.custom<void>(
 					(tui, theme, keybindings, done) =>
-						new AgentView(tui, theme, keybindings, registry, ctx.cwd, () => done(undefined)),
+						new AgentView(
+							tui,
+							theme,
+							keybindings,
+							registry,
+							ctx.cwd,
+							pi.getSettings().fullscreenScrollbar ?? "auto",
+							() => done(undefined),
+						),
 					{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left" } },
 				)
 				.finally(() => {

@@ -29,8 +29,14 @@ async function createSubagentSession(skillGroups: string): Promise<Harness> {
 		mkdirSync(join(filePath, ".."), { recursive: true });
 		writeFileSync(filePath, content);
 	};
-	write("php/symfony/SKILL.md", "---\nname: symfony\ndescription: Symfony services\ntags: [php, symfony]\n---\n\nUse autowiring.\n");
-	write("ops/kubernetes/SKILL.md", "---\nname: kubernetes\ndescription: Cluster deploys\ntags: [k8s]\n---\n\nUse helm.\n");
+	write(
+		"php/symfony/SKILL.md",
+		"---\nname: symfony\ndescription: Symfony services\ntags: [php, symfony]\n---\n\nUse autowiring.\n",
+	);
+	write(
+		"ops/kubernetes/SKILL.md",
+		"---\nname: kubernetes\ndescription: Cluster deploys\ntags: [k8s]\n---\n\nUse helm.\n",
+	);
 	return created;
 }
 

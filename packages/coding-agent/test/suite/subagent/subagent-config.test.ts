@@ -45,7 +45,8 @@ describe("subagent agent discovery", () => {
 
 	it("lets a trusted project override a bundled agent and add its own", () => {
 		const { cwd, subagentsDir } = createProject({
-			"agents/scout.md": "---\nname: scout\ndescription: Project scout\ntools: bash, edit\n---\n\nProject scout prompt.\n",
+			"agents/scout.md":
+				"---\nname: scout\ndescription: Project scout\ntools: bash, edit\n---\n\nProject scout prompt.\n",
 			"agents/php.md":
 				"---\nname: php\ndescription: PHP work\nskillGroups: [php]\npinnedSkills: symfony\n---\n\nPHP prompt.\n",
 		});
@@ -116,7 +117,11 @@ describe("subagent skill groups", () => {
 		const { subagentsDir } = createProject({
 			"skills/php/symfony/SKILL.md": skill("symfony", "Symfony framework", "tags: [php, symfony]\n"),
 			"skills/php/laravel/SKILL.md": skill("laravel", "Laravel framework", "tags: [php, laravel]\n"),
-			"skills/php/composer/SKILL.md": skill("composer", "Dependency management, works with symfony flex", "tags: [deps]\n"),
+			"skills/php/composer/SKILL.md": skill(
+				"composer",
+				"Dependency management, works with symfony flex",
+				"tags: [deps]\n",
+			),
 		});
 		const { skills } = loadSkillGroups(["php"], subagentsDir);
 
@@ -204,7 +209,11 @@ describe("subagent child arguments", () => {
 		expect(continued).toContain("--approve");
 		expect(continued.slice(-2)).toEqual(["--session", "/sessions/s.jsonl"]);
 
-		const ephemeral = buildChildArgs({ ...options, sessionDir: undefined, tools: [], skillGroups: [] }, undefined, "p");
+		const ephemeral = buildChildArgs(
+			{ ...options, sessionDir: undefined, tools: [], skillGroups: [] },
+			undefined,
+			"p",
+		);
 		expect(ephemeral).toContain("--no-session");
 		expect(ephemeral).toContain("--no-tools");
 		expect(ephemeral).not.toContain("--subagent-skill-groups");

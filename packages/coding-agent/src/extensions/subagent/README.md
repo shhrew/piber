@@ -96,7 +96,10 @@ Press `←` twice within 400 ms while the editor is empty (keybinding `app.agent
 | `Enter` | Open the selection (the main session closes the view) | Send the input: steers a running subagent, or starts a follow-up on an idle one |
 | `Esc` | Close the view | Abort a running subagent, or go back to the list |
 | `←←` | Close the view | Go back to the list (when the input is empty) |
-| `PgUp` / `PgDn` | | Scroll the transcript |
+| `PgUp` / `PgDn`, mouse wheel | Wheel moves the selection | Scroll the transcript |
+| `Ctrl+Home` / `Ctrl+End` | | Jump to the top or bottom of the transcript |
+
+The transcript scrolls like the fullscreen transcript. It uses the same configurable `tui.altScreen.*` keys (page, half-page, and line actions; the half-page and line actions have no default key). It follows new output until you scroll up, then holds its position and shows how many lines are below. Scrolling back to the bottom resumes following. The scrollbar follows the `fullscreenScrollbar` setting.
 
 Dialogs from a subagent's extensions (confirm, select, input) appear in the parent, prefixed with the agent name.
 
