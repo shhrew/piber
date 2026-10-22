@@ -38,6 +38,11 @@ export class SubagentRegistry {
 		return this.subagents;
 	}
 
+	/** Find a subagent instance by its unique key. */
+	findByKey(key: string): Subagent | undefined {
+		return this.subagents.find((subagent) => subagent.key === key);
+	}
+
 	/** Find a subagent by registry id or session file path. */
 	find(idOrSessionFile: string): Subagent | undefined {
 		return this.subagents.find(

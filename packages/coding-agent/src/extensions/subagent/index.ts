@@ -14,22 +14,26 @@
 
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { getKeybindings } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
-import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
+import { type Static, Type } from "typebox";
+import type { ExtensionAPI, ExtensionContext, ExtensionFactory } from "../../core/extensions/types.ts";
 import { stripFrontmatter } from "../../utils/frontmatter.ts";
 import { type AgentConfig, discoverAgents, findProjectSubagentsDir } from "./agents.ts";
 import { emptyUsage, SKILL_GROUPS_FLAG, Subagent } from "./child.ts";
 import { SubagentDock } from "./dock.ts";
-import { loadSubagentConfig, parseNameList } from "./paths.ts";
+import { type BackgroundCompletion, loadSubagentConfig, parseNameList } from "./paths.ts";
 import { SubagentRegistry } from "./registry.ts";
 import {
 	currentPhase,
 	getFinalOutput,
 	isFailedRun,
+	renderBackgroundNotice,
+	renderCallLine,
 	renderSubagentCall,
 	renderSubagentResult,
+	renderWaitCall,
+	renderWaitResult,
 	type SubagentRunDetails,
 	type SubagentToolDetails,
 } from "./render.ts";
@@ -45,6 +49,12 @@ import { AgentView, DoublePressDetector } from "./view.ts";
 
 export const SKILL_SEARCH_TOOL_NAME = "skill_search";
 export const LOAD_SKILL_TOOL_NAME = "load_skill";
+export const SUBAGENT_WAIT_TOOL_NAME = "subagent_wait";
+export const SUBAGENT_RESULT_TOOL_NAME = "subagent_result";
+/** Custom message type of the notice posted when background subagents finish. */
+const BACKGROUND_NOTICE_TYPE = "subagent-background-complete";
+/** Background subagents that finish within this window are announced in one notice. */
+const NOTICE_BATCH_MS = 500;
 /** Widget key of the subagent dock under the composer. */
 const DOCK_WIDGET_KEY = "subagents";
 
@@ -91,8 +101,35 @@ const SubagentParams = Type.Object({
 				"Continue an earlier subagent (single mode): its name, such as auth-scout, or its session file path. `task` is sent as the next message.",
 		}),
 	),
+	background: Type.Optional(
+		Type.Boolean({
+			description: `Run in the background: return at once with the subagents' names while they work. Wait for them with ${SUBAGENT_WAIT_TOOL_NAME} and read their results with ${SUBAGENT_RESULT_TOOL_NAME}.`,
+		}),
+	),
 	...NameFields,
 	...RunFields,
+});
+
+type SubagentCallParams = Static<typeof SubagentParams>;
+
+const WaitParams = Type.Object({
+	names: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "Names of the subagents to wait for. Default: every subagent still running or queued.",
+		}),
+	),
+	mode: Type.Optional(
+		Type.Union([Type.Literal("all"), Type.Literal("any")], {
+			description: '"all" (default) waits until every target has finished; "any" returns when any one finishes.',
+		}),
+	),
+});
+
+const ResultParams = Type.Object({
+	names: Type.Array(Type.String(), {
+		minItems: 1,
+		description: "Names of the finished subagents whose results to read. Several names read several results at once.",
+	}),
 });
 
 interface RunRequest {
@@ -135,6 +172,7 @@ function describeRun(request: RunRequest): string {
 function toDetails(subagent: Subagent, step?: number): SubagentRunDetails {
 	return {
 		id: subagent.id,
+		key: subagent.key,
 		description: subagent.options.description,
 		agent: subagent.options.agentName,
 		agentSource: subagent.options.agentSource,
@@ -151,6 +189,34 @@ function toDetails(subagent: Subagent, step?: number): SubagentRunDetails {
 		finishedAt: subagent.finishedAt,
 		phase: subagent.isRunning ? currentPhase(subagent.streaming) : undefined,
 	};
+}
+
+/**
+ * Details for rows that only report status (waits, results, notices): the transcript is cut to the last message
+ * with a tool call, enough for the expanded `→ command` line, so these results do not copy whole transcripts.
+ */
+function statusDetails(subagent: Subagent): SubagentRunDetails {
+	const details = toDetails(subagent);
+	const last = details.messages.findLast(
+		(message) => message.role === "assistant" && message.content.some((part) => part.type === "toolCall"),
+	);
+	return { ...details, messages: last ? [last] : [] };
+}
+
+/** One line per subagent for the orchestrator: `- name (description): done, 3 turns`. */
+function statusLine(subagent: Subagent): string {
+	const label = `- ${subagent.id} (${subagent.options.description})`;
+	if (subagent.isQueued) return `${label}: queued`;
+	if (subagent.isRunning) return `${label}: running`;
+	if (subagent.status === "failed") {
+		return `${label}: failed${subagent.errorMessage ? `: ${subagent.errorMessage.split("\n")[0]}` : ""}`;
+	}
+	const turns = subagent.usage.turns;
+	return `${label}: ${subagent.status}${turns ? `, ${turns} turn${turns > 1 ? "s" : ""}` : ""}`;
+}
+
+function isSettled(subagent: Subagent): boolean {
+	return !subagent.isRunning && !subagent.isQueued;
 }
 
 function failedRun(request: RunRequest, id: string, errorMessage: string): SubagentRunDetails {
@@ -237,8 +303,24 @@ function loadChildCatalog(pi: ExtensionAPI, ctx: ExtensionContext): SkillCatalog
 	return loadSkillGroups(groups, projectDir);
 }
 
-export default function subagentExtension(pi: ExtensionAPI): void {
+export interface SubagentExtensionOptions {
+	/** Command that starts pi for subagents. Default: the command that started this process. Tests pass a stand-in. */
+	command?: { executable: string; args: string[] };
+}
+
+export function createSubagentExtension(options: SubagentExtensionOptions = {}): ExtensionFactory {
+	return (pi) => setupSubagents(pi, options);
+}
+
+export default createSubagentExtension();
+
+function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): void {
 	const registry = new SubagentRegistry();
+	/** Live state of a subagent instance, for rows of background launches and waits. */
+	const lookup = (key: string) => {
+		const subagent = registry.findByKey(key);
+		return subagent ? statusDetails(subagent) : undefined;
+	};
 	/** Shared by every subagent of this session. Its limit is refreshed from config before each run. */
 	const slots = new SlotPool(loadSubagentConfig(null).maxConcurrent);
 	const reportedDiagnostics = new Set<string>();
@@ -256,33 +338,22 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		}
 	};
 
-	/** Start (or continue) one subagent and wait for it to settle. */
-	const runOne = async (
-		request: RunRequest,
-		ctx: ExtensionContext,
-		signal: AbortSignal | undefined,
-		onProgress: (run: SubagentRunDetails) => void,
-	): Promise<SubagentRunDetails> => {
-		const watch = async (subagent: Subagent, message: string) => {
-			const unsubscribe = subagent.onChange(() => onProgress(toDetails(subagent, request.step)));
-			try {
-				await subagent.run(message, signal);
-			} finally {
-				unsubscribe();
-			}
-			if (signal?.aborted) throw new Error("Subagent was aborted");
-			return toDetails(subagent, request.step);
-		};
+	type Prepared = { subagent: Subagent; message: string } | { failure: SubagentRunDetails };
 
+	/**
+	 * Create (or find, for `session`) the subagent for a request and register it, without starting it. Synchronous,
+	 * so a background launch knows its subagents' names before it returns.
+	 */
+	const prepareRun = (request: RunRequest, ctx: ExtensionContext): Prepared => {
 		const projectDir = ctx.isProjectTrusted() ? findProjectSubagentsDir(ctx.cwd) : null;
 		slots.setLimit(loadSubagentConfig(projectDir).maxConcurrent);
 
 		const existing = request.session ? registry.find(request.session) : undefined;
 		if (existing) {
-			if (existing.isRunning || existing.isQueued) {
-				return failedRun(request, existing.id, `Subagent ${existing.id} is still ${existing.status}`);
+			if (!isSettled(existing)) {
+				return { failure: failedRun(request, existing.id, `Subagent ${existing.id} is still ${existing.status}`) };
 			}
-			return watch(existing, request.task);
+			return { subagent: existing, message: request.task };
 		}
 
 		const discovery = discoverAgents(ctx.cwd, ctx.isProjectTrusted());
@@ -292,7 +363,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			const reason = request.session
 				? `Unknown subagent session "${request.session}". To continue a session file from an earlier pi run, also pass its agent.`
 				: `Unknown agent "${request.agent ?? ""}". Available agents: ${available}.`;
-			return failedRun(request, registry.createId(request.name ?? request.agent ?? "subagent"), reason);
+			return { failure: failedRun(request, registry.createId(request.name ?? request.agent ?? "subagent"), reason) };
 		}
 
 		const plan = planSubagentRun(agent, request, discovery.projectDir);
@@ -321,9 +392,182 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			projectTrusted: ctx.isProjectTrusted(),
 			ui: ctx.hasUI ? ctx.ui : undefined,
 			slots,
+			command: options.command,
 		});
 		registry.add(subagent);
-		return watch(subagent, request.session ? request.task : `Task: ${request.task}`);
+		return { subagent, message: request.session ? request.task : `Task: ${request.task}` };
+	};
+
+	/** Run a prepared subagent until it settles, reporting progress. Aborting `signal` aborts it. */
+	const watchRun = async (
+		subagent: Subagent,
+		message: string,
+		step: number | undefined,
+		signal: AbortSignal | undefined,
+		onProgress: (run: SubagentRunDetails) => void,
+	): Promise<SubagentRunDetails> => {
+		const unsubscribe = subagent.onChange(() => onProgress(toDetails(subagent, step)));
+		try {
+			await subagent.run(message, signal);
+		} finally {
+			unsubscribe();
+		}
+		if (signal?.aborted) throw new Error("Subagent was aborted");
+		return toDetails(subagent, step);
+	};
+
+	/** Start (or continue) one subagent and wait for it to settle. */
+	const runOne = async (
+		request: RunRequest,
+		ctx: ExtensionContext,
+		signal: AbortSignal | undefined,
+		onProgress: (run: SubagentRunDetails) => void,
+	): Promise<SubagentRunDetails> => {
+		const prepared = prepareRun(request, ctx);
+		if ("failure" in prepared) return prepared.failure;
+		return watchRun(prepared.subagent, prepared.message, request.step, signal, onProgress);
+	};
+
+	// --- Background subagents ---------------------------------------------------------------------------------
+
+	/** Background chains still working through their steps; waiting for all subagents also waits for these. */
+	const backgroundJobs = new Set<Promise<void>>();
+	const jobListeners = new Set<() => void>();
+	/** Subagents whose outcome a wait or result call already gave the orchestrator, so no notice repeats it. */
+	const reported = new Set<string>();
+	/** Bumped when the session changes, so subagents of an earlier session never post notices into this one. */
+	let generation = 0;
+	const pendingNotices: Array<{ subagent: Subagent; completion: BackgroundCompletion }> = [];
+	let noticeTimer: NodeJS.Timeout | undefined;
+
+	const trackJob = (job: Promise<void>) => {
+		backgroundJobs.add(job);
+		void job.finally(() => {
+			backgroundJobs.delete(job);
+			for (const listener of [...jobListeners]) listener();
+		});
+	};
+
+	/** Post one notice for the background subagents that finished in the last batch window. */
+	const flushNotices = () => {
+		noticeTimer = undefined;
+		const batch = pendingNotices.splice(0).filter(({ subagent }) => !reported.has(subagent.key));
+		for (const completion of ["wake", "notify"] as const) {
+			const subagents = batch.filter((entry) => entry.completion === completion).map((entry) => entry.subagent);
+			if (subagents.length === 0) continue;
+			for (const subagent of subagents) reported.add(subagent.key);
+			const content = [
+				"Background subagents finished:",
+				...subagents.map(statusLine),
+				`Read their results with ${SUBAGENT_RESULT_TOOL_NAME}.`,
+			].join("\n");
+			pi.sendMessage(
+				{
+					customType: BACKGROUND_NOTICE_TYPE,
+					content,
+					display: true,
+					details: { results: subagents.map(statusDetails) },
+				},
+				// `wake` starts a turn when the orchestrator is idle, or queues after its current one; `notify`
+				// waits for the next turn.
+				completion === "wake" ? { triggerTurn: true, deliverAs: "followUp" } : { deliverAs: "nextTurn" },
+			);
+		}
+	};
+
+	/** Run a prepared background subagent and queue a notice when it settles. */
+	const runInBackground = (
+		subagent: Subagent,
+		message: string,
+		step: number | undefined,
+		completion: BackgroundCompletion,
+	): Promise<SubagentRunDetails> => {
+		const startedIn = generation;
+		return watchRun(subagent, message, step, undefined, () => {}).finally(() => {
+			if (startedIn !== generation || completion === "silent") return;
+			pendingNotices.push({ subagent, completion });
+			noticeTimer ??= setTimeout(flushNotices, NOTICE_BATCH_MS);
+		});
+	};
+
+	/** Start a call's subagents in the background and describe them, without waiting. */
+	const launchBackground = (
+		params: SubagentCallParams,
+		shared: Pick<RunRequest, "cwd" | "extraTools" | "extraSkillGroups">,
+		ctx: ExtensionContext,
+		completion: BackgroundCompletion,
+	): AgentToolResult<SubagentToolDetails> => {
+		const results: SubagentRunDetails[] = [];
+		const started: Subagent[] = [];
+		let mode: SubagentToolDetails["mode"];
+
+		if (params.chain && params.chain.length > 0) {
+			mode = "chain";
+			const chain = params.chain;
+			const first = prepareRun({ ...shared, ...chain[0], step: 1 }, ctx);
+			if ("failure" in first) {
+				results.push(first.failure);
+			} else {
+				started.push(first.subagent);
+				results.push(toDetails(first.subagent, 1));
+				// Later steps start as earlier ones finish, each with the previous step's output.
+				trackJob(
+					(async () => {
+						let run = await runInBackground(first.subagent, first.message, 1, completion);
+						for (let i = 1; i < chain.length && !isFailedRun(run); i++) {
+							const task = chain[i].task.replace(/\{previous\}/g, getFinalOutput(run.messages));
+							const next = prepareRun({ ...shared, ...chain[i], task, step: i + 1 }, ctx);
+							if ("failure" in next) break;
+							run = await runInBackground(next.subagent, next.message, i + 1, completion);
+						}
+					})().catch(() => {}),
+				);
+			}
+		} else {
+			const parallel = params.tasks !== undefined && params.tasks.length > 0;
+			mode = parallel ? "parallel" : "single";
+			const requests: RunRequest[] = parallel
+				? (params.tasks ?? []).map((task) => ({ ...shared, ...task }))
+				: [
+						{
+							...shared,
+							agent: params.agent,
+							task: params.task ?? "",
+							name: params.name,
+							description: params.description,
+							session: params.session,
+						},
+					];
+			for (const request of requests) {
+				const prepared = prepareRun(request, ctx);
+				if ("failure" in prepared) {
+					results.push(prepared.failure);
+					continue;
+				}
+				started.push(prepared.subagent);
+				results.push(toDetails(prepared.subagent));
+				void runInBackground(prepared.subagent, prepared.message, undefined, completion).catch(() => {});
+			}
+		}
+
+		const lines: string[] = [];
+		if (started.length > 0) {
+			const names = started.map((subagent) => `${subagent.id} (${subagent.options.description})`).join(", ");
+			lines.push(`Started in the background: ${names}.`);
+			if (mode === "chain") lines.push("Later chain steps start as earlier ones finish.");
+			lines.push(
+				`They keep working while you continue. Wait for them with ${SUBAGENT_WAIT_TOOL_NAME} and read their results with ${SUBAGENT_RESULT_TOOL_NAME}.`,
+			);
+			if (completion !== "silent") lines.push("You will also be told when they finish.");
+		}
+		for (const failure of results.filter((run) => run.status === "failed")) {
+			lines.push(`${failure.id} did not start: ${failure.errorMessage}`);
+		}
+		return {
+			content: [{ type: "text", text: lines.join("\n") }],
+			details: { mode, results, background: true, live: true },
+			isError: started.length === 0 || undefined,
+		};
 	};
 
 	pi.registerFlag(SKILL_GROUPS_FLAG, {
@@ -394,6 +638,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			"Modes: single (agent + task), parallel (tasks), chain (sequential, with {previous} replaced by the prior output).",
 			"Give every subagent a one-word name and a 2-4 word description of what it is doing; both show in the agent view, and the name identifies it.",
 			"Pass session with a subagent's name to send it a follow-up.",
+			`Set background to keep working while subagents run; then use ${SUBAGENT_WAIT_TOOL_NAME} and ${SUBAGENT_RESULT_TOOL_NAME}.`,
 		].join(" "),
 		promptSnippet: "Delegate tasks to specialized subagents with isolated context",
 		parameters: SubagentParams,
@@ -416,6 +661,23 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 					details: { mode: "single", results: [] } satisfies SubagentToolDetails,
 					isError: true,
 				};
+			}
+
+			const config = loadSubagentConfig(ctx.isProjectTrusted() ? findProjectSubagentsDir(ctx.cwd) : null);
+			if (params.background ?? config.defaultMode === "background") {
+				if (params.tasks && params.tasks.length > MAX_PARALLEL_TASKS) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
+							},
+						],
+						details: { mode: "parallel", results: [] },
+						isError: true,
+					};
+				}
+				return launchBackground(params, shared, ctx, config.onBackgroundComplete);
 			}
 
 			if (params.chain && params.chain.length > 0) {
@@ -546,13 +808,204 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			return renderSubagentResult(
 				result.details,
 				first?.type === "text" ? first.text : "",
+				{ expanded, isError: context.isError, outputPad: context.outputPad, lookup },
+				theme,
+			);
+		},
+	});
+
+	pi.registerTool<typeof WaitParams, SubagentToolDetails>({
+		name: SUBAGENT_WAIT_TOOL_NAME,
+		label: "Subagent Wait",
+		description: [
+			"Wait for subagents to finish: the named ones, or every subagent still running or queued.",
+			'mode "any" returns as soon as the first finishes, so you can handle results as they arrive.',
+			`Returns each target's status. Read finished subagents' results with ${SUBAGENT_RESULT_TOOL_NAME}.`,
+		].join(" "),
+		promptSnippet: "Wait for background subagents to finish",
+		parameters: WaitParams,
+		renderShell: "self",
+
+		async execute(_toolCallId, params, signal, onUpdate) {
+			const mode = params.mode ?? "all";
+			const unknown = (params.names ?? []).filter((name) => !registry.find(name));
+			if (unknown.length > 0) {
+				const known =
+					registry
+						.list()
+						.map((subagent) => subagent.id)
+						.join(", ") || "none";
+				return {
+					content: [{ type: "text", text: `Unknown subagents: ${unknown.join(", ")}. Known: ${known}.` }],
+					details: { mode: "parallel", results: [] },
+					isError: true,
+				};
+			}
+
+			// Without names, every unsettled subagent is a target, including chain steps that start while waiting.
+			const targets = new Map<string, Subagent>();
+			const collect = (): boolean => {
+				const candidates = params.names
+					? params.names.map((name) => registry.find(name)).filter((subagent) => subagent !== undefined)
+					: registry.list().filter((subagent) => !isSettled(subagent));
+				let added = false;
+				for (const subagent of candidates) {
+					if (targets.has(subagent.key)) continue;
+					targets.set(subagent.key, subagent);
+					added = true;
+				}
+				return added;
+			};
+			collect();
+			if (targets.size === 0 && (params.names !== undefined || backgroundJobs.size === 0)) {
+				return {
+					content: [{ type: "text", text: "No subagents are running or queued." }],
+					details: { mode: "parallel", results: [] },
+				};
+			}
+
+			const emitProgress = () =>
+				onUpdate?.({
+					content: [{ type: "text", text: "Waiting..." }],
+					details: { mode: "parallel", results: [...targets.values()].map(statusDetails), live: true },
+				});
+			emitProgress();
+
+			const done = (): boolean => {
+				const list = [...targets.values()];
+				if (mode === "any") return list.some(isSettled);
+				return list.every(isSettled) && (params.names !== undefined || backgroundJobs.size === 0);
+			};
+			const aborted = await new Promise<boolean>((resolve) => {
+				let finished = false;
+				const finish = (wasAborted: boolean) => {
+					if (finished) return;
+					finished = true;
+					unsubscribe();
+					jobListeners.delete(check);
+					signal?.removeEventListener("abort", onAbort);
+					resolve(wasAborted);
+				};
+				const check = () => {
+					if (!params.names && collect()) emitProgress();
+					if (done()) finish(false);
+				};
+				const onAbort = () => finish(true);
+				const unsubscribe = registry.onChange(check);
+				jobListeners.add(check);
+				signal?.addEventListener("abort", onAbort, { once: true });
+				if (signal?.aborted) finish(true);
+				else check();
+			});
+
+			const list = [...targets.values()];
+			const finished = list.filter(isSettled);
+			for (const subagent of finished) reported.add(subagent.key);
+			const heading = aborted
+				? "Stopped waiting."
+				: mode === "any"
+					? "A subagent finished."
+					: "All targets finished.";
+			const lines = [heading, ...list.map(statusLine)];
+			if (finished.length > 0) {
+				const names = finished.map((subagent) => subagent.id).join(", ");
+				lines.push(`Read results with ${SUBAGENT_RESULT_TOOL_NAME}: ${names}.`);
+			}
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: { mode: "parallel", results: list.map(statusDetails) },
+			};
+		},
+
+		renderCall(args, theme, context) {
+			return renderWaitCall(args, theme, context);
+		},
+
+		renderResult(result, { expanded }, theme, context) {
+			const first = result.content[0];
+			const fallback = first?.type === "text" ? first.text : "";
+			const options = {
+				expanded,
+				isError: context.isError,
+				isPartial: context.isPartial,
+				outputPad: context.outputPad,
+				lookup,
+			};
+			return renderWaitResult(context.args, result.details, fallback, options, theme);
+		},
+	});
+
+	pi.registerTool<typeof ResultParams, SubagentToolDetails>({
+		name: SUBAGENT_RESULT_TOOL_NAME,
+		label: "Subagent Result",
+		description: [
+			"Read the results of finished subagents: each one's final answer, or its error.",
+			`Pass several names to read several results in one call. Running subagents have no result yet; wait for them with ${SUBAGENT_WAIT_TOOL_NAME}.`,
+		].join(" "),
+		promptSnippet: "Read the results of finished subagents",
+		parameters: ResultParams,
+		renderShell: "self",
+
+		async execute(_toolCallId, params) {
+			const sections: string[] = [];
+			const results: SubagentRunDetails[] = [];
+			let missing = 0;
+			for (const name of params.names) {
+				const subagent = registry.find(name);
+				if (!subagent) {
+					missing++;
+					sections.push(`### ${name}\n\nUnknown subagent.`);
+					continue;
+				}
+				results.push(statusDetails(subagent));
+				if (!isSettled(subagent)) {
+					const state = subagent.isQueued ? "queued" : "running";
+					sections.push(
+						`### ${subagent.id} (${state})\n\nStill ${state}; wait for it with ${SUBAGENT_WAIT_TOOL_NAME}.`,
+					);
+					continue;
+				}
+				reported.add(subagent.key);
+				sections.push(
+					`### ${subagent.id} (${subagent.status})\n\n${truncateOutput(runOutput(toDetails(subagent)))}`,
+				);
+			}
+			return {
+				content: [{ type: "text", text: sections.join("\n\n---\n\n") }],
+				details: { mode: "parallel", results },
+				isError: missing === params.names.length || undefined,
+			};
+		},
+
+		renderCall(args, theme, context) {
+			return renderCallLine("Result", (args.names ?? []).join(", "), "", theme, context);
+		},
+
+		renderResult(result, { expanded }, theme, context) {
+			const first = result.content[0];
+			return renderSubagentResult(
+				result.details,
+				first?.type === "text" ? first.text : "",
 				{ expanded, isError: context.isError, outputPad: context.outputPad },
 				theme,
 			);
 		},
 	});
 
+	pi.registerMessageRenderer<{ results: SubagentRunDetails[] }>(BACKGROUND_NOTICE_TYPE, (message, options, theme) =>
+		message.details ? renderBackgroundNotice(message.details.results, options, theme) : undefined,
+	);
+
+	const resetBackground = () => {
+		generation++;
+		pendingNotices.length = 0;
+		if (noticeTimer) clearTimeout(noticeTimer);
+		noticeTimer = undefined;
+		reported.clear();
+	};
+
 	pi.on("session_start", (_event, ctx) => {
+		resetBackground();
 		registry.clear();
 		lastViewed = undefined;
 		stopListening?.();
@@ -620,6 +1073,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		resetBackground();
 		registry.clear();
 		stopListening?.();
 		stopListening = undefined;

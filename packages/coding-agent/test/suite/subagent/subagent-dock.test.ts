@@ -11,8 +11,11 @@ import {
 	currentPhase,
 	formatPhase,
 	latestToolCall,
+	renderBackgroundNotice,
 	renderSubagentCall,
 	renderSubagentResult,
+	renderWaitCall,
+	renderWaitResult,
 	type SubagentRunDetails,
 } from "../../../src/extensions/subagent/render.ts";
 import { SlotPool } from "../../../src/extensions/subagent/slots.ts";
@@ -309,5 +312,97 @@ describe("subagent activity", () => {
 	it("finds the latest tool call for the transcript's expanded rows", () => {
 		expect(text(latestToolCall([toolCall], theme))).toBe("read a.txt");
 		expect(latestToolCall([assistant("no tools")], theme)).toBeUndefined();
+	});
+});
+
+describe("background rendering", () => {
+	const options = { expanded: false, isError: false, outputPad: 1 };
+
+	it("follows a background subagent's live state, and stops spinning once it belongs to an earlier process", () => {
+		const details = {
+			mode: "single" as const,
+			results: [run("bg", { key: "k1", status: "running" })],
+			background: true,
+			live: true,
+		};
+
+		const live = plain(
+			renderSubagentResult(details, "", { ...options, lookup: () => run("bg", { key: "k1" }) }, theme).render(120),
+		);
+		expect(live).toEqual(["   ⎿  ✓ Done · 3 turns · 12s · $0.0100"]);
+
+		const detached = plain(
+			renderSubagentResult(details, "", { ...options, lookup: () => undefined }, theme).render(120),
+		);
+		expect(detached).toEqual(["   ⎿  ○ Started in background"]);
+	});
+
+	it("marks background calls on the call line", () => {
+		const line = plain(
+			renderSubagentCall(
+				{ agent: "scout", task: "t", name: "bg", description: "Echo me", background: true },
+				theme,
+				{ isPartial: true, isError: false, outputPad: 1 },
+			).render(100),
+		);
+		expect(line).toEqual([" ● Subagent(bg) Echo me · background"]);
+	});
+
+	it("draws the completion notice as a call line with one row per subagent", () => {
+		const lines = plain(
+			renderBackgroundNotice([run("a"), run("b")], { expanded: false, outputPad: 1 }, theme).render(120),
+		);
+		expect(lines).toEqual([
+			" ● Subagents finished · 2 in the background",
+			"   ⎿  ✓ a  Job a · Done · 3 turns · 12s · $0.0100",
+			"      ✓ b  Job b · Done · 3 turns · 12s · $0.0100",
+		]);
+	});
+});
+
+describe("wait rendering", () => {
+	const waiting = { isPartial: true, isError: false, outputPad: 1 };
+	const options = { expanded: false, isError: false, isPartial: true, outputPad: 1 };
+	const details = { mode: "parallel" as const, results: [run("a"), run("b", { status: "running" })] };
+
+	it("shows only the call line when waiting for all or any subagents", () => {
+		expect(plain(renderWaitCall({}, theme, waiting).render(100))).toEqual([
+			" ● Wait(all) · waiting for subagents to finish",
+		]);
+		expect(plain(renderWaitCall({ mode: "any" }, theme, waiting).render(100))).toEqual([
+			" ● Wait(any) · waiting for a subagent to finish",
+		]);
+		expect(plain(renderWaitCall({}, theme, { ...waiting, isPartial: false }).render(100))).toEqual([
+			" ● Wait(all) · done waiting",
+		]);
+		expect(renderWaitResult({ mode: "any" }, details, "", options, theme).render(100)).toEqual([]);
+	});
+
+	it("names the mode on the call line for several targets, and the target itself for one", () => {
+		const several = plain(renderWaitCall({ names: ["scout-a", "scout-b"], mode: "any" }, theme, waiting).render(100));
+		expect(several).toEqual([" ● Wait(any) · waiting for a subagent to finish"]);
+
+		const one = plain(renderWaitCall({ names: ["scout-a"], mode: "any" }, theme, waiting).render(100));
+		expect(one).toEqual([" ● Wait(scout-a) · waiting for it to finish"]);
+		expect(renderWaitResult({ names: ["a"] }, details, "", options, theme).render(100)).toEqual([]);
+	});
+
+	it("lists named targets by name and description only", () => {
+		const lines = plain(renderWaitResult({ names: ["a", "b"] }, details, "", options, theme).render(100));
+		expect(lines[0]).toBe("   ⎿  ✓ a  Job a");
+		expect(lines[1]).toMatch(/^ {6}\S b {2}Job b$/);
+		expect(lines.join("\n")).not.toMatch(/turns|Done|\d+s/);
+	});
+
+	it("collapses to the call line once the wait is done", () => {
+		const done = { ...options, isPartial: false };
+		expect(renderWaitResult({ names: ["a", "b"] }, details, "", done, theme).render(100)).toEqual([]);
+	});
+
+	it("still shows errors, such as unknown names", () => {
+		const lines = plain(
+			renderWaitResult({}, undefined, "Unknown subagents: ghost.", { ...options, isError: true }, theme).render(100),
+		);
+		expect(lines).toEqual(["   ⎿  Unknown subagents: ghost."]);
 	});
 });

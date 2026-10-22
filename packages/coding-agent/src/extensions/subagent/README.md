@@ -83,7 +83,22 @@ Every new subagent also takes `name` and `description`, at the top level in sing
 - `name` is one word, such as `auth-scout`. It is lowercased and reduced to letters, digits, `-`, and `_`, and becomes the subagent's id: the agent view lists it, and `session` uses it to continue the subagent. A name already used in this session gets `-2`, `-3`, and so on. Without a name, the agent name is used.
 - `description` says what the subagent is doing in 2-4 words, such as `Map auth flow`. Without one, the first words of the task are used.
 
-Every mode accepts `cwd`, `extraTools`, and `extraSkillGroups`, at the top level or per task.
+Every mode accepts `cwd`, `extraTools`, and `extraSkillGroups`, at the top level or per task, and `background` at the top level (see [Background subagents](#background-subagents)).
+
+## Background subagents
+
+By default a `subagent` call runs in the foreground: it returns when its subagents finish, and the orchestrator waits. With `background: true` (or `defaultMode: "background"` in the config), the call starts its subagents and returns at once with their names, and the orchestrator keeps working. A background chain starts its later steps as earlier ones finish.
+
+Two tools manage background subagents:
+
+| Tool | Parameters | Returns |
+|---|---|---|
+| `subagent_wait` | `names` (optional), `mode`: `"all"` (default) or `"any"` | Each target's status once all of them, or the first, has finished. Without `names`, it waits for every subagent still running or queued, including later chain steps. |
+| `subagent_result` | `names` (one or more) | Each finished subagent's final answer, or its error, capped at 50 KB each. Running subagents have no result yet. |
+
+When a background subagent finishes and no wait or result call has reported it, the orchestrator is told, as `onBackgroundComplete` sets. Subagents that finish within half a second of each other share one notice. The notice gives each subagent's status and points to `subagent_result`; it never includes the output.
+
+In the chat, a background call's rows keep updating after the call returns. A wait for all or any subagents shows only its call line (`● Wait(all) · waiting for a subagent to finish`); a wait for two or more named subagents shows the mode and adds one row each with the name and description while it waits; a wait for one subagent names it on the call line (`● Wait(scout-a) · waiting for it to finish`). A finished wait is always a single line, such as `● Wait(any) · done waiting`. Background subagents stop when the session ends; after a resume, their rows show `Started in background`.
 
 ## Configuration
 
@@ -92,7 +107,9 @@ Every mode accepts `cwd`, `extraTools`, and `extraSkillGroups`, at the top level
 ```json
 {
 	"coreTools": ["read", "grep", "find", "ls"],
-	"maxConcurrent": 4
+	"maxConcurrent": 4,
+	"defaultMode": "foreground",
+	"onBackgroundComplete": "wake"
 }
 ```
 
@@ -100,6 +117,8 @@ Every mode accepts `cwd`, `extraTools`, and `extraSkillGroups`, at the top level
 |---|---|
 | `coreTools` | Tools every subagent gets (see [Tools](#tools)). |
 | `maxConcurrent` | How many subagent processes may run at once in a session. It must be a positive integer; other values are ignored. |
+| `defaultMode` | `"foreground"` or `"background"`: how a `subagent` call runs when it does not set `background`. |
+| `onBackgroundComplete` | What happens when a background subagent finishes and nothing has reported it: `"wake"` posts a notice at once, starting a turn if the orchestrator is idle or queuing it after the current one; `"notify"` posts it with the next turn; `"silent"` posts nothing, leaving the result to `subagent_wait` and `subagent_result`. |
 
 `maxConcurrent` covers every subagent the session starts: parallel tasks, separate `subagent` calls, `session` continuations, and follow-ups sent from the agent view. A subagent beyond the limit waits in a queue with the status `queued` (`◷`), and starts in order when a running one finishes. Esc in the agent view, or aborting the parent's tool call, removes it from the queue. A queued subagent cannot be steered until it starts. The limit is read again before each run, so editing `config.json` takes effect for the next subagent.
 
@@ -162,7 +181,7 @@ Dialogs from a subagent's extensions (confirm, select, input) appear in the pare
 
 | File | Purpose |
 |---|---|
-| `index.ts` | Tools, run planning, and the agent-view trigger |
+| `index.ts` | Tools (`subagent`, `subagent_wait`, `subagent_result`, and the skill tools), run planning, background notices, and the agent-view trigger |
 | `agents.ts` | Agent discovery |
 | `skills.ts` | Skill groups, tags, and search |
 | `child.ts` | One subagent process and its transcript |

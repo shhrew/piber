@@ -7,6 +7,11 @@
  * `config.json` holds:
  * - `coreTools`: the tools every subagent gets
  * - `maxConcurrent`: how many subagents may run at once; the rest wait in a queue for a free slot
+ * - `defaultMode`: whether `subagent` calls run in the `foreground` (the call waits for its subagents) or the
+ *   `background` (the call returns at once) when the call does not say
+ * - `onBackgroundComplete`: what happens when a background subagent finishes and nothing waits for it: `wake`
+ *   tells the orchestrator at once (starting a turn if it is idle), `notify` tells it on its next turn, `silent`
+ *   leaves the result for `subagent_wait` and `subagent_result`
  *
  * A trusted project's `.pi/subagents/config.json` overrides any of these fields.
  */
@@ -28,12 +33,25 @@ export function parseNameList(value: unknown): string[] {
 		.filter(Boolean);
 }
 
+export type SubagentMode = "foreground" | "background";
+export type BackgroundCompletion = "wake" | "notify" | "silent";
+
 export interface SubagentConfig {
 	coreTools: string[];
 	maxConcurrent: number;
+	defaultMode: SubagentMode;
+	onBackgroundComplete: BackgroundCompletion;
 }
 
-const DEFAULT_CONFIG: SubagentConfig = { coreTools: ["read", "grep", "find", "ls"], maxConcurrent: 4 };
+const DEFAULT_CONFIG: SubagentConfig = {
+	coreTools: ["read", "grep", "find", "ls"],
+	maxConcurrent: 4,
+	defaultMode: "foreground",
+	onBackgroundComplete: "wake",
+};
+
+const MODES: readonly SubagentMode[] = ["foreground", "background"];
+const COMPLETIONS: readonly BackgroundCompletion[] = ["wake", "notify", "silent"];
 
 /** Directory holding the bundled `agents/`, `skills/`, and `config.json`. */
 export function getSubagentAssetsDir(): string {
@@ -51,12 +69,17 @@ function readConfig(filePath: string): Partial<SubagentConfig> | undefined {
 		return undefined;
 	}
 	if (!raw || typeof raw !== "object") return undefined;
-	const { coreTools, maxConcurrent } = raw as { coreTools?: unknown; maxConcurrent?: unknown };
+	const fields = raw as Record<string, unknown>;
 	const config: Partial<SubagentConfig> = {};
-	if (Array.isArray(coreTools)) config.coreTools = parseNameList(coreTools);
-	// Anything but a positive integer is ignored, so a typo cannot stop subagents from running at all.
+	if (Array.isArray(fields.coreTools)) config.coreTools = parseNameList(fields.coreTools);
+	// Invalid values are ignored rather than rejected, so a typo cannot stop subagents from running at all.
+	const { maxConcurrent, defaultMode, onBackgroundComplete } = fields;
 	if (typeof maxConcurrent === "number" && Number.isInteger(maxConcurrent) && maxConcurrent > 0) {
 		config.maxConcurrent = maxConcurrent;
+	}
+	if (MODES.includes(defaultMode as SubagentMode)) config.defaultMode = defaultMode as SubagentMode;
+	if (COMPLETIONS.includes(onBackgroundComplete as BackgroundCompletion)) {
+		config.onBackgroundComplete = onBackgroundComplete as BackgroundCompletion;
 	}
 	return config;
 }

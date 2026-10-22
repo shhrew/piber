@@ -4,6 +4,7 @@
 // - crash: exit with code 3 when prompted
 // - hang: wait after a prompt until a steer ("steered: <message>") or an abort
 // - notify: send an info and a warning notification, then answer like echo
+// - auto: answer like echo, but after 1.5 s when the message contains "slow"
 import { createInterface } from "node:readline";
 
 const mode = process.argv[2];
@@ -66,6 +67,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 				write({ type: "extension_ui_request", id: "n-2", method: "notify", message: "careful", notifyType: "warning" });
 			}
 			if (mode === "echo" || mode === "notify") reply(`echo: ${command.message}`);
+			if (mode === "auto") {
+				const delay = command.message.includes("slow") ? 1500 : 0;
+				setTimeout(() => reply(`echo: ${command.message}`), delay);
+			}
 			if (mode === "confirm") {
 				pendingConfirm = "ui-1";
 				write({ type: "extension_ui_request", id: pendingConfirm, method: "confirm", title: "Proceed?", message: "Run it" });

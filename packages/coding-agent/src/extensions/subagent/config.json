@@ -1,4 +1,6 @@
 {
 	"coreTools": ["read", "grep", "find", "ls"],
-	"maxConcurrent": 2
+	"maxConcurrent": 2,
+	"defaultMode": "foreground",
+	"onBackgroundComplete": "wake"
 }

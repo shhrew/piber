@@ -12,7 +12,7 @@
 
 import * as os from "node:os";
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
-import { type Component, truncateToWidth } from "@earendil-works/pi-tui";
+import { type Component, Container, truncateToWidth } from "@earendil-works/pi-tui";
 import { formatReadLineRange } from "../../core/tools/render-utils.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { AgentSource } from "./agents.ts";
@@ -31,6 +31,11 @@ export function spinnerFrame(): string {
 export interface SubagentRunDetails {
 	/** The caller-given one-word name. Results stored before names existed hold ids such as `sa1`. */
 	id: string;
+	/**
+	 * Identifies the subagent instance for live lookups. Names are unique only within one pi process, so a resumed
+	 * session could otherwise match an old row to a new subagent with the same name.
+	 */
+	key?: string;
 	/** What the subagent is doing, in a few words. Absent in results stored before descriptions existed. */
 	description?: string;
 	agent: string;
@@ -54,6 +59,13 @@ export interface SubagentRunDetails {
 export interface SubagentToolDetails {
 	mode: "single" | "parallel" | "chain";
 	results: SubagentRunDetails[];
+	/** The call started its subagents in the background and returned at once. */
+	background?: boolean;
+	/**
+	 * Rows follow the subagents' live state while this process still has them, instead of the stored snapshot:
+	 * set for background launches, and for `subagent_wait` while it waits.
+	 */
+	live?: boolean;
 }
 
 /** What one subagent row shows, built from a stored run or a live subagent. */
@@ -244,7 +256,7 @@ export function rowFromRun(run: SubagentRunDetails, theme: Theme): SubagentRow {
 }
 
 /** Lines that never wrap: each is cut to the width with an ellipsis. */
-class SingleLines implements Component {
+export class SingleLines implements Component {
 	private readonly lines: string[] | (() => string[]);
 
 	/**
@@ -278,9 +290,10 @@ interface SubagentCallArgs {
 	tasks?: SubagentCallStep[];
 	chain?: SubagentCallStep[];
 	session?: string;
+	background?: boolean;
 }
 
-interface CallState {
+export interface CallState {
 	isPartial: boolean;
 	isError: boolean;
 	outputPad: number;
@@ -295,24 +308,42 @@ function preview(text: string, length: number): string {
 }
 
 /** `● Subagent(name) description`, with the bullet colored by state. */
-export function renderSubagentCall(args: SubagentCallArgs, theme: Theme, state: CallState): Component {
+/**
+ * One call line: `● Title(argument) summary`, with the bullet colored by state. `background` is the call's own
+ * flag; the actual mode also depends on config, so it is marked only when the call asked for it.
+ */
+export function renderCallLine(
+	title: string,
+	argument: string | undefined,
+	summary: string,
+	theme: Theme,
+	state: CallState,
+): Component {
 	const bullet = state.isPartial
 		? theme.fg("accent", "●")
 		: state.isError
 			? theme.fg("error", "●")
 			: theme.fg("success", "●");
 	const pad = " ".repeat(state.outputPad);
+	const head =
+		argument === undefined
+			? theme.bold(title)
+			: `${theme.bold(title)}${theme.fg("muted", "(")}${theme.fg("accent", argument)}${theme.fg("muted", ")")}`;
+	return new SingleLines([`${pad}${bullet} ${head}${summary ? ` ${theme.fg("dim", summary)}` : ""}`]);
+}
+
+export function renderSubagentCall(args: SubagentCallArgs, theme: Theme, state: CallState): Component {
+	const background = args.background ? " · background" : "";
 	const steps = args.chain ?? args.tasks;
 	if (steps && steps.length > 0) {
 		const shape = args.chain ? `${steps.length} in a chain` : `${steps.length} in parallel`;
-		return new SingleLines([`${pad}${bullet} ${theme.bold("Subagents")} ${theme.fg("dim", `· ${shape}`)}`]);
+		return renderCallLine("Subagents", undefined, `· ${shape}${background}`, theme, state);
 	}
 	const name = args.session ?? args.name ?? args.agent ?? "...";
 	const summary = args.session
 		? `follow-up: ${preview(args.task ?? "", 50)}`
 		: (args.description ?? preview(args.task ?? "", 50));
-	const title = `${theme.bold("Subagent")}${theme.fg("muted", "(")}${theme.fg("accent", name)}${theme.fg("muted", ")")}`;
-	return new SingleLines([`${pad}${bullet} ${title} ${theme.fg("dim", summary)}`]);
+	return renderCallLine("Subagent", name, summary + background, theme, state);
 }
 
 /**
@@ -323,7 +354,15 @@ export function renderSubagentCall(args: SubagentCallArgs, theme: Theme, state: 
 export function renderSubagentResult(
 	details: SubagentToolDetails | undefined,
 	fallbackText: string,
-	options: { expanded: boolean; isError: boolean; outputPad: number },
+	options: {
+		expanded: boolean;
+		isError: boolean;
+		outputPad: number;
+		/** The current state of a subagent instance by key, while this process has it. Used when `details.live`. */
+		lookup?: (key: string) => SubagentRunDetails | undefined;
+		/** Rows show only the status icon, name, and description: no status text, turns, timer, or command. */
+		compact?: boolean;
+	},
 	theme: Theme,
 ): Component {
 	const pad = " ".repeat(options.outputPad);
@@ -340,19 +379,89 @@ export function renderSubagentResult(
 	// Built on every render, so spinners and running timers advance with each frame.
 	return new SingleLines(() => {
 		const now = Date.now();
-		return runs.flatMap((run, index) => {
+		return runs.flatMap((stored, index) => {
+			const current = details?.live && stored.key ? options.lookup?.(stored.key) : undefined;
+			const run = current ?? stored;
+			// A background subagent from an earlier pi process: its last stored state is stale, so do not spin.
+			const detached = details?.background && !current && ["pending", "queued", "running"].includes(run.status);
 			const row = rowFromRun(run, theme);
-			let line = `${statusIcon(row.status, theme)} `;
+			let line = `${detached ? theme.fg("muted", "○") : statusIcon(row.status, theme)} `;
 			if (multi) {
 				const step = details?.mode === "chain" ? theme.fg("muted", `${run.step ?? index + 1}. `) : "";
-				line += `${step}${theme.fg("accent", run.id.padEnd(nameWidth))}  `;
+				line += `${step}${theme.fg("accent", options.compact ? run.id : run.id.padEnd(nameWidth))}  `;
+				if (options.compact)
+					return [(index === 0 ? elbow : indent) + line + theme.fg("dim", run.description ?? "")];
 				if (run.description) line += `${theme.fg("dim", run.description)} ${theme.fg("dim", "·")} `;
 			}
-			const lines = [(index === 0 ? elbow : indent) + line + describeRowStatus(row, theme, now)];
+			const status = detached ? theme.fg("muted", "Started in background") : describeRowStatus(row, theme, now);
+			const lines = [(index === 0 ? elbow : indent) + line + status];
 			const command = options.expanded ? latestToolCall(run.messages, theme) : undefined;
 			// Align under the text after the status icon.
 			if (command) lines.push(`${indent}  ${theme.fg("muted", "→ ")}${command}`);
 			return lines;
 		});
 	});
+}
+
+interface WaitArgs {
+	names?: string[];
+	mode?: "all" | "any";
+}
+
+/**
+ * `● Wait(any) · waiting for a subagent to finish`, then `· done waiting` once the wait returns. The argument is
+ * the one target's name, or otherwise the mode: several named targets are listed in the rows below instead.
+ */
+export function renderWaitCall(args: WaitArgs, theme: Theme, state: CallState): Component {
+	const single = args.names?.length === 1 ? args.names[0] : undefined;
+	const mode = args.mode ?? "all";
+	const target = single ? "it" : mode === "any" ? "a subagent" : "subagents";
+	const summary = state.isPartial ? `· waiting for ${target} to finish` : "· done waiting";
+	return renderCallLine("Wait", single ?? mode, summary, theme, state);
+}
+
+/**
+ * Rows under a wait: only while it waits for two or more named targets, one compact row each with the status
+ * icon, name, and description. A wait for all or any subagents would repeat the rows of the calls that started
+ * them, a single target is named on the call line, and a finished wait is a single line. Errors are always shown.
+ */
+export function renderWaitResult(
+	args: WaitArgs,
+	details: SubagentToolDetails | undefined,
+	fallbackText: string,
+	options: {
+		expanded: boolean;
+		isError: boolean;
+		isPartial: boolean;
+		outputPad: number;
+		lookup?: (key: string) => SubagentRunDetails | undefined;
+	},
+	theme: Theme,
+): Component {
+	if (!args.names || args.names.length < 2 || !options.isPartial) {
+		return options.isError ? renderSubagentResult(undefined, fallbackText, options, theme) : new SingleLines([]);
+	}
+	// Always one row per name, even for a single target.
+	const rows = details && { ...details, mode: "parallel" as const };
+	return renderSubagentResult(rows, fallbackText, { ...options, compact: true }, theme);
+}
+
+/** The message posted when background subagents finish: a `● Subagents finished` line with one row each. */
+export function renderBackgroundNotice(
+	results: SubagentRunDetails[],
+	options: { expanded: boolean; outputPad: number },
+	theme: Theme,
+): Component {
+	const isError = results.some(isFailedRun);
+	const summary = `· ${results.length} in the background`;
+	const container = new Container();
+	container.addChild(
+		renderCallLine("Subagents finished", undefined, summary, theme, {
+			isPartial: false,
+			isError,
+			outputPad: options.outputPad,
+		}),
+	);
+	container.addChild(renderSubagentResult({ mode: "parallel", results }, "", { ...options, isError }, theme));
+	return container;
 }

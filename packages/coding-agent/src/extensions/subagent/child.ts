@@ -6,6 +6,7 @@
  * same session file.
  */
 
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -110,6 +111,8 @@ export function buildChildArgs(
 
 export class Subagent {
 	readonly options: SubagentOptions;
+	/** Unique per instance, unlike `id`, which a later pi process may reuse for a different subagent. */
+	readonly key = randomUUID();
 	status: SubagentStatus = "running";
 	/** Completed user, assistant, and tool result messages. */
 	messages: Message[] = [];

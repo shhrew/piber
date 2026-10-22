@@ -171,6 +171,25 @@ describe("subagent run planning", () => {
 		expect(plan.systemPrompt).not.toContain("## Skills");
 	});
 
+	it("reads the background settings, lets a project override them, and ignores invalid values", () => {
+		const { subagentsDir } = createProject({
+			"config.json": JSON.stringify({ defaultMode: "background", onBackgroundComplete: "silent" }),
+		});
+		expect(loadSubagentConfig(subagentsDir)).toMatchObject({
+			defaultMode: "background",
+			onBackgroundComplete: "silent",
+		});
+
+		const invalid = createProject({
+			"config.json": JSON.stringify({ defaultMode: "later", onBackgroundComplete: true }),
+		});
+		const bundled = loadSubagentConfig(null);
+		expect(loadSubagentConfig(invalid.subagentsDir)).toMatchObject({
+			defaultMode: bundled.defaultMode,
+			onBackgroundComplete: bundled.onBackgroundComplete,
+		});
+	});
+
 	it("reads maxConcurrent from the bundled config, lets a project override it, and ignores invalid values", () => {
 		// Compare with the bundled file rather than fixed numbers, so tuning the shipped defaults keeps this passing.
 		const bundled = JSON.parse(readFileSync(join(getSubagentAssetsDir(), "config.json"), "utf-8"));
@@ -178,7 +197,7 @@ describe("subagent run planning", () => {
 
 		const override = bundled.maxConcurrent + 3;
 		const { subagentsDir } = createProject({ "config.json": JSON.stringify({ maxConcurrent: override }) });
-		expect(loadSubagentConfig(subagentsDir)).toEqual({ coreTools: bundled.coreTools, maxConcurrent: override });
+		expect(loadSubagentConfig(subagentsDir)).toEqual({ ...bundled, maxConcurrent: override });
 
 		for (const invalid of [0, -1, 1.5, "3"]) {
 			const project = createProject({ "config.json": JSON.stringify({ maxConcurrent: invalid }) });
