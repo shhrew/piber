@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { discoverAgents } from "../../../src/extensions/subagent/agents.ts";
 import { buildChildArgs, Subagent, type SubagentOptions } from "../../../src/extensions/subagent/child.ts";
 import subagentExtension, { planSubagentRun } from "../../../src/extensions/subagent/index.ts";
-import { loadSubagentConfig } from "../../../src/extensions/subagent/paths.ts";
+import { getSubagentAssetsDir, loadSubagentConfig } from "../../../src/extensions/subagent/paths.ts";
 import { SubagentRegistry } from "../../../src/extensions/subagent/registry.ts";
 import type { SubagentToolDetails } from "../../../src/extensions/subagent/render.ts";
 import { loadSkillGroups, searchSkills } from "../../../src/extensions/subagent/skills.ts";
@@ -172,14 +172,17 @@ describe("subagent run planning", () => {
 	});
 
 	it("reads maxConcurrent from the bundled config, lets a project override it, and ignores invalid values", () => {
-		expect(loadSubagentConfig(null).maxConcurrent).toBe(4);
+		// Compare with the bundled file rather than fixed numbers, so tuning the shipped defaults keeps this passing.
+		const bundled = JSON.parse(readFileSync(join(getSubagentAssetsDir(), "config.json"), "utf-8"));
+		expect(loadSubagentConfig(null)).toEqual(bundled);
 
-		const { subagentsDir } = createProject({ "config.json": JSON.stringify({ maxConcurrent: 2 }) });
-		expect(loadSubagentConfig(subagentsDir)).toEqual({ coreTools: ["read", "grep", "find", "ls"], maxConcurrent: 2 });
+		const override = bundled.maxConcurrent + 3;
+		const { subagentsDir } = createProject({ "config.json": JSON.stringify({ maxConcurrent: override }) });
+		expect(loadSubagentConfig(subagentsDir)).toEqual({ coreTools: bundled.coreTools, maxConcurrent: override });
 
 		for (const invalid of [0, -1, 1.5, "3"]) {
 			const project = createProject({ "config.json": JSON.stringify({ maxConcurrent: invalid }) });
-			expect(loadSubagentConfig(project.subagentsDir).maxConcurrent).toBe(4);
+			expect(loadSubagentConfig(project.subagentsDir).maxConcurrent).toBe(bundled.maxConcurrent);
 		}
 	});
 });

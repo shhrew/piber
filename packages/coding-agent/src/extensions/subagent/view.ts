@@ -31,7 +31,7 @@ import { UserMessageComponent } from "../../modes/interactive/components/user-me
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { Subagent } from "./child.ts";
 import type { SubagentRegistry } from "./registry.ts";
-import { formatUsageStats } from "./render.ts";
+import { formatUsageStats, SPINNER_INTERVAL_MS, spinnerFrame } from "./render.ts";
 
 /** Two presses of the agent-view key within this many milliseconds open or leave the view. */
 export const DOUBLE_PRESS_MS = 400;
@@ -109,12 +109,26 @@ function statusIcon(subagent: Subagent, theme: Theme): string {
 		case "queued":
 			return theme.fg("muted", "◷");
 		case "running":
-			return theme.fg("warning", "⏳");
+			return theme.fg("accent", spinnerFrame());
 		case "done":
 			return theme.fg("success", "✓");
 		default:
 			return theme.fg("error", "✗");
 	}
+}
+
+interface ListSection {
+	title: string;
+	subagents: Subagent[];
+}
+
+/** The list's sections below the main session, in display order, leaving out empty ones. */
+function listSections(subagents: readonly Subagent[]): ListSection[] {
+	return [
+		{ title: "In progress", subagents: subagents.filter((subagent) => subagent.isRunning) },
+		{ title: "Queued", subagents: subagents.filter((subagent) => subagent.isQueued) },
+		{ title: "Completed", subagents: subagents.filter((subagent) => !subagent.isRunning && !subagent.isQueued) },
+	].filter((section) => section.subagents.length > 0);
 }
 
 function oneLine(text: string): string {
@@ -153,8 +167,13 @@ export class AgentView implements Component {
 	private readonly doublePress = new DoublePressDetector();
 	private readonly input = new Input({ prompt: "› " });
 	private readonly unsubscribe: () => void;
-	/** 0 is the main session; 1..n are subagents in registry order. */
-	private selected = 0;
+	/** Redraws running subagents' spinners. */
+	private readonly animation: NodeJS.Timeout;
+	/**
+	 * The selected list row: a subagent id, or undefined for the main session. An id rather than a position, so
+	 * the selection stays on a subagent as it moves between sections.
+	 */
+	private selectedId: string | undefined;
 	private open: Subagent | undefined;
 	/** Status line above the input. Info notices show only while the subagent runs; errors stay until the next action. */
 	private notice: { text: string; isError: boolean } | undefined;
@@ -178,12 +197,18 @@ export class AgentView implements Component {
 		this.input.focused = true;
 		this.input.onSubmit = (value) => this.submit(value);
 		this.unsubscribe = registry.onChange(() => this.tui.requestRender());
+		this.animation = setInterval(() => {
+			if (this.registry.list().some((subagent) => subagent.isRunning)) this.tui.requestRender();
+		}, SPINNER_INTERVAL_MS);
+		this.animation.unref();
 		// Start where the user last was, so switching between sessions takes one or two keys.
-		this.selected = registry.list().findIndex((subagent) => subagent.id === options.initialSelection) + 1;
+		const initial = options.initialSelection;
+		this.selectedId = initial !== undefined && registry.find(initial) ? initial : undefined;
 	}
 
 	dispose(): void {
 		this.unsubscribe();
+		clearInterval(this.animation);
 		if (this.scrollbarTimer) clearTimeout(this.scrollbarTimer);
 	}
 
@@ -202,8 +227,7 @@ export class AgentView implements Component {
 		if (this.open) {
 			this.scrollTranscript(() => this.scroll.scrollBy(event.wheelDelta ?? 0));
 		} else {
-			const last = this.registry.list().length;
-			this.selected = Math.max(0, Math.min(last, this.selected + Math.sign(event.wheelDelta)));
+			this.moveSelection(Math.sign(event.wheelDelta), false);
 		}
 		return { handled: true };
 	}
@@ -215,17 +239,34 @@ export class AgentView implements Component {
 		return lines.slice(0, height).map((line) => truncateToWidth(line, width));
 	}
 
+	/** Selectable rows in display order: the main session, then each section's subagents. Headers are not rows. */
+	private selectableIds(): Array<string | undefined> {
+		return [
+			undefined,
+			...listSections(this.registry.list()).flatMap((section) => section.subagents.map((s) => s.id)),
+		];
+	}
+
+	/** Move the selection by `delta` rows, wrapping around at the ends for the keyboard but not the wheel. */
+	private moveSelection(delta: number, wrap: boolean): void {
+		const ids = this.selectableIds();
+		const current = Math.max(0, ids.indexOf(this.selectedId));
+		const next = wrap
+			? (current + delta + ids.length) % ids.length
+			: Math.max(0, Math.min(ids.length - 1, current + delta));
+		this.selectedId = ids[next];
+	}
+
 	private handleListInput(data: string): void {
-		const count = this.registry.list().length + 1;
 		const kb = this.keybindings;
 		if (this.doublePress.isDoublePress(data, kb) || kb.matches(data, "tui.select.cancel")) {
 			this.close();
 		} else if (kb.matches(data, "tui.select.up")) {
-			this.selected = (this.selected - 1 + count) % count;
+			this.moveSelection(-1, true);
 		} else if (kb.matches(data, "tui.select.down")) {
-			this.selected = (this.selected + 1) % count;
+			this.moveSelection(1, true);
 		} else if (kb.matches(data, "tui.select.confirm")) {
-			const subagent = this.registry.list()[this.selected - 1];
+			const subagent = this.selectedId === undefined ? undefined : this.registry.find(this.selectedId);
 			this.onOpen(subagent?.id);
 			if (!subagent) {
 				this.close();
@@ -310,31 +351,40 @@ export class AgentView implements Component {
 	private renderList(width: number, height: number): string[] {
 		const theme = this.theme;
 		const subagents = this.registry.list();
-		const lines = [
+		const title = [
 			theme.fg("accent", theme.bold(" Agents")),
 			theme.fg("dim", " ↑↓ select · enter open · esc close"),
 			"",
 		];
-		const row = (index: number, text: string) => {
-			const prefix = index === this.selected ? theme.fg("accent", "› ") : "  ";
-			return prefix + (index === this.selected ? theme.bold(text) : text);
+		const lines: string[] = [];
+		let selectedLine = 0;
+		const row = (id: string | undefined, text: string) => {
+			const selected = id === this.selectedId;
+			if (selected) selectedLine = lines.length;
+			return (selected ? theme.fg("accent", "› ") : "  ") + (selected ? theme.bold(text) : text);
 		};
-		lines.push(row(0, `${theme.fg("success", "●")} main session`));
-		subagents.forEach((subagent, index) => {
-			const usage = formatUsageStats(subagent.usage);
-			let text = `${statusIcon(subagent, theme)} ${theme.fg("accent", subagent.id)}`;
-			text += ` ${oneLine(subagent.options.description)}`;
-			text += theme.fg("muted", ` (${subagent.options.agentName})`);
-			const line = row(index + 1, text);
-			const suffix = usage ? `  ${theme.fg("dim", usage)}` : "";
-			const room = width - visibleWidth(suffix);
-			lines.push(room > 20 ? truncateToWidth(line, room) + suffix : line);
-		});
-		if (subagents.length === 0) lines.push(theme.fg("muted", "  No subagents in this session yet."));
-		// Keep the selected row visible in a long list.
-		const overflow = lines.length - height;
-		const selectedLine = 3 + this.selected;
-		return overflow > 0 && selectedLine >= height ? [...lines.slice(0, 3), ...lines.slice(3 + overflow)] : lines;
+		lines.push(row(undefined, `${theme.fg("success", "●")} main session`));
+		for (const section of listSections(subagents)) {
+			lines.push(
+				"",
+				theme.fg("muted", theme.bold(` ${section.title}`)) + theme.fg("dim", ` ${section.subagents.length}`),
+			);
+			for (const subagent of section.subagents) {
+				const usage = formatUsageStats(subagent.usage);
+				let text = `${statusIcon(subagent, theme)} ${theme.fg("accent", subagent.id)}`;
+				text += ` ${oneLine(subagent.options.description)}`;
+				text += theme.fg("muted", ` (${subagent.options.agentName})`);
+				const line = row(subagent.id, text);
+				const suffix = usage ? `  ${theme.fg("dim", usage)}` : "";
+				const room = width - visibleWidth(suffix);
+				lines.push(room > 20 ? truncateToWidth(line, room) + suffix : line);
+			}
+		}
+		if (subagents.length === 0) lines.push("", theme.fg("muted", "  No subagents in this session yet."));
+		// In a long list, scroll the rows below the title so the selected one stays visible.
+		const rows = Math.max(1, height - title.length);
+		const start = Math.max(0, Math.min(selectedLine - rows + 1, lines.length - rows));
+		return [...title, ...lines.slice(start, start + rows)];
 	}
 
 	private renderSession(width: number, height: number, subagent: Subagent): string[] {

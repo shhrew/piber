@@ -12,6 +12,15 @@ import type { SubagentStatus, SubagentUsage } from "./child.ts";
 
 const COLLAPSED_ITEM_COUNT = 10;
 
+/** The frames and timing of pi-tui's `Loader`, the spinner next to "Working", which does not export them. */
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+export const SPINNER_INTERVAL_MS = 80;
+
+/** The spinner frame for the current time, so every running subagent spins in step on each render. */
+export function spinnerFrame(): string {
+	return SPINNER_FRAMES[Math.floor(Date.now() / SPINNER_INTERVAL_MS) % SPINNER_FRAMES.length];
+}
+
 /** One subagent run as stored in the tool result. Plain data, so it survives the session file. */
 export interface SubagentRunDetails {
 	/** The caller-given one-word name. Results stored before names existed hold ids such as `sa1`. */
@@ -133,7 +142,7 @@ function getDisplayItems(messages: readonly Message[]): DisplayItem[] {
 
 function statusIcon(run: SubagentRunDetails, theme: Theme): string {
 	if (run.status === "queued") return theme.fg("muted", "◷");
-	if (run.status === "running" || run.status === "pending") return theme.fg("warning", "⏳");
+	if (run.status === "running" || run.status === "pending") return theme.fg("accent", spinnerFrame());
 	return isFailedRun(run) ? theme.fg("error", "✗") : theme.fg("success", "✓");
 }
 
@@ -270,7 +279,7 @@ export function renderSubagentResult(
 	const succeeded = runs.length - queued - running - failed;
 	const icon =
 		running + queued > 0
-			? theme.fg("warning", "⏳")
+			? theme.fg("accent", spinnerFrame())
 			: failed > 0
 				? theme.fg("warning", "◐")
 				: theme.fg("success", "✓");

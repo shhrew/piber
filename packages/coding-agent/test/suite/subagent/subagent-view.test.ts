@@ -1,10 +1,12 @@
+import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../../../src/core/keybindings.ts";
-import { Subagent } from "../../../src/extensions/subagent/child.ts";
+import { Subagent, type SubagentOptions } from "../../../src/extensions/subagent/child.ts";
 import { SubagentRegistry } from "../../../src/extensions/subagent/registry.ts";
+import { SlotPool } from "../../../src/extensions/subagent/slots.ts";
 import { AgentView, TranscriptScroll } from "../../../src/extensions/subagent/view.ts";
 import { initTheme, theme } from "../../../src/modes/interactive/theme/theme.ts";
 
@@ -55,7 +57,14 @@ function wheel(delta: number): TuiMouseEvent {
 	};
 }
 
-function createSubagent(id: string, description: string, agentName = "worker"): Subagent {
+const fakeChild = fileURLToPath(new URL("./fake-rpc-child.mjs", import.meta.url));
+
+function createSubagent(
+	id: string,
+	description: string,
+	agentName = "worker",
+	overrides: Partial<SubagentOptions> = {},
+): Subagent {
 	const subagent = new Subagent({
 		id,
 		agentName,
@@ -67,6 +76,7 @@ function createSubagent(id: string, description: string, agentName = "worker"): 
 		tools: [],
 		skillGroups: [],
 		projectTrusted: false,
+		...overrides,
 	});
 	subagent.status = "done";
 	return subagent;
@@ -219,5 +229,42 @@ describe("subagent agent view list", () => {
 		view.handleInput(KEYS.left);
 
 		expect(selectedRow()).toContain("alpha");
+	});
+
+	it("groups subagents under In progress, Queued, and Completed, and moves between rows without stopping on headers", async () => {
+		const slots = new SlotPool(1);
+		const hang = { slots, command: { executable: process.execPath, args: [fakeChild, "hang"] } };
+		const finished = createSubagent("finished", "Old job");
+		const runner = createSubagent("runner", "Busy job", "worker", hang);
+		const waiter = createSubagent("waiter", "Next job", "worker", hang);
+		const runs = [runner.run("Task: wait"), waiter.run("Task: wait too")];
+		try {
+			await vi.waitFor(() => expect([runner.isRunning, waiter.isQueued]).toEqual([true, true]));
+			const { view, lines, selectedRow } = createView([finished, runner, waiter]);
+
+			const labels = lines()
+				.map((line) => line.trim())
+				.filter((line) => /^(› )?(● main|.? ?\w+ (Busy|Next|Old) job|In progress|Queued|Completed)/.test(line));
+			expect(labels.map((line) => line.replace(/^› /, "").split(" (")[0])).toEqual([
+				"● main session",
+				"In progress 1",
+				expect.stringMatching(/^. runner Busy job$/),
+				"Queued 1",
+				"◷ waiter Next job",
+				"Completed 1",
+				"✓ finished Old job",
+			]);
+
+			const order = [];
+			for (let i = 0; i < 4; i++) {
+				view.handleInput(KEYS.down);
+				order.push(selectedRow()?.split(" ")[2]);
+			}
+			expect(order).toEqual(["runner", "waiter", "finished", "main"]);
+		} finally {
+			await runner.abort();
+			await waiter.abort();
+			await Promise.all(runs);
+		}
 	});
 });
