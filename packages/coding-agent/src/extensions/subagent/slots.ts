@@ -24,6 +24,16 @@ export class SlotPool {
 		return this.waiting.length;
 	}
 
+	/**
+	 * Take a free slot at once and return the function that gives it back, or undefined when the run must queue.
+	 * It never takes a slot ahead of runs already waiting.
+	 */
+	tryAcquire(): (() => void) | undefined {
+		if (this.active >= this.limit || this.waiting.length > 0) return undefined;
+		this.active++;
+		return this.releaser();
+	}
+
 	/** Change the limit. Raising it starts waiting runs at once; lowering it lets running ones finish. */
 	setLimit(limit: number): void {
 		this.limit = Math.max(1, limit);
@@ -59,13 +69,18 @@ export class SlotPool {
 		while (this.active < this.limit && this.waiting.length > 0) {
 			const waiter = this.waiting.shift()!;
 			this.active++;
-			let released = false;
-			waiter.grant(() => {
-				if (released) return;
-				released = true;
-				this.active--;
-				this.drain();
-			});
+			waiter.grant(this.releaser());
 		}
+	}
+
+	/** A function that returns one slot, once, however often it is called. */
+	private releaser(): () => void {
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.active--;
+			this.drain();
+		};
 	}
 }

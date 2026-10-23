@@ -60,7 +60,7 @@ describe("background subagents", () => {
 		await harness.session.prompt("Delegate in the background");
 
 		const [launch] = toolResults(harness, "subagent");
-		expect(getMessageText(launch)).toContain("Started in the background: bg (Echo me).");
+		expect(getMessageText(launch)).toContain("Started in the background:\n- bg (Echo me): running");
 		expect(launch.details).toMatchObject({ background: true, live: true } satisfies Partial<SubagentToolDetails>);
 		expect(getMessageText(toolResults(harness, "subagent_wait")[0])).toContain(
 			"All targets finished.\n- bg (Echo me): done, 1 turn",
@@ -92,7 +92,12 @@ describe("background subagents", () => {
 			{ timeout: 10_000 },
 		);
 		expect(getMessageText(notices(harness)[0])).toBe(
-			"Background subagents finished:\n- solo (Echo me): done, 1 turn\nRead their results with subagent_result.",
+			[
+				"[Automated notice from the subagent system, not a message from the user.]",
+				"Background subagents you started have finished:",
+				"- solo (Echo me): done, 1 turn",
+				"If the user's request needs their results, read them with subagent_result and continue. Otherwise no reply is needed.",
+			].join("\n"),
 		);
 		await vi.waitFor(() => expect(harness!.session.messages.at(-1)).toMatchObject({ role: "assistant" }));
 	});
@@ -107,7 +112,7 @@ describe("background subagents", () => {
 					{ agent: "scout", task: "slow job", name: "slow", description: "Slow job" },
 				],
 			}),
-			call("subagent_wait", { mode: "any" }),
+			call("subagent_wait", { returnOnFirst: true }),
 			fauxAssistantMessage("one done"),
 			// The slow subagent's notice starts another turn later.
 			fauxAssistantMessage("noted"),
@@ -126,6 +131,30 @@ describe("background subagents", () => {
 		expect(getMessageText(notices(harness)[0])).not.toContain("fast");
 	});
 
+	it("drops the notice for a subagent whose result the orchestrator read before its run settled", async () => {
+		harness = await createSession();
+		harness.setResponses([
+			call("subagent", {
+				background: true,
+				tasks: [
+					{ agent: "scout", task: "echo fast", name: "fast", description: "Fast job" },
+					{ agent: "scout", task: "slow job", name: "slow", description: "Slow job" },
+				],
+			}),
+			// While this waits for slow, fast finishes and its notice comes due mid-run.
+			call("subagent_wait", { names: ["slow"] }),
+			call("subagent_result", { names: ["fast", "slow"] }),
+			fauxAssistantMessage("both read"),
+		]);
+
+		await harness.session.prompt("Run both and read them");
+
+		expect(getMessageText(toolResults(harness, "subagent_result")[0])).toContain("echo: Task: echo fast");
+		await new Promise((resolve) => setTimeout(resolve, 1000));
+		expect(notices(harness)).toEqual([]);
+		expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant" });
+	});
+
 	it("follows the project config: background by default, and silent completion", async () => {
 		harness = await createSession({ defaultMode: "background", onBackgroundComplete: "silent" });
 		harness.setResponses([
@@ -135,7 +164,9 @@ describe("background subagents", () => {
 
 		await harness.session.prompt("Delegate");
 
-		expect(getMessageText(toolResults(harness, "subagent")[0])).toContain("Started in the background: quiet");
+		expect(getMessageText(toolResults(harness, "subagent")[0])).toContain(
+			"Started in the background:\n- quiet (Quiet job): running",
+		);
 		await new Promise((resolve) => setTimeout(resolve, 1500));
 		expect(notices(harness)).toEqual([]);
 	});
@@ -158,12 +189,63 @@ describe("background subagents", () => {
 
 		await harness.session.prompt("Check early");
 
-		expect(getMessageText(toolResults(harness, "subagent_result")[0])).toBe(
-			"### busy (running)\n\nStill running; wait for it with subagent_wait.\n\n---\n\n### ghost\n\nUnknown subagent.",
+		const [early] = toolResults(harness, "subagent_result");
+		expect(early.isError).toBe(true);
+		expect(getMessageText(early)).toBe(
+			[
+				"### busy (not finished)\n\nNo result yet: running. Wait for it with subagent_wait, or check subagent_list.",
+				"### ghost\n\nUnknown subagent. List this session's subagents with subagent_list.",
+			].join("\n\n---\n\n"),
 		);
 		const [unknownWait, namedWait] = toolResults(harness, "subagent_wait");
 		expect(unknownWait.isError).toBe(true);
 		expect(getMessageText(unknownWait)).toBe("Unknown subagents: ghost. Known: busy.");
 		expect(getMessageText(namedWait)).toContain("- busy (Busy job): done, 1 turn");
 	});
+
+	it("reports queued subagents, lists subagents with their result state, and refuses early reads", async () => {
+		harness = await createSession({ maxConcurrent: 1 });
+		harness.setResponses([
+			call("subagent", {
+				background: true,
+				tasks: [
+					{ agent: "scout", task: "slow one", name: "one", description: "First" },
+					{ agent: "scout", task: "slow two", name: "two", description: "Second" },
+					{ agent: "scout", task: "slow three", name: "three", description: "Third" },
+				],
+			}),
+			call("subagent_list", {}),
+			call("subagent_result", { names: ["three"] }),
+			call("subagent_wait", {}),
+			call("subagent_result", { names: ["one"] }),
+			call("subagent_list", {}),
+			fauxAssistantMessage("done"),
+		]);
+
+		await harness.session.prompt("Queue three");
+
+		expect(getMessageText(toolResults(harness, "subagent")[0])).toContain(
+			["- one (First): running", "- two (Second): queued", "- three (Third): queued"].join("\n"),
+		);
+		const [before, after] = toolResults(harness, "subagent_list");
+		expect(getMessageText(before)).toBe(
+			[
+				"Subagents: 1 running, 2 queued, 0 finished (0 results not read).",
+				"- one (First): running",
+				"- two (Second): queued",
+				"- three (Third): queued",
+			].join("\n"),
+		);
+		const [early] = toolResults(harness, "subagent_result");
+		expect(early.isError).toBe(true);
+		expect(getMessageText(early)).toContain("No result yet: queued.");
+		expect(getMessageText(after)).toBe(
+			[
+				"Subagents: 0 running, 0 queued, 3 finished (2 results not read).",
+				"- one (First): done, 1 turn; result read",
+				"- two (Second): done, 1 turn; result not read",
+				"- three (Third): done, 1 turn; result not read",
+			].join("\n"),
+		);
+	}, 20_000);
 });

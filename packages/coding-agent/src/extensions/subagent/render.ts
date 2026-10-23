@@ -405,7 +405,7 @@ export function renderSubagentResult(
 
 interface WaitArgs {
 	names?: string[];
-	mode?: "all" | "any";
+	returnOnFirst?: boolean;
 }
 
 /**
@@ -414,7 +414,7 @@ interface WaitArgs {
  */
 export function renderWaitCall(args: WaitArgs, theme: Theme, state: CallState): Component {
 	const single = args.names?.length === 1 ? args.names[0] : undefined;
-	const mode = args.mode ?? "all";
+	const mode = args.returnOnFirst ? "any" : "all";
 	const target = single ? "it" : mode === "any" ? "a subagent" : "subagents";
 	const summary = state.isPartial ? `· waiting for ${target} to finish` : "· done waiting";
 	return renderCallLine("Wait", single ?? mode, summary, theme, state);
@@ -444,6 +444,26 @@ export function renderWaitResult(
 	// Always one row per name, even for a single target.
 	const rows = details && { ...details, mode: "parallel" as const };
 	return renderSubagentResult(rows, fallbackText, { ...options, compact: true }, theme);
+}
+
+/** `⎿  2 running · 1 queued · 3 done · 1 failed`: the counts behind a subagent list. */
+export function renderListResult(details: SubagentToolDetails | undefined, outputPad: number, theme: Theme): Component {
+	const runs = details?.results ?? [];
+	const elbow = `${" ".repeat(outputPad)}  ${theme.fg("muted", "⎿")}  `;
+	if (runs.length === 0) return new SingleLines([elbow + theme.fg("dim", "No subagents")]);
+	const count = (statuses: Array<SubagentRunDetails["status"]>) =>
+		runs.filter((run) => statuses.includes(run.status)).length;
+	const parts = [
+		[count(["running", "pending"]), "running"],
+		[count(["queued"]), "queued"],
+		[count(["done"]), "done"],
+		[count(["failed", "aborted"]), "failed"],
+	] as const;
+	const text = parts
+		.filter(([total]) => total > 0)
+		.map(([total, label]) => `${total} ${label}`)
+		.join(" · ");
+	return new SingleLines([elbow + theme.fg("dim", text)]);
 }
 
 /** The message posted when background subagents finish: a `● Subagents finished` line with one row each. */

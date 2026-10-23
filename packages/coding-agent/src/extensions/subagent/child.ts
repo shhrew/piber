@@ -185,7 +185,9 @@ export class Subagent {
 
 		let release: (() => void) | undefined;
 		try {
-			if (this.options.slots) {
+			// Take a free slot at once, so a subagent is `queued` only while it really waits for one.
+			release = this.options.slots?.tryAcquire();
+			if (this.options.slots && !release) {
 				this.status = "queued";
 				this.emit();
 				try {

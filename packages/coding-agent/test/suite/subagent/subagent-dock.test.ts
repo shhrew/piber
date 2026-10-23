@@ -12,6 +12,7 @@ import {
 	formatPhase,
 	latestToolCall,
 	renderBackgroundNotice,
+	renderListResult,
 	renderSubagentCall,
 	renderSubagentResult,
 	renderWaitCall,
@@ -369,20 +370,22 @@ describe("wait rendering", () => {
 		expect(plain(renderWaitCall({}, theme, waiting).render(100))).toEqual([
 			" ● Wait(all) · waiting for subagents to finish",
 		]);
-		expect(plain(renderWaitCall({ mode: "any" }, theme, waiting).render(100))).toEqual([
+		expect(plain(renderWaitCall({ returnOnFirst: true }, theme, waiting).render(100))).toEqual([
 			" ● Wait(any) · waiting for a subagent to finish",
 		]);
 		expect(plain(renderWaitCall({}, theme, { ...waiting, isPartial: false }).render(100))).toEqual([
 			" ● Wait(all) · done waiting",
 		]);
-		expect(renderWaitResult({ mode: "any" }, details, "", options, theme).render(100)).toEqual([]);
+		expect(renderWaitResult({ returnOnFirst: true }, details, "", options, theme).render(100)).toEqual([]);
 	});
 
 	it("names the mode on the call line for several targets, and the target itself for one", () => {
-		const several = plain(renderWaitCall({ names: ["scout-a", "scout-b"], mode: "any" }, theme, waiting).render(100));
+		const several = plain(
+			renderWaitCall({ names: ["scout-a", "scout-b"], returnOnFirst: true }, theme, waiting).render(100),
+		);
 		expect(several).toEqual([" ● Wait(any) · waiting for a subagent to finish"]);
 
-		const one = plain(renderWaitCall({ names: ["scout-a"], mode: "any" }, theme, waiting).render(100));
+		const one = plain(renderWaitCall({ names: ["scout-a"], returnOnFirst: true }, theme, waiting).render(100));
 		expect(one).toEqual([" ● Wait(scout-a) · waiting for it to finish"]);
 		expect(renderWaitResult({ names: ["a"] }, details, "", options, theme).render(100)).toEqual([]);
 	});
@@ -404,5 +407,25 @@ describe("wait rendering", () => {
 			renderWaitResult({}, undefined, "Unknown subagents: ghost.", { ...options, isError: true }, theme).render(100),
 		);
 		expect(lines).toEqual(["   ⎿  Unknown subagents: ghost."]);
+	});
+});
+
+describe("list rendering", () => {
+	it("summarizes the list in one line of counts", () => {
+		const details = {
+			mode: "parallel" as const,
+			results: [
+				run("a", { status: "running" }),
+				run("b", { status: "queued" }),
+				run("c"),
+				run("d", { status: "failed" }),
+			],
+		};
+		expect(plain(renderListResult(details, 1, theme).render(100))).toEqual([
+			"   ⎿  1 running · 1 queued · 1 done · 1 failed",
+		]);
+		expect(plain(renderListResult({ mode: "parallel", results: [] }, 1, theme).render(100))).toEqual([
+			"   ⎿  No subagents",
+		]);
 	});
 });

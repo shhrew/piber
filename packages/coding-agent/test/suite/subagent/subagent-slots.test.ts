@@ -60,4 +60,19 @@ describe("subagent slot pool", () => {
 		await flush();
 		expect(started).toBe(true);
 	});
+
+	it("takes a free slot at once, but never ahead of runs already waiting", async () => {
+		const pool = new SlotPool(1);
+		const first = pool.tryAcquire();
+		expect(first).toBeTypeOf("function");
+		expect(pool.tryAcquire()).toBeUndefined();
+
+		const waiting = pool.acquire();
+		first!();
+		// The freed slot goes to the waiting run, not to a later tryAcquire.
+		expect(pool.tryAcquire()).toBeUndefined();
+		const release = await waiting;
+		release();
+		expect([pool.running, pool.queued]).toEqual([0, 0]);
+	});
 });

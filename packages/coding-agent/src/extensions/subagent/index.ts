@@ -30,6 +30,7 @@ import {
 	isFailedRun,
 	renderBackgroundNotice,
 	renderCallLine,
+	renderListResult,
 	renderSubagentCall,
 	renderSubagentResult,
 	renderWaitCall,
@@ -51,6 +52,7 @@ export const SKILL_SEARCH_TOOL_NAME = "skill_search";
 export const LOAD_SKILL_TOOL_NAME = "load_skill";
 export const SUBAGENT_WAIT_TOOL_NAME = "subagent_wait";
 export const SUBAGENT_RESULT_TOOL_NAME = "subagent_result";
+export const SUBAGENT_LIST_TOOL_NAME = "subagent_list";
 /** Custom message type of the notice posted when background subagents finish. */
 const BACKGROUND_NOTICE_TYPE = "subagent-background-complete";
 /** Background subagents that finish within this window are announced in one notice. */
@@ -118,12 +120,15 @@ const WaitParams = Type.Object({
 			description: "Names of the subagents to wait for. Default: every subagent still running or queued.",
 		}),
 	),
-	mode: Type.Optional(
-		Type.Union([Type.Literal("all"), Type.Literal("any")], {
-			description: '"all" (default) waits until every target has finished; "any" returns when any one finishes.',
+	returnOnFirst: Type.Optional(
+		Type.Boolean({
+			description:
+				"Return as soon as ONE target finishes, leaving the rest running. Leave unset to wait until EVERY target has finished, which is what you want before reading all of their results.",
 		}),
 	),
 });
+
+const ListParams = Type.Object({});
 
 const ResultParams = Type.Object({
 	names: Type.Array(Type.String(), {
@@ -435,10 +440,14 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 	const jobListeners = new Set<() => void>();
 	/** Subagents whose outcome a wait or result call already gave the orchestrator, so no notice repeats it. */
 	const reported = new Set<string>();
+	/** Subagents whose result `subagent_result` returned, for `subagent_list`. */
+	const resultsRead = new Set<string>();
 	/** Bumped when the session changes, so subagents of an earlier session never post notices into this one. */
 	let generation = 0;
 	const pendingNotices: Array<{ subagent: Subagent; completion: BackgroundCompletion }> = [];
 	let noticeTimer: NodeJS.Timeout | undefined;
+	/** From the orchestrator's agent_start to agent_settled: notices are held while it works. */
+	let orchestratorBusy = false;
 
 	const trackJob = (job: Promise<void>) => {
 		backgroundJobs.add(job);
@@ -451,15 +460,21 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 	/** Post one notice for the background subagents that finished in the last batch window. */
 	const flushNotices = () => {
 		noticeTimer = undefined;
+		// A message posted mid-run is only delivered when the run ends, by which time the orchestrator may have
+		// read these results itself. So wait for it to settle, and only then drop what it has seen.
+		if (orchestratorBusy) return;
 		const batch = pendingNotices.splice(0).filter(({ subagent }) => !reported.has(subagent.key));
 		for (const completion of ["wake", "notify"] as const) {
 			const subagents = batch.filter((entry) => entry.completion === completion).map((entry) => entry.subagent);
 			if (subagents.length === 0) continue;
 			for (const subagent of subagents) reported.add(subagent.key);
 			const content = [
-				"Background subagents finished:",
+				// The model receives this in the user role, so say plainly that the user did not write it and what is
+				// expected; without that, models remark on a "user message" that is not from the user.
+				"[Automated notice from the subagent system, not a message from the user.]",
+				"Background subagents you started have finished:",
 				...subagents.map(statusLine),
-				`Read their results with ${SUBAGENT_RESULT_TOOL_NAME}.`,
+				`If the user's request needs their results, read them with ${SUBAGENT_RESULT_TOOL_NAME} and continue. Otherwise no reply is needed.`,
 			].join("\n");
 			pi.sendMessage(
 				{
@@ -552,11 +567,10 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 
 		const lines: string[] = [];
 		if (started.length > 0) {
-			const names = started.map((subagent) => `${subagent.id} (${subagent.options.description})`).join(", ");
-			lines.push(`Started in the background: ${names}.`);
+			lines.push("Started in the background:", ...started.map(statusLine));
 			if (mode === "chain") lines.push("Later chain steps start as earlier ones finish.");
 			lines.push(
-				`They keep working while you continue. Wait for them with ${SUBAGENT_WAIT_TOOL_NAME} and read their results with ${SUBAGENT_RESULT_TOOL_NAME}.`,
+				`They keep working while you continue. To collect them, call ${SUBAGENT_WAIT_TOOL_NAME} (it returns once all of them have finished), then ${SUBAGENT_RESULT_TOOL_NAME}.`,
 			);
 			if (completion !== "silent") lines.push("You will also be told when they finish.");
 		}
@@ -818,16 +832,17 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		name: SUBAGENT_WAIT_TOOL_NAME,
 		label: "Subagent Wait",
 		description: [
-			"Wait for subagents to finish: the named ones, or every subagent still running or queued.",
-			'mode "any" returns as soon as the first finishes, so you can handle results as they arrive.',
-			`Returns each target's status. Read finished subagents' results with ${SUBAGENT_RESULT_TOOL_NAME}.`,
+			"Wait until subagents finish: the named ones, or every subagent still running or queued.",
+			"By default it returns only once ALL targets have finished.",
+			"Set returnOnFirst only to handle results one at a time as each subagent finishes.",
+			`Returns each target's status. Then read finished subagents' results with ${SUBAGENT_RESULT_TOOL_NAME}.`,
 		].join(" "),
 		promptSnippet: "Wait for background subagents to finish",
 		parameters: WaitParams,
 		renderShell: "self",
 
 		async execute(_toolCallId, params, signal, onUpdate) {
-			const mode = params.mode ?? "all";
+			const mode = params.returnOnFirst ? "any" : "all";
 			const unknown = (params.names ?? []).filter((name) => !registry.find(name));
 			if (unknown.length > 0) {
 				const known =
@@ -940,7 +955,8 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		label: "Subagent Result",
 		description: [
 			"Read the results of finished subagents: each one's final answer, or its error.",
-			`Pass several names to read several results in one call. Running subagents have no result yet; wait for them with ${SUBAGENT_WAIT_TOOL_NAME}.`,
+			`Only for subagents that have finished: running and queued ones have no result yet, so check ${SUBAGENT_LIST_TOOL_NAME} or wait with ${SUBAGENT_WAIT_TOOL_NAME} first.`,
+			"Pass several names to read several results in one call.",
 		].join(" "),
 		promptSnippet: "Read the results of finished subagents",
 		parameters: ResultParams,
@@ -949,23 +965,26 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		async execute(_toolCallId, params) {
 			const sections: string[] = [];
 			const results: SubagentRunDetails[] = [];
-			let missing = 0;
+			let read = 0;
 			for (const name of params.names) {
 				const subagent = registry.find(name);
 				if (!subagent) {
-					missing++;
-					sections.push(`### ${name}\n\nUnknown subagent.`);
+					sections.push(
+						`### ${name}\n\nUnknown subagent. List this session's subagents with ${SUBAGENT_LIST_TOOL_NAME}.`,
+					);
 					continue;
 				}
 				results.push(statusDetails(subagent));
 				if (!isSettled(subagent)) {
 					const state = subagent.isQueued ? "queued" : "running";
 					sections.push(
-						`### ${subagent.id} (${state})\n\nStill ${state}; wait for it with ${SUBAGENT_WAIT_TOOL_NAME}.`,
+						`### ${subagent.id} (not finished)\n\nNo result yet: ${state}. Wait for it with ${SUBAGENT_WAIT_TOOL_NAME}, or check ${SUBAGENT_LIST_TOOL_NAME}.`,
 					);
 					continue;
 				}
+				read++;
 				reported.add(subagent.key);
+				resultsRead.add(subagent.key);
 				sections.push(
 					`### ${subagent.id} (${subagent.status})\n\n${truncateOutput(runOutput(toDetails(subagent)))}`,
 				);
@@ -973,7 +992,8 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 			return {
 				content: [{ type: "text", text: sections.join("\n\n---\n\n") }],
 				details: { mode: "parallel", results },
-				isError: missing === params.names.length || undefined,
+				// No result at all is an error, so the orchestrator notices it asked too early.
+				isError: read === 0 || undefined,
 			};
 		},
 
@@ -992,6 +1012,49 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		},
 	});
 
+	pi.registerTool<typeof ListParams, SubagentToolDetails>({
+		name: SUBAGENT_LIST_TOOL_NAME,
+		label: "Subagent List",
+		description: [
+			"List this session's subagents and their status: running, queued (waiting for a free slot),",
+			`or finished, with whether you have read its result. Check it before ${SUBAGENT_RESULT_TOOL_NAME} to read only finished subagents.`,
+		].join(" "),
+		promptSnippet: "List subagents and their status",
+		parameters: ListParams,
+		renderShell: "self",
+
+		async execute() {
+			const subagents = registry.list();
+			if (subagents.length === 0) {
+				return {
+					content: [{ type: "text", text: "No subagents in this session." }],
+					details: { mode: "parallel", results: [] },
+				};
+			}
+			const running = subagents.filter((subagent) => subagent.isRunning);
+			const queued = subagents.filter((subagent) => subagent.isQueued);
+			const finished = subagents.filter(isSettled);
+			const unread = finished.filter((subagent) => !resultsRead.has(subagent.key));
+			const heading = `Subagents: ${running.length} running, ${queued.length} queued, ${finished.length} finished (${unread.length} result${unread.length === 1 ? "" : "s"} not read).`;
+			const lines = subagents.map((subagent) => {
+				if (!isSettled(subagent)) return statusLine(subagent);
+				return `${statusLine(subagent)}; result ${resultsRead.has(subagent.key) ? "read" : "not read"}`;
+			});
+			return {
+				content: [{ type: "text", text: [heading, ...lines].join("\n") }],
+				details: { mode: "parallel", results: subagents.map(statusDetails) },
+			};
+		},
+
+		renderCall(_args, theme, context) {
+			return renderCallLine("List", "subagents", "", theme, context);
+		},
+
+		renderResult(result, _options, theme, context) {
+			return renderListResult(result.details, context.outputPad, theme);
+		},
+	});
+
 	pi.registerMessageRenderer<{ results: SubagentRunDetails[] }>(BACKGROUND_NOTICE_TYPE, (message, options, theme) =>
 		message.details ? renderBackgroundNotice(message.details.results, options, theme) : undefined,
 	);
@@ -1003,6 +1066,15 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		noticeTimer = undefined;
 		reported.clear();
 	};
+
+	pi.on("agent_start", () => {
+		orchestratorBusy = true;
+	});
+
+	pi.on("agent_settled", () => {
+		orchestratorBusy = false;
+		if (pendingNotices.length > 0 && !noticeTimer) flushNotices();
+	});
 
 	pi.on("session_start", (_event, ctx) => {
 		resetBackground();

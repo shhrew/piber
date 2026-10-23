@@ -89,14 +89,19 @@ Every mode accepts `cwd`, `extraTools`, and `extraSkillGroups`, at the top level
 
 By default a `subagent` call runs in the foreground: it returns when its subagents finish, and the orchestrator waits. With `background: true` (or `defaultMode: "background"` in the config), the call starts its subagents and returns at once with their names, and the orchestrator keeps working. A background chain starts its later steps as earlier ones finish.
 
-Two tools manage background subagents:
+Three tools manage background subagents:
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `subagent_wait` | `names` (optional), `mode`: `"all"` (default) or `"any"` | Each target's status once all of them, or the first, has finished. Without `names`, it waits for every subagent still running or queued, including later chain steps. |
-| `subagent_result` | `names` (one or more) | Each finished subagent's final answer, or its error, capped at 50 KB each. Running subagents have no result yet. |
+| `subagent_wait` | `names` (optional), `returnOnFirst` (optional, default `false`) | Each target's status once all of them have finished, or, with `returnOnFirst`, once the first has. Without `names`, it waits for every subagent still running or queued, including later chain steps. The chat shows `Wait(all)` or `Wait(any)`. |
+| `subagent_result` | `names` (one or more) | Each finished subagent's final answer, or its error, capped at 50 KB each. Running and queued subagents have no result yet; a call that returns no result at all is an error, so the orchestrator notices it asked too early. |
+| `subagent_list` | none | Every subagent in the session: running, queued (waiting for a free slot), or finished, with whether its result has been read. |
+
+A subagent is `queued` only while it waits for a free slot (see `maxConcurrent`); one that finds a free slot starts at once.
 
 When a background subagent finishes and no wait or result call has reported it, the orchestrator is told, as `onBackgroundComplete` sets. Subagents that finish within half a second of each other share one notice. The notice gives each subagent's status and points to `subagent_result`; it never includes the output.
+
+While the orchestrator is working, notices are held until its run settles. A message posted mid-run would only be delivered at the end of the run, after the orchestrator may already have read those results; holding it lets the extension drop subagents that a wait or result call reported in the meantime, and post nothing if none are left.
 
 In the chat, a background call's rows keep updating after the call returns. A wait for all or any subagents shows only its call line (`● Wait(all) · waiting for a subagent to finish`); a wait for two or more named subagents shows the mode and adds one row each with the name and description while it waits; a wait for one subagent names it on the call line (`● Wait(scout-a) · waiting for it to finish`). A finished wait is always a single line, such as `● Wait(any) · done waiting`. Background subagents stop when the session ends; after a resume, their rows show `Started in background`.
 
@@ -181,7 +186,7 @@ Dialogs from a subagent's extensions (confirm, select, input) appear in the pare
 
 | File | Purpose |
 |---|---|
-| `index.ts` | Tools (`subagent`, `subagent_wait`, `subagent_result`, and the skill tools), run planning, background notices, and the agent-view trigger |
+| `index.ts` | Tools (`subagent`, `subagent_wait`, `subagent_result`, `subagent_list`, and the skill tools), run planning, background notices, and the agent-view trigger |
 | `agents.ts` | Agent discovery |
 | `skills.ts` | Skill groups, tags, and search |
 | `child.ts` | One subagent process and its transcript |
