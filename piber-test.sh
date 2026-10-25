@@ -10,6 +10,7 @@ usage() {
   echo
   echo "Scenarios:"
   echo "  chat   Subagent chat: subagent to subagent, reply waits, orchestrator replies, held messages, broadcast"
+  echo "  skills Skill search: listing, query and tag ranking, no match, load_skill, tool gating, extraSkillGroups"
 }
 
 chat_prompt() {
@@ -35,6 +36,40 @@ This is a manual test of the subagent chat feature. Follow these steps exactly. 
 EOF
 }
 
+skills_prompt() {
+  cat <<'EOF'
+This is a manual test of subagent skill search. Follow these steps exactly. Do not edit any files, and tell every subagent not to edit files either. Tell every subagent to quote each tool result verbatim in its final answer.
+
+The bundled "review" skill group holds two skills:
+- review-checklist, tags [review, quality, tests]
+- security-review, tags [review, security], description mentions path traversal
+
+1. In ONE `subagent` call with `background: false`, run these three subagents in parallel:
+   - `reviewer`, name "rex", task: Do not edit files and do not review any code. Make these calls in order and quote each result verbatim:
+     a. skill_search with no arguments
+     b. skill_search with query "path traversal"
+     c. skill_search with tags ["security"]
+     d. skill_search with tags ["review"] and limit 1
+     e. skill_search with query "kubernetes"
+     f. load_skill with name "security-review"
+     g. load_skill with name "does-not-exist"
+     Also quote the "Skills" section of your system prompt verbatim.
+   - `scout`, name "sam", task: Do not edit files. List the names of every tool you have. State whether skill_search and load_skill are among them. Do not call any other tool.
+   - `scout`, name "sky", with `extraSkillGroups: ["review"]`, task: Do not edit files. List the names of every tool you have. Then call skill_search with query "tests" and quote the result verbatim.
+2. Give a checklist, each item marked worked or failed with the evidence:
+   - rex (a): lists both skills, in name order, with tags
+   - rex (b): security-review is the first match
+   - rex (c): only security-review
+   - rex (d): exactly one result
+   - rex (e): "No skills matched", followed by the available tags (quality, review, security, tests)
+   - rex (f): returns the security-review body inside a <skill name="security-review" directory="..."> wrapper
+   - rex (g): an error saying the skill is not available
+   - rex prompt: Skills section lists the tags and the pinned skill review-checklist
+   - sam: has neither skill_search nor load_skill
+   - sky: has skill_search and load_skill, and query "tests" returns review-checklist first
+EOF
+}
+
 if [[ $# -lt 1 ]]; then
   usage
   exit 1
@@ -46,6 +81,9 @@ shift
 case "$SCENARIO" in
   chat)
     PROMPT="$(chat_prompt)"
+    ;;
+  skills)
+    PROMPT="$(skills_prompt)"
     ;;
   -h | --help)
     usage
