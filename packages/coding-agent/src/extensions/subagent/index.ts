@@ -31,6 +31,7 @@ import {
 	type ChatDelivery,
 	type ChatDirectory,
 	ChatHub,
+	ChatLog,
 	type ChatPeer,
 	type ChatRights,
 	canMessageAnyone,
@@ -425,6 +426,8 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 	/** The project whose config the chat hub reads, from the latest run or chat call. */
 	let chatProjectDir: string | null = null;
 	let chatHub: ChatHub | undefined;
+	/** Every send in this session, for the agent view's chat tab. Outlives the hub, which is created on first use. */
+	const chatLog = new ChatLog();
 	/**
 	 * Chat messages to the orchestrator that have not reached its context yet: a steer waits for the current tool
 	 * calls to end. `subagent_wait` returns at once while any are unread, so the orchestrator can answer them.
@@ -452,6 +455,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		chatHub ??= new ChatHub({
 			directory: chatDirectory,
 			config: (): ChatConfig => loadSubagentConfig(chatProjectDir).chat,
+			log: chatLog,
 			// Steers the orchestrator while it works, and starts a turn when it is idle.
 			deliverToOrchestrator: (delivery) => {
 				unreadChat.set(delivery.id, delivery);
@@ -472,6 +476,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 	const closeChat = () => {
 		chatHub?.close();
 		chatHub = undefined;
+		chatLog.clear();
 		unreadChat.clear();
 		chatClient?.close();
 		chatClient = undefined;
@@ -1438,6 +1443,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 								lastViewed = id;
 							},
 							isAwaitingReply,
+							chatLog,
 							close: () => done(undefined),
 						}),
 					{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left" } },

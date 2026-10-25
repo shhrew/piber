@@ -5,11 +5,13 @@ import type { CustomMessage } from "../../../src/core/messages.ts";
 import { discoverAgents } from "../../../src/extensions/subagent/agents.ts";
 import {
 	CHAT_FLAG,
+	CHAT_LOG_LIMIT,
 	CHAT_MESSAGE_TYPE,
 	CHAT_TOKEN_ENV,
 	ChatClient,
 	type ChatDelivery,
 	ChatHub,
+	ChatLog,
 	type ChatPeer,
 	frameMessage,
 	ORCHESTRATOR,
@@ -104,10 +106,12 @@ function createHub(overrides: Partial<ChatConfig> = {}) {
 	const peers = new Map<string, ChatPeer>();
 	const toOrchestrator: ChatDelivery[] = [];
 	const config: ChatConfig = { ...loadSubagentConfig(null).chat, ...overrides };
+	const log = new ChatLog();
 	const hub = new ChatHub({
 		directory: { find: (name) => peers.get(name), list: () => [...peers.values()] },
 		config: () => config,
 		deliverToOrchestrator: (delivery) => toOrchestrator.push(delivery),
+		log,
 	});
 	cleanups.push(() => hub.close());
 
@@ -125,7 +129,7 @@ function createHub(overrides: Partial<ChatConfig> = {}) {
 		};
 		return { peer, token, connect };
 	};
-	return { hub, peers, join, toOrchestrator };
+	return { hub, peers, join, toOrchestrator, log };
 }
 
 describe("chat hub", () => {
@@ -230,6 +234,66 @@ describe("chat hub", () => {
 		expect((await chatty.client.send({ to: "orchestrator", text: "three" })).text).toBe(
 			"You have sent 2 messages in the last minute; wait before sending more.",
 		);
+	});
+});
+
+describe("chat log", () => {
+	it("records delivered, refused, held, and broadcast sends in order", async () => {
+		const { hub, peers, join, log } = createHub();
+		const scout = await join("scout", ["orchestrator", "all"]).connect();
+		const later = join("later", [], "queued");
+
+		await scout.client.send({ to: "orchestrator", text: "Found  it\nin a.ts" });
+		await scout.client.send({ to: "scout", text: "nope" });
+		await hub.send(ORCHESTRATOR, { to: "later", text: "Start with a.ts" });
+		await scout.client.send({ to: "all", text: "Plan B" });
+
+		const summary = () =>
+			log.entries().map(({ from, to, text, held, refused }) => ({ from, to, text, held, refused }));
+		expect(summary()).toEqual([
+			{ from: "scout", to: "orchestrator", text: "Found  it\nin a.ts", held: 0, refused: undefined },
+			{
+				from: "scout",
+				to: "scout",
+				text: "nope",
+				held: 0,
+				refused: "You cannot message yourself.",
+			},
+			{ from: "orchestrator", to: "later", text: "Start with a.ts", held: 1, refused: undefined },
+			{ from: "scout", to: "all", text: "Plan B", held: 1, refused: undefined },
+		]);
+		expect(log.entries()[1].id).toBe("");
+
+		peers.get("later")!.state = "running";
+		await later.connect();
+		await vi.waitFor(() => expect(summary().map((entry) => entry.held)).toEqual([0, 0, 0, 0]));
+	});
+
+	it("records a send that waits for a reply when it is sent, not when the reply arrives", async () => {
+		const { join, log } = createHub();
+		const asker = await join("asker", ["subagents"]).connect();
+		await join("answerer", ["subagents"]).connect();
+
+		const pending = asker.client.send({ to: "answerer", text: "Ready?", waitForReply: true, timeoutSeconds: 30 });
+		await vi.waitFor(() => expect(log.entries().map((entry) => entry.awaitingReply)).toEqual([true]));
+		asker.client.close();
+		await pending;
+	});
+
+	it("keeps at most CHAT_LOG_LIMIT entries and notifies listeners", () => {
+		const log = new ChatLog();
+		let changes = 0;
+		const stop = log.onChange(() => changes++);
+		for (let i = 0; i < CHAT_LOG_LIMIT + 5; i++) {
+			log.add({ id: `m${i}`, at: 0, from: "a", to: "b", text: `${i}`, awaitingReply: false, held: 0 });
+		}
+		expect(log.entries()).toHaveLength(CHAT_LOG_LIMIT);
+		expect(log.entries()[0].text).toBe("5");
+		expect(changes).toBe(CHAT_LOG_LIMIT + 5);
+		stop();
+		log.clear();
+		expect(changes).toBe(CHAT_LOG_LIMIT + 5);
+		expect(log.entries()).toEqual([]);
 	});
 });
 

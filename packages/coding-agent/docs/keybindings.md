@@ -145,6 +145,13 @@ On native Windows, `app.suspend` has no default because Windows terminals do not
 | `app.session.delete` | `ctrl+d` | Delete session |
 | `app.session.deleteNoninvasive` | `ctrl+backspace` | Delete session when query is empty |
 
+### Agent View
+
+| Keybinding id | Default | Description |
+|--------|---------|-------------|
+| `app.agents.view` | `left` | Open the agent view (with an empty editor); in the view, go back or close |
+| `app.agents.chat` | `right` | Show the chat tab in the agent view |
+
 ### Models and Thinking
 
 | Keybinding id | Default | Description |

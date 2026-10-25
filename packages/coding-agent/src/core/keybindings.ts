@@ -84,6 +84,10 @@ const APP_KEYBINDINGS = {
 		defaultKeys: "left",
 		description: "Open the agent view (with an empty editor)",
 	},
+	"app.agents.chat": {
+		defaultKeys: "right",
+		description: "Show the chat tab in the agent view",
+	},
 	"app.tree.foldOrUp": {
 		defaultKeys: process.platform === "darwin" ? ["alt+left", "ctrl+left"] : ["ctrl+left", "alt+left"],
 		description: "Fold tree branch or move up",

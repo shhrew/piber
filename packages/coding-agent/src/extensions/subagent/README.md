@@ -224,18 +224,33 @@ Rows beyond the fourth are reached by moving the selection; the dock shows how m
 
 ## Agent view
 
-Press `←` while the editor is empty (keybinding `app.agents.view`, configurable in `keybindings.json`). The view lists the main session at the top, then the subagents started in this session under **In progress**, **Queued**, and **Completed** (empty sections are hidden), each by name, description, and agent. Running subagents show a spinner, queued ones `◷`, and finished ones `✓`, or `✗` when they failed or were aborted. Section headers are not selectable: ↑ and ↓ move between rows, and the selection stays on a subagent as it moves from one section to the next. It starts on the session you last opened in it: the main session at first, then whichever subagent (or the main session) you opened most recently. Going back from a subagent returns to the list on that subagent, unless it was opened from the dock: then going back returns to the main session.
+Press `←` while the editor is empty (keybinding `app.agents.view`, configurable in `keybindings.json`). The view has two tabs, **Agents** and **Chat**; it opens on Agents, and `→` (keybinding `app.agents.chat`) switches to Chat.
 
-| Key | List | Subagent |
-|---|---|---|
-| `↑` / `↓` | Select | |
-| `Enter` | Open the selection (the main session closes the view) | Send the input: steers a running subagent, or starts a follow-up on an idle one |
-| `Esc` | Close the view | Abort a running subagent, cancel a queued one, or go back |
-| `←` | Close the view | Go back (when the input is empty) |
-| `PgUp` / `PgDn`, mouse wheel | Wheel moves the selection | Scroll the transcript |
-| `Ctrl+Home` / `Ctrl+End` | | Jump to the top or bottom of the transcript |
+The Agents tab lists the main session at the top, then the subagents started in this session under **In progress**, **Queued**, and **Completed** (empty sections are hidden), each by name, description, and agent. Running subagents show a spinner, queued ones `◷`, and finished ones `✓`, or `✗` when they failed or were aborted. Section headers are not selectable: ↑ and ↓ move between rows, and the selection stays on a subagent as it moves from one section to the next. It starts on the session you last opened in it: the main session at first, then whichever subagent (or the main session) you opened most recently. Going back from a subagent returns to the list on that subagent, unless it was opened from the dock: then going back returns to the main session.
+
+| Key | Agents | Subagent | Chat |
+|---|---|---|---|
+| `↑` / `↓` | Select | | |
+| `Enter` | Open the selection (the main session closes the view) | Send the input: steers a running subagent, or starts a follow-up on an idle one | |
+| `Esc` | Close the view | Abort a running subagent, cancel a queued one, or go back | Close the view |
+| `←` | Close the view | Go back (when the input is empty) | Back to Agents |
+| `→` | Show Chat | | |
+| `PgUp` / `PgDn`, mouse wheel | Wheel moves the selection | Scroll the transcript | Scroll the log |
+| `Ctrl+Home` / `Ctrl+End` | | Jump to the top or bottom of the transcript | Jump to the top or bottom of the log |
 
 The transcript scrolls like the fullscreen transcript. It uses the same configurable `tui.altScreen.*` keys (page, half-page, and line actions; the half-page and line actions have no default key). It follows new output until you scroll up, then holds its position and shows how many lines are below. Scrolling back to the bottom resumes following. The scrollbar follows the `fullscreenScrollbar` setting.
+
+The Chat tab lists every chat message sent in this session, oldest first, including sends the hub refused. The tab label shows the count. Each message is one entry, with long text wrapped under its own column:
+
+```
+ 12:01   orchestrator → scout-a  Check b.ts too
+ 12:02 ? scout-a → worker        Use verifyToken from b.ts, or the helper in
+                                 auth/session.ts?
+ 12:02 ~ orchestrator → tester   Run auth tests next
+ 12:03 x worker → all            You are not allowed to message everyone.
+```
+
+The marker after the time is `?` while the sender waits for a reply, `~` while a recipient that has not started yet holds the message, and `x` for a refused send, which shows the reason in place of the text. The log scrolls like the transcript and follows new messages until you scroll up. It keeps the last 500 messages and is cleared when a new session starts.
 
 Dialogs from a subagent's extensions (confirm, select, input) appear in the parent, prefixed with the agent name. So do their warning and error notifications; info notifications, such as per-run token statistics, are dropped.
 

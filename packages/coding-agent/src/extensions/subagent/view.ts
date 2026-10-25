@@ -1,7 +1,10 @@
 /**
- * The agent view: a full-screen overlay listing the main session and its subagents.
+ * The agent view: a full-screen overlay with two tabs, Agents and Chat.
  *
- * List: up/down select, Enter opens, Esc or the agent-view key closes.
+ * Agents: the main session and its subagents. Up/down select, Enter opens, the chat-tab key shows Chat, Esc or
+ * the agent-view key closes.
+ * Chat: every chat message in the session, one compact entry each, scrolled like a transcript. The agent-view
+ * key returns to Agents; Esc closes.
  * Subagent: live transcript with an input line. Enter steers a running subagent or starts a follow-up
  * run on an idle one; Esc aborts a running subagent or goes back; the agent-view key goes back. Back is
  * the list, or the main session when the subagent was opened from the dock.
@@ -24,13 +27,14 @@ import {
 	type TuiMouseEventResult,
 	truncateToWidth,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { allToolNames, createToolDefinition, type ToolName } from "../../core/tools/index.ts";
 import { AssistantMessageComponent } from "../../modes/interactive/components/assistant-message.ts";
 import { ToolExecutionComponent } from "../../modes/interactive/components/tool-execution.ts";
 import { UserMessageComponent } from "../../modes/interactive/components/user-message.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
-import { CHAT_SEND_TOOL_NAME, type ChatDelivery, type SendOutcome } from "./chat.ts";
+import { CHAT_SEND_TOOL_NAME, type ChatDelivery, type ChatLog, type ChatLogEntry, type SendOutcome } from "./chat.ts";
 import type { Subagent } from "./child.ts";
 import type { SubagentRegistry } from "./registry.ts";
 import {
@@ -41,6 +45,8 @@ import {
 	SPINNER_INTERVAL_MS,
 	statusIcon,
 } from "./render.ts";
+
+type Tab = "agents" | "chat";
 
 /** Lines kept from the previous page when paging, as in the fullscreen transcript. */
 const PAGE_SCROLL_OVERLAP = 4;
@@ -108,6 +114,12 @@ function oneLine(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
 }
 
+/** Local time as HH:MM. */
+function clockTime(at: number): string {
+	const date = new Date(at);
+	return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
 export interface AgentViewOptions {
 	cwd: string;
 	scrollbar: ScrollViewScrollbar;
@@ -120,6 +132,8 @@ export interface AgentViewOptions {
 	close: () => void;
 	/** Whether a chat message's sender is still blocked waiting for its reply. */
 	isAwaitingReply?: (id: string) => boolean;
+	/** The session's chat messages, for the Chat tab. */
+	chatLog?: ChatLog;
 }
 
 function userText(message: Extract<Message, { role: "user" }>): string {
@@ -141,6 +155,9 @@ export class AgentView implements Component {
 	private readonly isAwaitingReply: ((id: string) => boolean) | undefined;
 	private readonly scrollbar: ScrollViewScrollbar;
 	private readonly scroll = new TranscriptScroll();
+	private readonly chatLog: ChatLog | undefined;
+	private readonly chatScroll = new TranscriptScroll();
+	private tab: Tab = "agents";
 	private scrollbarTimer: NodeJS.Timeout | undefined;
 	/** Opened straight onto a subagent, as from the dock: going back closes the view instead of showing the list. */
 	private readonly openedDirectly: boolean;
@@ -176,7 +193,13 @@ export class AgentView implements Component {
 		this.scrollbar = options.scrollbar;
 		this.input.focused = true;
 		this.input.onSubmit = (value) => this.submit(value);
-		this.unsubscribe = registry.onChange(() => this.tui.requestRender());
+		this.chatLog = options.chatLog;
+		const stopRegistry = registry.onChange(() => this.tui.requestRender());
+		const stopChat = this.chatLog?.onChange(() => this.tui.requestRender());
+		this.unsubscribe = () => {
+			stopRegistry();
+			stopChat?.();
+		};
 		this.animation = setInterval(() => {
 			if (this.registry.list().some((subagent) => subagent.isRunning)) this.tui.requestRender();
 		}, SPINNER_INTERVAL_MS);
@@ -200,6 +223,7 @@ export class AgentView implements Component {
 
 	handleInput(data: string): void {
 		if (this.open) this.handleSessionInput(data, this.open);
+		else if (this.tab === "chat") this.handleChatInput(data);
 		else this.handleListInput(data);
 		this.tui.requestRender();
 	}
@@ -208,6 +232,8 @@ export class AgentView implements Component {
 		if (event.type !== "wheel" || !event.wheelDelta) return undefined;
 		if (this.open) {
 			this.scrollTranscript(() => this.scroll.scrollBy(event.wheelDelta ?? 0));
+		} else if (this.tab === "chat") {
+			this.scrollTranscript(() => this.chatScroll.scrollBy(event.wheelDelta ?? 0));
 		} else {
 			this.moveSelection(Math.sign(event.wheelDelta), false);
 		}
@@ -216,7 +242,11 @@ export class AgentView implements Component {
 
 	render(width: number): string[] {
 		const height = Math.max(5, this.tui.terminal.rows);
-		const lines = this.open ? this.renderSession(width, height, this.open) : this.renderList(width, height);
+		const lines = this.open
+			? this.renderSession(width, height, this.open)
+			: this.tab === "chat"
+				? this.renderChat(width, height)
+				: this.renderList(width, height);
 		while (lines.length < height) lines.push("");
 		return lines.slice(0, height).map((line) => truncateToWidth(line, width));
 	}
@@ -243,6 +273,9 @@ export class AgentView implements Component {
 		const kb = this.keybindings;
 		if (kb.matches(data, "app.agents.view") || kb.matches(data, "tui.select.cancel")) {
 			this.close();
+		} else if (kb.matches(data, "app.agents.chat")) {
+			this.tab = "chat";
+			this.chatScroll.scrollToBottom();
 		} else if (kb.matches(data, "tui.select.up")) {
 			this.moveSelection(-1, true);
 		} else if (kb.matches(data, "tui.select.down")) {
@@ -272,8 +305,22 @@ export class AgentView implements Component {
 			else this.back();
 			return;
 		}
-		const page = Math.max(1, this.scroll.viewportHeight - PAGE_SCROLL_OVERLAP);
-		const halfPage = Math.max(1, Math.floor(this.scroll.viewportHeight / 2));
+		if (this.handleScrollKey(data, this.scroll)) return;
+		this.input.handleInput(data);
+	}
+
+	private handleChatInput(data: string): void {
+		const kb = this.keybindings;
+		if (kb.matches(data, "app.agents.view")) this.tab = "agents";
+		else if (kb.matches(data, "tui.select.cancel")) this.close();
+		else this.handleScrollKey(data, this.chatScroll);
+	}
+
+	/** Scroll `scroll` for the `tui.altScreen.*` keys. False when `data` is not one of them. */
+	private handleScrollKey(data: string, scroll: TranscriptScroll): boolean {
+		const kb = this.keybindings;
+		const page = Math.max(1, scroll.viewportHeight - PAGE_SCROLL_OVERLAP);
+		const halfPage = Math.max(1, Math.floor(scroll.viewportHeight / 2));
 		const steps: Array<[Keybinding, number]> = [
 			["tui.altScreen.pageUp", -page],
 			["tui.altScreen.pageDown", page],
@@ -284,19 +331,19 @@ export class AgentView implements Component {
 		];
 		for (const [keybinding, lines] of steps) {
 			if (kb.matches(data, keybinding)) {
-				this.scrollTranscript(() => this.scroll.scrollBy(lines));
-				return;
+				this.scrollTranscript(() => scroll.scrollBy(lines));
+				return true;
 			}
 		}
 		if (kb.matches(data, "tui.altScreen.top")) {
-			this.scrollTranscript(() => this.scroll.scrollToTop());
-			return;
+			this.scrollTranscript(() => scroll.scrollToTop());
+			return true;
 		}
 		if (kb.matches(data, "tui.altScreen.bottom")) {
-			this.scrollTranscript(() => this.scroll.scrollToBottom());
-			return;
+			this.scrollTranscript(() => scroll.scrollToBottom());
+			return true;
 		}
-		this.input.handleInput(data);
+		return false;
 	}
 
 	/** Apply a scroll and, for an `auto` scrollbar, render again once it should hide. */
@@ -335,14 +382,20 @@ export class AgentView implements Component {
 		});
 	}
 
+	/** The tab bar with the active tab highlighted, the tab's key hint, and a blank line. */
+	private renderTitle(hint: string): string[] {
+		const theme = this.theme;
+		const tab = (name: Tab, label: string) =>
+			name === this.tab ? theme.fg("accent", theme.bold(label)) : theme.fg("dim", label);
+		const count = this.chatLog?.entries().length ?? 0;
+		const chat = tab("chat", "Chat") + (count > 0 ? theme.fg("dim", ` ${count}`) : "");
+		return [` ${tab("agents", "Agents")}   ${chat}`, theme.fg("dim", ` ${hint}`), ""];
+	}
+
 	private renderList(width: number, height: number): string[] {
 		const theme = this.theme;
 		const subagents = this.registry.list();
-		const title = [
-			theme.fg("accent", theme.bold(" Agents")),
-			theme.fg("dim", " ↑↓ select · enter open · esc close"),
-			"",
-		];
+		const title = this.renderTitle("↑↓ select · enter open · → chat · esc close");
 		const lines: string[] = [];
 		let selectedLine = 0;
 		const row = (id: string | undefined, text: string) => {
@@ -407,21 +460,90 @@ export class AgentView implements Component {
 		const visible = body.slice(top, top + bodyHeight);
 		// Short transcripts sit at the bottom, next to the input, like the main transcript.
 		while (visible.length < bodyHeight) visible.unshift("");
-		const bar = this.renderScrollbar(body.length, bodyHeight, top);
-		const rows = bar
-			? visible.map(
-					(line, index) =>
-						`${truncateToWidth(line, bodyWidth)}${" ".repeat(Math.max(0, bodyWidth - visibleWidth(line)))}${bar[index]}`,
-				)
-			: visible;
+		const rows = this.withScrollbar(visible, bodyWidth, body.length, top, this.scroll);
 		return [...header, ...rows, theme.fg("borderMuted", "─".repeat(width)), ...footer];
 	}
 
+	private renderChat(width: number, height: number): string[] {
+		const entries = this.chatLog?.entries() ?? [];
+		const bodyWidth = this.scrollbar === "hidden" || width < 2 ? width : width - 1;
+		const body =
+			entries.length === 0
+				? [this.theme.fg("muted", "  No chat messages in this session yet.")]
+				: this.renderChatEntries(entries, bodyWidth);
+		const below = this.chatScroll.linesBelow;
+		const title = this.renderTitle(
+			["← agents · pgup/pgdn/wheel scroll · esc close", ...(below > 0 ? [`↓ ${below} more`] : [])].join(" · "),
+		);
+		const bodyHeight = Math.max(1, height - title.length);
+		const top = this.chatScroll.layout(body.length, bodyHeight);
+		const visible = body.slice(top, top + bodyHeight);
+		while (visible.length < bodyHeight) visible.push("");
+		return [...title, ...this.withScrollbar(visible, bodyWidth, body.length, top, this.chatScroll)];
+	}
+
+	/**
+	 * One entry per send: ` HH:MM M from → to  text`, the text wrapped under its own column. The marker M is `?`
+	 * while the sender waits for a reply, `~` while a recipient that has not started holds it, `x` when refused.
+	 */
+	private renderChatEntries(entries: readonly ChatLogEntry[], width: number): string[] {
+		const theme = this.theme;
+		const routeWidth = Math.min(
+			Math.max(8, Math.floor(width / 3)),
+			Math.max(...entries.map((entry) => visibleWidth(`${entry.from} → ${entry.to}`))),
+		);
+		// " HH:MM M " before the route, two spaces after it.
+		const textColumn = 9 + routeWidth + 2;
+		const textWidth = Math.max(10, width - textColumn);
+		const indent = " ".repeat(textColumn);
+		return entries.flatMap((entry) => {
+			const marker = entry.refused
+				? theme.fg("error", "x")
+				: this.isAwaitingReply?.(entry.id)
+					? theme.fg("warning", "?")
+					: entry.held > 0
+						? theme.fg("muted", "~")
+						: " ";
+			const route = truncateToWidth(
+				`${theme.fg("accent", entry.from)} ${theme.fg("dim", "→")} ${theme.fg("accent", entry.to)}`,
+				routeWidth,
+			);
+			const padding = " ".repeat(Math.max(0, routeWidth - visibleWidth(route)));
+			const text = entry.refused ? theme.fg("error", entry.refused) : oneLine(entry.text);
+			const [first = "", ...rest] = wrapTextWithAnsi(text, textWidth);
+			return [
+				` ${theme.fg("dim", clockTime(entry.at))} ${marker} ${route}${padding}  ${first}`,
+				...rest.map((line) => indent + line),
+			];
+		});
+	}
+
+	/** `visible` with a scrollbar cell appended to each row, when one shows. */
+	private withScrollbar(
+		visible: string[],
+		bodyWidth: number,
+		totalLines: number,
+		top: number,
+		scroll: TranscriptScroll,
+	): string[] {
+		const bar = this.renderScrollbar(totalLines, visible.length, top, scroll);
+		if (!bar) return visible;
+		return visible.map(
+			(line, index) =>
+				`${truncateToWidth(line, bodyWidth)}${" ".repeat(Math.max(0, bodyWidth - visibleWidth(line)))}${bar[index]}`,
+		);
+	}
+
 	/** One scrollbar cell per body row, or undefined when no scrollbar shows. Geometry matches the fullscreen one. */
-	private renderScrollbar(totalLines: number, trackHeight: number, top: number): string[] | undefined {
+	private renderScrollbar(
+		totalLines: number,
+		trackHeight: number,
+		top: number,
+		scroll: TranscriptScroll,
+	): string[] | undefined {
 		if (this.scrollbar === "hidden") return undefined;
 		const overflows = totalLines > trackHeight;
-		if (this.scrollbar === "auto" && !(overflows && this.scroll.recentlyScrolled)) return undefined;
+		if (this.scrollbar === "auto" && !(overflows && scroll.recentlyScrolled)) return undefined;
 		if (!overflows) return new Array(trackHeight).fill(this.theme.fg("scrollbarTrack", "│"));
 		const thumbHeight = Math.max(
 			Math.min(2, trackHeight),

@@ -141,11 +141,70 @@ export interface ChatDirectory {
 	list(): ChatPeer[];
 }
 
+/** One send as the chat log shows it, refused ones included. */
+export interface ChatLogEntry {
+	/** The delivery id, or "" for a refused send. */
+	id: string;
+	at: number;
+	from: string;
+	to: string;
+	text: string;
+	awaitingReply: boolean;
+	/** Recipients still holding the message until they start. */
+	held: number;
+	/** Why the hub refused the send. */
+	refused?: string;
+}
+
+/** Entries kept in the chat log; older ones are dropped. */
+export const CHAT_LOG_LIMIT = 500;
+
+/** Every send in the session, oldest first, for the agent view's chat tab. */
+export class ChatLog {
+	private readonly items: ChatLogEntry[] = [];
+	private readonly listeners = new Set<() => void>();
+
+	entries(): readonly ChatLogEntry[] {
+		return this.items;
+	}
+
+	add(entry: ChatLogEntry): void {
+		this.items.push(entry);
+		if (this.items.length > CHAT_LOG_LIMIT) this.items.splice(0, this.items.length - CHAT_LOG_LIMIT);
+		this.notify();
+	}
+
+	/** A recipient holding message `id` has started and received it. */
+	markDelivered(id: string): void {
+		const entry = this.items.find((item) => item.id === id);
+		if (!entry || entry.held === 0) return;
+		entry.held--;
+		this.notify();
+	}
+
+	clear(): void {
+		if (this.items.length === 0) return;
+		this.items.length = 0;
+		this.notify();
+	}
+
+	onChange(listener: () => void): () => void {
+		this.listeners.add(listener);
+		return () => this.listeners.delete(listener);
+	}
+
+	private notify(): void {
+		for (const listener of [...this.listeners]) listener();
+	}
+}
+
 export interface ChatHubOptions {
 	directory: ChatDirectory;
 	/** Read on every send, so config edits apply at once. */
 	config: () => ChatConfig;
 	deliverToOrchestrator: (delivery: ChatDelivery) => void;
+	/** Records every send, refused ones included. */
+	log?: ChatLog;
 }
 
 interface Waiter {
@@ -238,43 +297,50 @@ export class ChatHub {
 	/** Send a message from `from` (a subagent name, or `orchestrator`), checking its permissions and the limits. */
 	async send(from: string, request: SendRequest, signal?: AbortSignal): Promise<SendResult> {
 		const config = this.options.config();
-		const rights = from === ORCHESTRATOR ? resolvePermissions(config.orchestratorCanMessage) : this.rights.get(from);
-		if (!rights) return refuse(`${from} is not part of this chat.`);
 		const text = request.text.trim();
 		const to = request.to.trim();
-		if (!text) return refuse("The message is empty.");
+		const awaitingReply = request.waitForReply === true;
+		const record = (id: string, held: number, refused?: string) =>
+			this.options.log?.add({ id, at: Date.now(), from, to, text, awaitingReply, held, refused });
+		const decline = (reason: string): SendResult => {
+			record("", 0, reason);
+			return refuse(reason);
+		};
+		const rights = from === ORCHESTRATOR ? resolvePermissions(config.orchestratorCanMessage) : this.rights.get(from);
+		if (!rights) return decline(`${from} is not part of this chat.`);
+		if (!text) return decline("The message is empty.");
 		if (text.length > config.maxMessageLength) {
-			return refuse(
+			return decline(
 				`The message is ${text.length} characters; the limit is ${config.maxMessageLength}. Shorten it.`,
 			);
 		}
-		if (to === from) return refuse("You cannot message yourself.");
+		if (to === from) return decline("You cannot message yourself.");
 
 		if (to === BROADCAST) {
-			if (!rights.broadcast) return refuse("You are not allowed to message everyone.");
-			if (request.waitForReply) return refuse(`waitForReply cannot be used with to: "${BROADCAST}".`);
+			if (!rights.broadcast) return decline("You are not allowed to message everyone.");
+			if (request.waitForReply) return decline(`waitForReply cannot be used with to: "${BROADCAST}".`);
 		} else if (to === ORCHESTRATOR) {
-			if (!rights.orchestrator) return refuse("You are not allowed to message the orchestrator.");
+			if (!rights.orchestrator) return decline("You are not allowed to message the orchestrator.");
 		} else {
-			if (!rights.subagents) return refuse("You are not allowed to message other subagents.");
+			if (!rights.subagents) return decline("You are not allowed to message other subagents.");
 			const peer = this.options.directory.find(to);
 			if (!peer) {
 				const names = this.options.directory
 					.list()
 					.map((candidate) => candidate.name)
 					.filter((name) => name !== from);
-				return refuse(`There is no subagent named "${to}". Subagents: ${names.join(", ") || "none"}.`);
+				return decline(`There is no subagent named "${to}". Subagents: ${names.join(", ") || "none"}.`);
 			}
-			if (peer.state === "finished") return refuse(`${to} has finished and cannot receive messages.`);
+			if (peer.state === "finished") return decline(`${to} has finished and cannot receive messages.`);
 		}
-		if (request.waitForReply && this.waiters.has(from)) return refuse("You are already waiting for a reply.");
+		if (request.waitForReply && this.waiters.has(from)) return decline("You are already waiting for a reply.");
 		if (!this.withinRate(from, config.maxMessagesPerMinute)) {
-			return refuse(
+			return decline(
 				`You have sent ${config.maxMessagesPerMinute} messages in the last minute; wait before sending more.`,
 			);
 		}
 
-		const delivery: ChatDelivery = { id: randomUUID(), from, to, text, awaitingReply: request.waitForReply === true };
+		const delivery: ChatDelivery = { id: randomUUID(), from, to, text, awaitingReply };
 		if (to === BROADCAST) {
 			const recipients = [
 				...(from === ORCHESTRATOR ? [] : [ORCHESTRATOR]),
@@ -283,10 +349,11 @@ export class ChatHub {
 					.filter((peer) => peer.state !== "finished" && peer.name !== from)
 					.map((peer) => peer.name),
 			];
-			if (recipients.length === 0) return refuse("No one else is running.");
+			if (recipients.length === 0) return decline("No one else is running.");
 			const outcomes = recipients.map((recipient) => this.route(recipient, delivery));
 			const held = outcomes.filter((outcome) => outcome === "held").length;
 			const delivered = outcomes.length - held;
+			record(delivery.id, held);
 			return {
 				ok: true,
 				text: `Sent to everyone: ${delivered} delivered${held > 0 ? `, ${held} held until they start` : ""}.`,
@@ -295,6 +362,7 @@ export class ChatHub {
 		}
 
 		const outcome = this.route(to, delivery);
+		record(delivery.id, outcome === "held" ? 1 : 0);
 		const sent =
 			outcome === "held"
 				? `Held for ${to}, which has not started yet; it gets the message when it starts.`
@@ -441,7 +509,10 @@ export class ChatHub {
 				this.sockets.get(member.name)?.destroy();
 				this.sockets.set(member.name, socket);
 				write(socket, { type: "welcome", name: member.name });
-				for (const delivery of this.held.get(member.name) ?? []) write(socket, { type: "deliver", delivery });
+				for (const delivery of this.held.get(member.name) ?? []) {
+					write(socket, { type: "deliver", delivery });
+					this.options.log?.markDelivered(delivery.id);
+				}
 				this.held.delete(member.name);
 				return;
 			}

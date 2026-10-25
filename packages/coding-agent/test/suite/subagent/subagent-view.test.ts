@@ -4,6 +4,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../../../src/core/keybindings.ts";
+import { ChatLog, type ChatLogEntry } from "../../../src/extensions/subagent/chat.ts";
 import { Subagent, type SubagentOptions } from "../../../src/extensions/subagent/child.ts";
 import { SubagentRegistry } from "../../../src/extensions/subagent/registry.ts";
 import { SlotPool } from "../../../src/extensions/subagent/slots.ts";
@@ -14,6 +15,8 @@ const KEYS = {
 	enter: "\r",
 	down: "\x1b[B",
 	left: "\x1b[D",
+	right: "\x1b[C",
+	escape: "\x1b",
 	pageUp: "\x1b[5~",
 	pageDown: "\x1b[6~",
 	ctrlHome: "\x1b[1;5H",
@@ -90,6 +93,7 @@ function createView(
 		initialSelection?: string;
 		openId?: string;
 		isAwaitingReply?: (id: string) => boolean;
+		chatLog?: ChatLog;
 	} = {},
 ) {
 	const registry = new SubagentRegistry();
@@ -107,6 +111,7 @@ function createView(
 			closes++;
 		},
 		isAwaitingReply: options.isAwaitingReply,
+		chatLog: options.chatLog,
 	});
 	const lines = () => view.render(80).map((line) => stripVTControlCharacters(line));
 	/** The list row marked as selected. */
@@ -126,6 +131,20 @@ function openView(count: number, scrollbar: "hidden" | "auto" | "always" = "hidd
 	// The TUI renders before any input arrives; scrolling needs the viewport height from that render.
 	screen();
 	return { view, subagent, screen, visible };
+}
+
+/** A chat log entry sent at 12:01 local time. */
+function chatEntry(overrides: Partial<ChatLogEntry>): ChatLogEntry {
+	return {
+		id: "m",
+		at: new Date(2026, 0, 1, 12, 1).getTime(),
+		from: "orchestrator",
+		to: "scout",
+		text: "hi",
+		awaitingReply: false,
+		held: 0,
+		...overrides,
+	};
 }
 
 beforeAll(() => initTheme("dark"));
@@ -349,5 +368,74 @@ describe("subagent agent view list", () => {
 		expect(screen.some((line) => line.trim() === "✓ delivered")).toBe(true);
 		expect(screen.some((line) => line.includes("╭─ worker → scout"))).toBe(true);
 		expect(screen.join("\n")).not.toContain("[Chat message");
+	});
+});
+
+describe("subagent agent view chat tab", () => {
+	it("switches tabs with the arrows, and the agent-view key on Agents still closes", () => {
+		const { view, lines, closed } = createView([], { chatLog: new ChatLog() });
+		expect(lines()[1]).toContain("→ chat");
+
+		view.handleInput(KEYS.right);
+		expect(lines()[1]).toContain("← agents");
+		expect(lines().join("\n")).toContain("No chat messages in this session yet.");
+
+		view.handleInput(KEYS.left);
+		expect(lines()[1]).toContain("→ chat");
+		expect(closed()).toBe(false);
+
+		view.handleInput(KEYS.left);
+		expect(closed()).toBe(true);
+
+		const viaEsc = createView([], { chatLog: new ChatLog() });
+		viaEsc.view.handleInput(KEYS.right);
+		viaEsc.view.handleInput(KEYS.escape);
+		expect(viaEsc.closed()).toBe(true);
+	});
+
+	it("shows one entry per send with markers, wrapping long text under the text column", () => {
+		const chatLog = new ChatLog();
+		chatLog.add(chatEntry({ id: "m1", text: "Check b.ts too" }));
+		chatLog.add(chatEntry({ id: "m2", from: "scout", to: "worker", text: "Ready?", awaitingReply: true }));
+		chatLog.add(chatEntry({ id: "m3", to: "later", text: "Start with a.ts", held: 1 }));
+		chatLog.add(chatEntry({ id: "", from: "worker", to: "all", text: "x", refused: "Not allowed." }));
+		chatLog.add(chatEntry({ id: "m5", text: `${"word ".repeat(30)}end` }));
+		const { view, lines } = createView([], { chatLog, isAwaitingReply: (id) => id === "m2" });
+		view.handleInput(KEYS.right);
+		const screen = lines();
+
+		expect(screen[0]).toContain("Chat 5");
+		const body = screen.slice(3).filter((line) => line.trim() !== "");
+		expect(body[0]).toBe(" 12:01   orchestrator → scout  Check b.ts too");
+		expect(body[1]).toBe(" 12:01 ? scout → worker        Ready?");
+		expect(body[2]).toBe(" 12:01 ~ orchestrator → later  Start with a.ts");
+		expect(body[3]).toBe(" 12:01 x worker → all          Not allowed.");
+		expect(body[4].startsWith(" 12:01   orchestrator → scout  word")).toBe(true);
+		expect(body[5]).toMatch(/^ {31}word/);
+		expect(body.at(-1)?.trimEnd().endsWith("end")).toBe(true);
+	});
+
+	it("follows new messages, and holds its position once scrolled up", () => {
+		const chatLog = new ChatLog();
+		for (let i = 0; i < 40; i++) chatLog.add(chatEntry({ id: `m${i}`, text: `msg-${i}` }));
+		const { view, lines } = createView([], { chatLog });
+		view.handleInput(KEYS.right);
+		const visible = () =>
+			[
+				...lines()
+					.join("\n")
+					.matchAll(/msg-(\d+)/g),
+			].map((match) => Number(match[1]));
+		expect(visible()).toContain(39);
+
+		chatLog.add(chatEntry({ id: "m40", text: "msg-40" }));
+		expect(visible()).toContain(40);
+
+		view.handleInput(KEYS.pageUp);
+		const held = visible();
+		expect(held).not.toContain(40);
+		chatLog.add(chatEntry({ id: "m41", text: "msg-41" }));
+		expect(visible()).toEqual(held);
+		expect(lines()[1]).toMatch(/↓ \d+ more/);
 	});
 });
