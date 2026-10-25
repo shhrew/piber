@@ -12,8 +12,13 @@
  * - `onBackgroundComplete`: what happens when a background subagent finishes and nothing waits for it: `wake`
  *   tells the orchestrator at once (starting a turn if it is idle), `notify` tells it on its next turn, `silent`
  *   leaves the result for `subagent_wait` and `subagent_result`
+ * - `chat`: subagent chat (see `chat.ts`): whether it is enabled, the default `canMessage` for agents without
+ *   one, what the orchestrator may message, message limits, and reply-wait timeouts
  *
- * A trusted project's `.pi/subagents/config.json` overrides any of these fields.
+ * A trusted project's `.pi/subagents/config.json` overrides any of these fields; within `chat`, any sub-field.
+ *
+ * `system-prompt.md` is the global prompt every subagent gets before its own; a trusted project's
+ * `.pi/subagents/system-prompt.md` is appended to it.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -36,11 +41,32 @@ export function parseNameList(value: unknown): string[] {
 export type SubagentMode = "foreground" | "background";
 export type BackgroundCompletion = "wake" | "notify" | "silent";
 
+/**
+ * Who an agent may message: `orchestrator`; `subagents`, any other subagent by name; `all`, everything including a
+ * broadcast to everyone at once.
+ */
+export type ChatPermission = "orchestrator" | "subagents" | "all";
+export const CHAT_PERMISSIONS: readonly ChatPermission[] = ["orchestrator", "subagents", "all"];
+
+export interface ChatConfig {
+	enabled: boolean;
+	/** `canMessage` for agents whose definition has none. */
+	defaultCanMessage: ChatPermission[];
+	/** What the orchestrator may message. Empty turns chat off for it. */
+	orchestratorCanMessage: ChatPermission[];
+	maxMessageLength: number;
+	maxMessagesPerMinute: number;
+	/** How long `chat_send` with `waitForReply` waits by default, and at most. */
+	replyTimeoutSeconds: number;
+	maxReplyTimeoutSeconds: number;
+}
+
 export interface SubagentConfig {
 	coreTools: string[];
 	maxConcurrent: number;
 	defaultMode: SubagentMode;
 	onBackgroundComplete: BackgroundCompletion;
+	chat: ChatConfig;
 }
 
 const DEFAULT_CONFIG: SubagentConfig = {
@@ -48,7 +74,46 @@ const DEFAULT_CONFIG: SubagentConfig = {
 	maxConcurrent: 4,
 	defaultMode: "foreground",
 	onBackgroundComplete: "wake",
+	chat: {
+		enabled: true,
+		defaultCanMessage: ["orchestrator"],
+		orchestratorCanMessage: ["subagents", "all"],
+		maxMessageLength: 4000,
+		maxMessagesPerMinute: 10,
+		replyTimeoutSeconds: 120,
+		maxReplyTimeoutSeconds: 600,
+	},
 };
+
+/** The known permission words in a frontmatter or config list; unknown words are dropped. */
+export function parseChatPermissions(value: unknown): ChatPermission[] {
+	return parseNameList(value).filter((word): word is ChatPermission =>
+		CHAT_PERMISSIONS.includes(word as ChatPermission),
+	);
+}
+
+const isPositiveInteger = (value: unknown): value is number =>
+	typeof value === "number" && Number.isInteger(value) && value > 0;
+
+function readChatConfig(value: unknown): Partial<ChatConfig> {
+	if (!value || typeof value !== "object") return {};
+	const fields = value as Record<string, unknown>;
+	const chat: Partial<ChatConfig> = {};
+	if (typeof fields.enabled === "boolean") chat.enabled = fields.enabled;
+	if (Array.isArray(fields.defaultCanMessage)) chat.defaultCanMessage = parseChatPermissions(fields.defaultCanMessage);
+	if (Array.isArray(fields.orchestratorCanMessage)) {
+		chat.orchestratorCanMessage = parseChatPermissions(fields.orchestratorCanMessage);
+	}
+	for (const key of [
+		"maxMessageLength",
+		"maxMessagesPerMinute",
+		"replyTimeoutSeconds",
+		"maxReplyTimeoutSeconds",
+	] as const) {
+		if (isPositiveInteger(fields[key])) chat[key] = fields[key];
+	}
+	return chat;
+}
 
 const MODES: readonly SubagentMode[] = ["foreground", "background"];
 const COMPLETIONS: readonly BackgroundCompletion[] = ["wake", "notify", "silent"];
@@ -61,7 +126,9 @@ export function getSubagentAssetsDir(): string {
 	return join(packageDir, srcOrDist, "extensions", "subagent");
 }
 
-function readConfig(filePath: string): Partial<SubagentConfig> | undefined {
+type PartialConfig = Partial<Omit<SubagentConfig, "chat">> & { chat?: Partial<ChatConfig> };
+
+function readConfig(filePath: string): PartialConfig | undefined {
 	let raw: unknown;
 	try {
 		raw = JSON.parse(readFileSync(filePath, "utf-8"));
@@ -70,7 +137,7 @@ function readConfig(filePath: string): Partial<SubagentConfig> | undefined {
 	}
 	if (!raw || typeof raw !== "object") return undefined;
 	const fields = raw as Record<string, unknown>;
-	const config: Partial<SubagentConfig> = {};
+	const config: PartialConfig = {};
 	if (Array.isArray(fields.coreTools)) config.coreTools = parseNameList(fields.coreTools);
 	// Invalid values are ignored rather than rejected, so a typo cannot stop subagents from running at all.
 	const { maxConcurrent, defaultMode, onBackgroundComplete } = fields;
@@ -81,6 +148,7 @@ function readConfig(filePath: string): Partial<SubagentConfig> | undefined {
 	if (COMPLETIONS.includes(onBackgroundComplete as BackgroundCompletion)) {
 		config.onBackgroundComplete = onBackgroundComplete as BackgroundCompletion;
 	}
+	if (fields.chat !== undefined) config.chat = readChatConfig(fields.chat);
 	return config;
 }
 
@@ -88,5 +156,25 @@ function readConfig(filePath: string): Partial<SubagentConfig> | undefined {
 export function loadSubagentConfig(projectDir: string | null): SubagentConfig {
 	const bundled = readConfig(join(getSubagentAssetsDir(), "config.json"));
 	const project = projectDir ? readConfig(join(projectDir, "config.json")) : undefined;
-	return { ...DEFAULT_CONFIG, ...bundled, ...project };
+	return {
+		...DEFAULT_CONFIG,
+		...bundled,
+		...project,
+		chat: { ...DEFAULT_CONFIG.chat, ...bundled?.chat, ...project?.chat },
+	};
+}
+
+function readText(filePath: string): string | undefined {
+	try {
+		return readFileSync(filePath, "utf-8").trim() || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** The bundled `system-prompt.md`, with a trusted project's `.pi/subagents/system-prompt.md` appended. */
+export function loadGlobalSystemPrompt(projectDir: string | null): string {
+	const bundled = readText(join(getSubagentAssetsDir(), "system-prompt.md"));
+	const project = projectDir ? readText(join(projectDir, "system-prompt.md")) : undefined;
+	return [bundled, project].filter((part) => part !== undefined).join("\n\n");
 }

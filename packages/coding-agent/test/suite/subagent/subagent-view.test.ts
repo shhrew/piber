@@ -85,7 +85,11 @@ function createSubagent(
 /** An agent view over `subagents` in an 80x20 terminal. `opened` records each `onOpen` call. */
 function createView(
 	subagents: Subagent[],
-	options: { scrollbar?: "hidden" | "auto" | "always"; initialSelection?: string } = {},
+	options: {
+		scrollbar?: "hidden" | "auto" | "always";
+		initialSelection?: string;
+		isAwaitingReply?: (id: string) => boolean;
+	} = {},
 ) {
 	const registry = new SubagentRegistry();
 	for (const subagent of subagents) registry.add(subagent);
@@ -97,6 +101,7 @@ function createView(
 		initialSelection: options.initialSelection,
 		onOpen: (id) => opened.push(id),
 		close: () => {},
+		isAwaitingReply: options.isAwaitingReply,
 	});
 	const lines = () => view.render(80).map((line) => stripVTControlCharacters(line));
 	/** The list row marked as selected. */
@@ -266,5 +271,62 @@ describe("subagent agent view list", () => {
 			await waiter.abort();
 			await Promise.all(runs);
 		}
+	});
+
+	it("shows chat messages in a subagent's transcript as bubbles", () => {
+		const subagent = createSubagent("scout", "Map auth flow");
+		subagent.messages.push(
+			{
+				role: "custom",
+				customType: "subagent-chat",
+				content: "[Chat message from the orchestrator to you, not from the user]\nCheck b.ts",
+				display: true,
+				details: { id: "m1", from: "orchestrator", to: "scout", text: "Check b.ts", awaitingReply: true },
+				timestamp: 0,
+			},
+			{
+				...assistant(""),
+				content: [
+					{
+						type: "toolCall",
+						id: "c1",
+						name: "chat_send",
+						arguments: { to: "worker", text: "Use a.ts", waitForReply: true },
+					},
+				],
+			},
+			{
+				role: "toolResult",
+				toolCallId: "c1",
+				toolName: "chat_send",
+				content: [{ type: "text", text: "worker replied:\nok" }],
+				details: {
+					to: "worker",
+					ok: true,
+					outcome: "reply",
+					message: { id: "m2", from: "worker", to: "scout", text: "ok", awaitingReply: false },
+				},
+				isError: false,
+				timestamp: 0,
+			},
+		);
+		const { view, lines } = createView([subagent], {
+			initialSelection: "scout",
+			isAwaitingReply: (id) => id === "m1",
+		});
+		view.handleInput(KEYS.enter);
+		const screen = lines();
+
+		const received = screen.findIndex((line) => line.includes("╭─ orchestrator → scout"));
+		expect(received).toBeGreaterThanOrEqual(0);
+		expect(screen[received].startsWith(" ╭")).toBe(true);
+		expect(screen[received + 1]).toContain("Check b.ts");
+		expect(screen[received + 2]).toContain("waiting for your reply");
+		const sent = screen.find((line) => line.includes("╭─ worker ← scout"));
+		expect(sent?.trimEnd().endsWith("╮")).toBe(true);
+		expect(sent?.startsWith(" ╭")).toBe(false);
+		expect(screen.some((line) => line.trim() === "✓ delivered")).toBe(true);
+		expect(screen.some((line) => line.includes("╭─ worker → scout"))).toBe(true);
+		expect(screen.join("\n")).not.toContain("[Chat message");
 	});
 });

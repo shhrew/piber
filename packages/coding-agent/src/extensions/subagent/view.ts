@@ -18,6 +18,7 @@ import {
 	type Keybinding,
 	type KeybindingsManager,
 	type ScrollViewScrollbar,
+	Spacer,
 	type TUI,
 	type TuiMouseEvent,
 	type TuiMouseEventResult,
@@ -29,9 +30,17 @@ import { AssistantMessageComponent } from "../../modes/interactive/components/as
 import { ToolExecutionComponent } from "../../modes/interactive/components/tool-execution.ts";
 import { UserMessageComponent } from "../../modes/interactive/components/user-message.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
+import { CHAT_SEND_TOOL_NAME, type ChatDelivery, type SendOutcome } from "./chat.ts";
 import type { Subagent } from "./child.ts";
 import type { SubagentRegistry } from "./registry.ts";
-import { formatUsageStats, SPINNER_INTERVAL_MS, statusIcon } from "./render.ts";
+import {
+	formatUsageStats,
+	renderChatMessage,
+	renderChatSendCall,
+	renderChatSendResult,
+	SPINNER_INTERVAL_MS,
+	statusIcon,
+} from "./render.ts";
 
 /** Two presses of the agent-view key within this many milliseconds open or leave the view. */
 export const DOUBLE_PRESS_MS = 400;
@@ -132,6 +141,8 @@ export interface AgentViewOptions {
 	/** Called when the user opens a session: a subagent id, or undefined for the main session. */
 	onOpen: (id: string | undefined) => void;
 	close: () => void;
+	/** Whether a chat message's sender is still blocked waiting for its reply. */
+	isAwaitingReply?: (id: string) => boolean;
 }
 
 function userText(message: Extract<Message, { role: "user" }>): string {
@@ -150,6 +161,7 @@ export class AgentView implements Component {
 	private readonly cwd: string;
 	private readonly close: () => void;
 	private readonly onOpen: (id: string | undefined) => void;
+	private readonly isAwaitingReply: ((id: string) => boolean) | undefined;
 	private readonly scrollbar: ScrollViewScrollbar;
 	private readonly scroll = new TranscriptScroll();
 	private scrollbarTimer: NodeJS.Timeout | undefined;
@@ -182,6 +194,7 @@ export class AgentView implements Component {
 		this.cwd = options.cwd;
 		this.close = options.close;
 		this.onOpen = options.onOpen;
+		this.isAwaitingReply = options.isAwaitingReply;
 		this.scrollbar = options.scrollbar;
 		this.input.focused = true;
 		this.input.onSubmit = (value) => this.submit(value);
@@ -443,7 +456,7 @@ export class AgentView implements Component {
 			this.transcript = {
 				subagent,
 				count: subagent.messages.length,
-				components: this.buildComponents(subagent.messages),
+				components: this.buildComponents(subagent),
 			};
 		}
 		const components = [...this.transcript.components];
@@ -451,16 +464,40 @@ export class AgentView implements Component {
 		return components.flatMap((component) => component.render(width));
 	}
 
-	private buildComponents(messages: readonly Message[]): Component[] {
+	private buildComponents(subagent: Subagent): Component[] {
+		const theme = this.theme;
+		const self = subagent.id;
 		const components: Component[] = [];
 		const toolCalls = new Map<string, ToolExecutionComponent>();
-		for (const message of messages) {
-			if (message.role === "user") {
+		/** chat_send calls, drawn as bubbles; their results as the outcome under the bubble. */
+		const chatSends = new Map<string, string>();
+		const answered = new Set<string>();
+		for (const message of subagent.messages) if (message.role === "toolResult") answered.add(message.toolCallId);
+		const chat = { expanded: true, outputPad: 1, self, isAwaitingReply: this.isAwaitingReply };
+		for (const message of subagent.messages) {
+			if (message.role === "custom") {
+				const delivery = message.details ?? { id: "", from: "?", to: self, text: "", awaitingReply: false };
+				components.push(new Spacer(1), renderChatMessage(delivery, chat, theme));
+			} else if (message.role === "user") {
 				components.push(new UserMessageComponent(userText(message)));
 			} else if (message.role === "assistant") {
 				components.push(new AssistantMessageComponent(message));
 				for (const part of message.content) {
 					if (part.type !== "toolCall") continue;
+					if (part.name === CHAT_SEND_TOOL_NAME) {
+						const to = typeof part.arguments.to === "string" ? part.arguments.to : "?";
+						const args = {
+							to,
+							text: typeof part.arguments.text === "string" ? part.arguments.text : "",
+							waitForReply: part.arguments.waitForReply === true,
+						};
+						// Still waiting while it has no result and the subagent runs; an aborted run leaves none.
+						const isPartial = !answered.has(part.id) && subagent.isRunning;
+						const state = { ...chat, isError: false, isPartial };
+						components.push(new Spacer(1), renderChatSendCall(args, theme, state));
+						chatSends.set(part.id, to);
+						continue;
+					}
 					const definition = allToolNames.has(part.name as ToolName)
 						? createToolDefinition(part.name as ToolName, this.cwd)
 						: undefined;
@@ -478,6 +515,16 @@ export class AgentView implements Component {
 					toolCalls.set(part.id, component);
 					components.push(component);
 				}
+			} else if (message.role === "toolResult" && chatSends.has(message.toolCallId)) {
+				const details = message.details as { outcome?: SendOutcome; message?: ChatDelivery } | undefined;
+				const outcome = {
+					text: message.content.map((part) => (part.type === "text" ? part.text : "")).join("\n"),
+					outcome: details?.outcome,
+					message: details?.message,
+				};
+				const to = chatSends.get(message.toolCallId) ?? "?";
+				const options = { ...chat, isError: message.isError, isPartial: false };
+				components.push(renderChatSendResult(outcome, to, options, theme));
 			} else if (message.role === "toolResult") {
 				toolCalls.get(message.toolCallId)?.updateResult({
 					content: message.content,

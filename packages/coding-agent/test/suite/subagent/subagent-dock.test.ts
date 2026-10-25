@@ -12,6 +12,9 @@ import {
 	formatPhase,
 	latestToolCall,
 	renderBackgroundNotice,
+	renderChatMessage,
+	renderChatSendCall,
+	renderChatSendResult,
 	renderListResult,
 	renderSubagentCall,
 	renderSubagentResult,
@@ -427,5 +430,91 @@ describe("list rendering", () => {
 		expect(plain(renderListResult({ mode: "parallel", results: [] }, 1, theme).render(100))).toEqual([
 			"   ⎿  No subagents",
 		]);
+	});
+});
+
+describe("chat rendering in the main chat", () => {
+	const received = {
+		id: "m1",
+		from: "scout-a",
+		to: "orchestrator",
+		text: "Found it\nin src/a.ts",
+		awaitingReply: false,
+	};
+	const inbound = { expanded: false, outputPad: 1, self: "orchestrator" };
+
+	it("draws a received message as a bubble on the left, labeled sender → current", () => {
+		expect(plain(renderChatMessage(received, inbound, theme).render(50))).toEqual([
+			" ╭─ scout-a → orchestrator ─╮",
+			" │ Found it                 │",
+			" │ in src/a.ts              │",
+			" ╰──────────────────────────╯",
+		]);
+		const broadcast = { ...received, to: "all", text: "Stop" };
+		expect(plain(renderChatMessage(broadcast, inbound, theme).render(50))[0]).toBe(" ╭─ scout-a → everyone ─╮");
+	});
+
+	it("tells the receiver while the sender waits for a reply, and after", () => {
+		let waiting = true;
+		const bubble = renderChatMessage(
+			{ ...received, awaitingReply: true },
+			{ ...inbound, isAwaitingReply: (id) => waiting && id === "m1" },
+			theme,
+		);
+		expect(plain(bubble.render(50)).at(-1)).toBe(" ╰─ waiting for your reply ─╯");
+		waiting = false;
+		expect(plain(bubble.render(50)).at(-1)).toBe(" ╰────── asked for a reply ─╯");
+	});
+
+	it("cuts a long message to a preview until expanded", () => {
+		const long = { ...received, text: Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join("\n") };
+		const collapsed = plain(renderChatMessage(long, inbound, theme).render(50));
+		expect(collapsed).toHaveLength(8);
+		expect(collapsed.at(-2)).toContain("… 5 more lines");
+		expect(plain(renderChatMessage(long, { ...inbound, expanded: true }, theme).render(50))).toHaveLength(12);
+	});
+
+	it("draws a send as a bubble on the right, labeled receiver ← current", () => {
+		const state = { isPartial: true, isError: false, outputPad: 1, expanded: false, self: "orchestrator" };
+		const lines = plain(
+			renderChatSendCall({ to: "worker", text: "Use a.ts", waitForReply: true }, theme, state).render(50),
+		);
+		expect(lines).toEqual([
+			`${" ".repeat(22)}╭─ worker ← orchestrator ─╮`,
+			`${" ".repeat(22)}│ Use a.ts                │`,
+			`${" ".repeat(22)}╰─── waiting for a reply ─╯`,
+		]);
+		const sent = plain(renderChatSendCall({ to: "worker", text: "Use a.ts" }, theme, state).render(50));
+		expect(sent.at(-1)).toBe(`${" ".repeat(22)}╰─────────────────────────╯`);
+	});
+
+	it("puts the outcome under the sent bubble, and the reply below it", () => {
+		const done = { expanded: false, isError: false, isPartial: false, outputPad: 1, self: "orchestrator" };
+		const reply = { id: "m2", from: "worker", to: "orchestrator", text: "yes", awaitingReply: false };
+		const lines = plain(
+			renderChatSendResult(
+				{ text: "worker replied:\nyes", outcome: "reply", message: reply },
+				"worker",
+				done,
+				theme,
+			).render(50),
+		);
+		expect(lines).toEqual([
+			`${" ".repeat(38)}✓ delivered`,
+			"",
+			" ╭─ worker → orchestrator ─╮",
+			" │ yes                     │",
+			" ╰─────────────────────────╯",
+		]);
+		const held = renderChatSendResult({ text: "", outcome: "held" }, "worker", done, theme);
+		expect(plain(held.render(50))).toEqual([`${" ".repeat(23)}◷ held until worker starts`]);
+		const refused = renderChatSendResult(
+			{ text: "You are not allowed to message other subagents.", outcome: "refused" },
+			"worker",
+			{ ...done, isError: true },
+			theme,
+		);
+		expect(plain(refused.render(50)).join(" ")).toContain("✗ not sent: You are not allowed");
+		expect(renderChatSendResult({ text: "" }, "worker", { ...done, isPartial: true }, theme).render(50)).toEqual([]);
 	});
 });

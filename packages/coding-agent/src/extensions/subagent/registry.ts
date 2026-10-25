@@ -2,6 +2,7 @@
  * The subagents started by this session, for the agent view and for `session` continuations.
  */
 
+import { RESERVED_NAMES } from "./chat.ts";
 import type { Subagent } from "./child.ts";
 
 export class SubagentRegistry {
@@ -11,7 +12,7 @@ export class SubagentRegistry {
 
 	/**
 	 * A unique one-word id from `name`: lowercased, spaces turned into hyphens, other characters dropped.
-	 * An id already in use gets `-2`, `-3`, and so on.
+	 * An id already in use, or reserved for chat (`orchestrator`, `all`), gets `-2`, `-3`, and so on.
 	 */
 	createId(name: string): string {
 		const base =
@@ -24,7 +25,9 @@ export class SubagentRegistry {
 				.replace(/^-+|-+$/g, "")
 				.slice(0, 32) || "subagent";
 		let id = base;
-		for (let n = 2; this.subagents.some((subagent) => subagent.id === id); n++) id = `${base}-${n}`;
+		const taken = (candidate: string) =>
+			RESERVED_NAMES.includes(candidate) || this.subagents.some((subagent) => subagent.id === candidate);
+		for (let n = 2; taken(id); n++) id = `${base}-${n}`;
 		return id;
 	}
 

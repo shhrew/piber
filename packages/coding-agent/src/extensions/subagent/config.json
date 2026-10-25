@@ -1,6 +1,15 @@
 {
 	"coreTools": ["read", "grep", "find", "ls"],
-	"maxConcurrent": 2,
+	"maxConcurrent": 4,
 	"defaultMode": "foreground",
-	"onBackgroundComplete": "wake"
+	"onBackgroundComplete": "wake",
+	"chat": {
+		"enabled": true,
+		"defaultCanMessage": ["orchestrator"],
+		"orchestratorCanMessage": ["subagents", "all"],
+		"maxMessageLength": 4000,
+		"maxMessagesPerMinute": 10,
+		"replyTimeoutSeconds": 120,
+		"maxReplyTimeoutSeconds": 600
+	}
 }

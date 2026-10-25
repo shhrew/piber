@@ -12,7 +12,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { CONFIG_DIR_NAME } from "../../config.ts";
 import { parseFrontmatter } from "../../utils/frontmatter.ts";
-import { getSubagentAssetsDir, parseNameList } from "./paths.ts";
+import { type ChatPermission, getSubagentAssetsDir, parseChatPermissions, parseNameList } from "./paths.ts";
 
 export type AgentSource = "bundled" | "project";
 
@@ -25,6 +25,11 @@ export interface AgentConfig {
 	skillGroups: string[];
 	/** Skills always listed in the agent's prompt. They must belong to one of `skillGroups`. */
 	pinnedSkills: string[];
+	/**
+	 * Who the agent may message over subagent chat (`orchestrator`, `subagents`, `all`). Undefined uses the config's
+	 * `chat.defaultCanMessage`; unknown words are ignored.
+	 */
+	canMessage?: ChatPermission[];
 	model?: string;
 	systemPrompt: string;
 	source: AgentSource;
@@ -47,6 +52,7 @@ type AgentFrontmatter = {
 	tools?: unknown;
 	skillGroups?: unknown;
 	pinnedSkills?: unknown;
+	canMessage?: unknown;
 	model?: unknown;
 };
 
@@ -85,6 +91,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 			description: frontmatter.description,
 			tools: parseNameList(frontmatter.tools),
 			skillGroups: parseNameList(frontmatter.skillGroups),
+			canMessage: frontmatter.canMessage === undefined ? undefined : parseChatPermissions(frontmatter.canMessage),
 			pinnedSkills: parseNameList(frontmatter.pinnedSkills),
 			model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
 			systemPrompt: body,

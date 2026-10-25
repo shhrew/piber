@@ -28,6 +28,8 @@ export interface ChildRpcOptions {
 	executable: string;
 	args: string[];
 	cwd: string;
+	/** Added to this process's environment for the child. */
+	env?: Record<string, string>;
 	onEvent: (event: ChildEvent) => void;
 	onStderr: (chunk: string) => void;
 	/** Called once when the process exits or fails, unless `stop()` ended it. */
@@ -49,6 +51,7 @@ export class ChildRpc {
 	start(): void {
 		const child = spawn(this.options.executable, [...this.options.args, "--mode", "rpc"], {
 			cwd: this.options.cwd,
+			env: this.options.env ? { ...process.env, ...this.options.env } : process.env,
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.process = child;

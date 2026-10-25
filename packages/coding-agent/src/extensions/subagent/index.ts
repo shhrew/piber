@@ -15,14 +15,40 @@
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { Message } from "@earendil-works/pi-ai";
 import { getKeybindings } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, ExtensionFactory } from "../../core/extensions/types.ts";
 import { stripFrontmatter } from "../../utils/frontmatter.ts";
 import { type AgentConfig, discoverAgents, findProjectSubagentsDir } from "./agents.ts";
+import {
+	CHAT_FLAG,
+	CHAT_MESSAGE_TYPE,
+	CHAT_PEERS_TOOL_NAME,
+	CHAT_SEND_TOOL_NAME,
+	CHAT_TOKEN_ENV,
+	ChatClient,
+	type ChatDelivery,
+	type ChatDirectory,
+	ChatHub,
+	type ChatPeer,
+	type ChatRights,
+	canMessageAnyone,
+	frameMessage,
+	ORCHESTRATOR,
+	resolvePermissions,
+	type SendOutcome,
+	type SendResult,
+} from "./chat.ts";
 import { emptyUsage, SKILL_GROUPS_FLAG, Subagent } from "./child.ts";
 import { SubagentDock } from "./dock.ts";
-import { type BackgroundCompletion, loadSubagentConfig, parseNameList } from "./paths.ts";
+import {
+	type BackgroundCompletion,
+	type ChatConfig,
+	loadGlobalSystemPrompt,
+	loadSubagentConfig,
+	parseNameList,
+} from "./paths.ts";
 import { SubagentRegistry } from "./registry.ts";
 import {
 	currentPhase,
@@ -30,6 +56,10 @@ import {
 	isFailedRun,
 	renderBackgroundNotice,
 	renderCallLine,
+	renderChatMessage,
+	renderChatPeersResult,
+	renderChatSendCall,
+	renderChatSendResult,
 	renderListResult,
 	renderSubagentCall,
 	renderSubagentResult,
@@ -130,6 +160,34 @@ const WaitParams = Type.Object({
 
 const ListParams = Type.Object({});
 
+const ChatSendParams = Type.Object({
+	to: Type.String({
+		description: 'Recipient: a subagent\'s name, "orchestrator", or "all" for everyone still running',
+	}),
+	text: Type.String({
+		description: "The message: short and concrete, such as what you found, where, and what it means for them",
+	}),
+	waitForReply: Type.Optional(
+		Type.Boolean({
+			description: "Block until the recipient replies. Only for questions you cannot continue without.",
+		}),
+	),
+	timeoutSeconds: Type.Optional(
+		Type.Number({
+			description: "With waitForReply: how long to wait. Default and maximum come from the chat config.",
+		}),
+	),
+});
+
+const ChatPeersParams = Type.Object({});
+
+interface ChatToolDetails {
+	to: string;
+	ok: boolean;
+	outcome?: SendOutcome;
+	message?: ChatDelivery;
+}
+
 const ResultParams = Type.Object({
 	names: Type.Array(Type.String(), {
 		minItems: 1,
@@ -183,7 +241,8 @@ function toDetails(subagent: Subagent, step?: number): SubagentRunDetails {
 		agentSource: subagent.options.agentSource,
 		task: subagent.options.task,
 		status: subagent.isRunning ? "running" : subagent.status,
-		messages: [...subagent.messages],
+		// Chat entries are for the agent view; results keep only the conversation.
+		messages: subagent.messages.filter((message): message is Message => message.role !== "custom"),
 		usage: { ...subagent.usage },
 		model: subagent.model,
 		stopReason: subagent.stopReason,
@@ -248,9 +307,17 @@ function runOutput(run: SubagentRunDetails): string {
 	return output + resume;
 }
 
-/** The agent's prompt plus a skills section naming the tags to search and the pinned skills. */
-function buildSystemPrompt(agent: AgentConfig, catalog: SkillCatalog, hasSkillGroups: boolean): string {
-	const parts = [agent.systemPrompt.trim()];
+/**
+ * The global subagent prompt, the agent's own prompt, and a skills section naming the tags to search and the
+ * pinned skills. The chat section is added once the subagent has a name (see `chatPromptSection`).
+ */
+function buildSystemPrompt(
+	agent: AgentConfig,
+	catalog: SkillCatalog,
+	hasSkillGroups: boolean,
+	globalPrompt: string,
+): string {
+	const parts = [globalPrompt, agent.systemPrompt.trim()].filter(Boolean);
 	if (hasSkillGroups) {
 		const tags = listSkillTags(catalog.skills);
 		const lines = [
@@ -277,12 +344,27 @@ export interface SubagentRunPlan {
 	skillGroups: string[];
 	catalog: SkillCatalog;
 	systemPrompt: string;
+	/** What the subagent may message, or undefined when chat is turned off. */
+	chatRights: ChatRights | undefined;
+}
+
+/** The chat part of a subagent's prompt: its name and who it may message. */
+export function chatPromptSection(name: string, rights: ChatRights): string {
+	const targets: string[] = [];
+	if (rights.orchestrator) targets.push(`the orchestrator (to: "${ORCHESTRATOR}")`);
+	if (rights.subagents) targets.push(`other subagents by name (see ${CHAT_PEERS_TOOL_NAME})`);
+	if (rights.broadcast) targets.push('everyone at once (to: "all")');
+	const can =
+		targets.length > 0
+			? `You can message ${targets.join(", ")}.`
+			: "You cannot send chat messages, but other agents may message you.";
+	return ["## Your chat permissions", `Your name in chat is "${name}". ${can}`].join("\n");
 }
 
 /**
  * What a subagent runs with: the core tools from `config.json`, then the agent's tools, then the call's
- * `extraTools`, plus `skill_search` and `load_skill` when it has skill groups; and the agent's prompt with
- * a skills section.
+ * `extraTools`, plus `skill_search` and `load_skill` when it has skill groups and the chat tools when it may send
+ * messages; and the global prompt, the agent's prompt, and a skills section.
  */
 export function planSubagentRun(
 	agent: AgentConfig,
@@ -292,12 +374,17 @@ export function planSubagentRun(
 	const skillGroups = unique([...agent.skillGroups, ...(request.extraSkillGroups ?? [])]);
 	const catalog = loadSkillGroups(skillGroups, projectDir);
 	const skillTools = skillGroups.length > 0 ? [SKILL_SEARCH_TOOL_NAME, LOAD_SKILL_TOOL_NAME] : [];
-	const coreTools = loadSubagentConfig(projectDir).coreTools;
+	const config = loadSubagentConfig(projectDir);
+	const chatRights = config.chat.enabled
+		? resolvePermissions(agent.canMessage ?? config.chat.defaultCanMessage)
+		: undefined;
+	const chatTools = chatRights && canMessageAnyone(chatRights) ? [CHAT_SEND_TOOL_NAME, CHAT_PEERS_TOOL_NAME] : [];
 	return {
-		tools: unique([...coreTools, ...agent.tools, ...(request.extraTools ?? []), ...skillTools]),
+		tools: unique([...config.coreTools, ...agent.tools, ...(request.extraTools ?? []), ...skillTools, ...chatTools]),
 		skillGroups,
 		catalog,
-		systemPrompt: buildSystemPrompt(agent, catalog, skillGroups.length > 0),
+		systemPrompt: buildSystemPrompt(agent, catalog, skillGroups.length > 0, loadGlobalSystemPrompt(projectDir)),
+		chatRights,
 	};
 }
 
@@ -332,6 +419,63 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 	let stopListening: (() => void) | undefined;
 	/** The subagent last opened in the agent view, where the view starts next time. Undefined is the main session. */
 	let lastViewed: string | undefined;
+
+	/** The chat config at load time, for which tools start active; runs read the project's config. */
+	const bundledChat = loadSubagentConfig(null).chat;
+	/** The project whose config the chat hub reads, from the latest run or chat call. */
+	let chatProjectDir: string | null = null;
+	let chatHub: ChatHub | undefined;
+	/**
+	 * Chat messages to the orchestrator that have not reached its context yet: a steer waits for the current tool
+	 * calls to end. `subagent_wait` returns at once while any are unread, so the orchestrator can answer them.
+	 */
+	const unreadChat = new Map<string, ChatDelivery>();
+	/** Called with each chat message to the orchestrator; `subagent_wait` listens to stop waiting. */
+	const chatListeners = new Set<(delivery: ChatDelivery) => void>();
+	const chatPeer = (subagent: Subagent): ChatPeer => ({
+		name: subagent.id,
+		description: subagent.options.description,
+		agent: subagent.options.agentName,
+		state: subagent.isRunning ? "running" : subagent.isQueued ? "queued" : "finished",
+	});
+	const chatDirectory: ChatDirectory = {
+		find: (name) => {
+			const subagent = registry.find(name);
+			return subagent ? chatPeer(subagent) : undefined;
+		},
+		list: () => registry.list().map(chatPeer),
+	};
+	/** The session's chat hub, created on first use, or undefined when chat is turned off for the project. */
+	const chatHubFor = (ctx: ExtensionContext): ChatHub | undefined => {
+		chatProjectDir = ctx.isProjectTrusted() ? findProjectSubagentsDir(ctx.cwd) : null;
+		if (!loadSubagentConfig(chatProjectDir).chat.enabled) return undefined;
+		chatHub ??= new ChatHub({
+			directory: chatDirectory,
+			config: (): ChatConfig => loadSubagentConfig(chatProjectDir).chat,
+			// Steers the orchestrator while it works, and starts a turn when it is idle.
+			deliverToOrchestrator: (delivery) => {
+				unreadChat.set(delivery.id, delivery);
+				pi.sendMessage(
+					{
+						customType: CHAT_MESSAGE_TYPE,
+						content: frameMessage(delivery, true),
+						display: true,
+						details: delivery,
+					},
+					{ triggerTurn: true, deliverAs: "steer" },
+				);
+				for (const listener of [...chatListeners]) listener(delivery);
+			},
+		});
+		return chatHub;
+	};
+	const closeChat = () => {
+		chatHub?.close();
+		chatHub = undefined;
+		unreadChat.clear();
+		chatClient?.close();
+		chatClient = undefined;
+	};
 
 	const reportDiagnostics = (catalog: SkillCatalog, ctx: ExtensionContext) => {
 		if (!ctx.hasUI) return;
@@ -380,14 +524,24 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 			? path.join(ctx.sessionManager.getSessionDir(), "subagents", ctx.sessionManager.getSessionId())
 			: undefined;
 
+		const id = registry.createId(request.name ?? agent.name);
+		// Every subagent joins the chat when it is on, so others can message it even if it may not send.
+		const hub = plan.chatRights ? chatHubFor(ctx) : undefined;
+		const chat =
+			hub && plan.chatRights ? { socket: hub.address(), token: hub.register(id, plan.chatRights) } : undefined;
+		const systemPrompt =
+			chat && plan.chatRights
+				? `${plan.systemPrompt}\n\n${chatPromptSection(id, plan.chatRights)}`
+				: plan.systemPrompt;
+
 		const subagent = new Subagent({
-			id: registry.createId(request.name ?? agent.name),
+			id,
 			agentName: agent.name,
 			agentSource: agent.source,
 			description: describeRun(request),
 			task: request.task,
 			cwd: request.cwd ?? ctx.cwd,
-			systemPrompt: plan.systemPrompt,
+			systemPrompt,
 			tools: plan.tools,
 			skillGroups: plan.skillGroups,
 			model: agent.model ?? parentModel,
@@ -398,6 +552,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 			ui: ctx.hasUI ? ctx.ui : undefined,
 			slots,
 			command: options.command,
+			chat,
 		});
 		registry.add(subagent);
 		return { subagent, message: request.session ? request.task : `Task: ${request.task}` };
@@ -583,6 +738,119 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 			isError: started.length === 0 || undefined,
 		};
 	};
+
+	// --- Chat -----------------------------------------------------------------------------------------------
+
+	pi.registerFlag(CHAT_FLAG, {
+		type: "string",
+		description: "Socket of the parent's subagent chat hub (set by the parent in subagent processes)",
+	});
+
+	/** In a subagent process: the connection to the parent's chat hub, once `session_start` has connected it. */
+	let chatClient: ChatClient | undefined;
+	const isSubagentProcess = () => {
+		const socket = pi.getFlag(CHAT_FLAG);
+		return typeof socket === "string" && socket !== "";
+	};
+	/** This process's name in chat, for bubble labels. */
+	const chatSelf = () => (isSubagentProcess() ? (chatClient?.name ?? "me") : ORCHESTRATOR);
+	/** Whether a message's sender is still blocked waiting for its reply. Only the parent's hub knows. */
+	const isAwaitingReply = (id: string) => chatHub?.isAwaitingReply(id) === true;
+
+	pi.registerTool<typeof ChatSendParams, ChatToolDetails>({
+		name: CHAT_SEND_TOOL_NAME,
+		label: "Chat Send",
+		description: [
+			'Send a short chat message to another agent in this session: a subagent by name, "orchestrator", or "all" for everyone still running.',
+			"A busy recipient reads it after its current tool call. Use it for findings, conflicts, and questions that change the recipient's work, not for progress updates.",
+			"Set waitForReply to block until the recipient answers (or the timeout passes); while you wait, any other message to you ends the wait and is returned instead.",
+			`See who you can message with ${CHAT_PEERS_TOOL_NAME}.`,
+		].join(" "),
+		promptSnippet: "Send a chat message to another agent",
+		parameters: ChatSendParams,
+		defaultActive: bundledChat.enabled && bundledChat.orchestratorCanMessage.length > 0,
+		renderShell: "self",
+
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const request = {
+				to: params.to,
+				text: params.text,
+				waitForReply: params.waitForReply,
+				timeoutSeconds: params.timeoutSeconds,
+			};
+			let result: SendResult;
+			if (isSubagentProcess()) {
+				result = chatClient
+					? await chatClient.send(request, signal)
+					: { ok: false, text: "Chat is not connected.", outcome: "refused" };
+			} else {
+				const hub = chatHubFor(ctx);
+				result = hub
+					? await hub.send(ORCHESTRATOR, request, signal)
+					: { ok: false, text: "Chat is turned off.", outcome: "refused" };
+			}
+			return {
+				content: [{ type: "text", text: result.text }],
+				details: { to: params.to, ok: result.ok, outcome: result.outcome, message: result.message },
+				isError: !result.ok || undefined,
+			};
+		},
+
+		renderCall(args, theme, context) {
+			return renderChatSendCall(args, theme, { ...context, self: chatSelf() });
+		},
+
+		renderResult(result, { expanded }, theme, context) {
+			const first = result.content[0];
+			const outcome = {
+				text: first?.type === "text" ? first.text : "",
+				outcome: result.details?.outcome,
+				message: result.details?.message,
+			};
+			const options = {
+				expanded,
+				isError: context.isError,
+				isPartial: context.isPartial,
+				outputPad: context.outputPad,
+				self: chatSelf(),
+				isAwaitingReply,
+			};
+			return renderChatSendResult(outcome, context.args.to, options, theme);
+		},
+	});
+
+	pi.registerTool<typeof ChatPeersParams, undefined>({
+		name: CHAT_PEERS_TOOL_NAME,
+		label: "Chat Peers",
+		description:
+			"List the agents you can message with chat_send, with what each is doing and whether it is still running.",
+		promptSnippet: "List the agents you can message",
+		parameters: ChatPeersParams,
+		defaultActive: bundledChat.enabled && bundledChat.orchestratorCanMessage.length > 0,
+		renderShell: "self",
+
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			let text: string;
+			if (isSubagentProcess()) text = chatClient ? await chatClient.peers() : "Chat is not connected.";
+			else text = chatHubFor(ctx)?.peers(ORCHESTRATOR) ?? "Chat is turned off.";
+			return { content: [{ type: "text", text }], details: undefined };
+		},
+
+		renderCall(_args, theme, context) {
+			return renderCallLine("Peers", undefined, "", theme, context);
+		},
+
+		renderResult(result, _options, theme, context) {
+			const first = result.content[0];
+			return renderChatPeersResult(first?.type === "text" ? first.text : "", context.outputPad, theme);
+		},
+	});
+
+	pi.registerMessageRenderer<ChatDelivery>(CHAT_MESSAGE_TYPE, (message, options, theme) =>
+		message.details
+			? renderChatMessage(message.details, { ...options, self: chatSelf(), isAwaitingReply }, theme)
+			: undefined,
+	);
 
 	pi.registerFlag(SKILL_GROUPS_FLAG, {
 		type: "string",
@@ -828,6 +1096,22 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		},
 	});
 
+	/** The heading of a wait that a chat message ended. The messages themselves follow the tool result. */
+	const chatInterruption = (unread: ChatDelivery[]): string => {
+		const senders = [...new Set(unread.map((delivery) => delivery.from))];
+		const waiting = unread
+			.filter((delivery) => delivery.awaitingReply && isAwaitingReply(delivery.id))
+			.map((delivery) => delivery.from);
+		const lines = [
+			`Stopped waiting: ${senders.join(", ") || "another agent"} sent you a chat message, shown after this result.`,
+		];
+		if (waiting.length > 0) lines.push(`${[...new Set(waiting)].join(", ")} is blocked waiting for your reply.`);
+		lines.push(
+			`The subagents keep running. Answer it or change direction if needed; if you still want their results, call ${SUBAGENT_WAIT_TOOL_NAME} again. Status:`,
+		);
+		return lines.join("\n");
+	};
+
 	pi.registerTool<typeof WaitParams, SubagentToolDetails>({
 		name: SUBAGENT_WAIT_TOOL_NAME,
 		label: "Subagent Wait",
@@ -835,6 +1119,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 			"Wait until subagents finish: the named ones, or every subagent still running or queued.",
 			"By default it returns only once ALL targets have finished.",
 			"Set returnOnFirst only to handle results one at a time as each subagent finishes.",
+			"A chat message to you ends the wait early, so you can answer it or change direction; the subagents keep running, and you may call it again to keep waiting.",
 			`Returns each target's status. Then read finished subagents' results with ${SUBAGENT_RESULT_TOOL_NAME}.`,
 		].join(" "),
 		promptSnippet: "Wait for background subagents to finish",
@@ -891,36 +1176,44 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 				if (mode === "any") return list.some(isSettled);
 				return list.every(isSettled) && (params.names !== undefined || backgroundJobs.size === 0);
 			};
-			const aborted = await new Promise<boolean>((resolve) => {
+			// Ends when the targets finish, the call is aborted, or a chat message to the orchestrator arrives.
+			const ending = await new Promise<"done" | "aborted" | "chat">((resolve) => {
 				let finished = false;
-				const finish = (wasAborted: boolean) => {
+				const finish = (reason: "done" | "aborted" | "chat") => {
 					if (finished) return;
 					finished = true;
 					unsubscribe();
 					jobListeners.delete(check);
+					chatListeners.delete(onChat);
 					signal?.removeEventListener("abort", onAbort);
-					resolve(wasAborted);
+					resolve(reason);
 				};
 				const check = () => {
 					if (!params.names && collect()) emitProgress();
-					if (done()) finish(false);
+					if (done()) finish("done");
 				};
-				const onAbort = () => finish(true);
+				const onAbort = () => finish("aborted");
+				const onChat = () => finish("chat");
 				const unsubscribe = registry.onChange(check);
 				jobListeners.add(check);
+				chatListeners.add(onChat);
 				signal?.addEventListener("abort", onAbort, { once: true });
-				if (signal?.aborted) finish(true);
+				if (signal?.aborted) finish("aborted");
 				else check();
+				if (unreadChat.size > 0) finish("chat");
 			});
 
 			const list = [...targets.values()];
 			const finished = list.filter(isSettled);
 			for (const subagent of finished) reported.add(subagent.key);
-			const heading = aborted
-				? "Stopped waiting."
-				: mode === "any"
-					? "A subagent finished."
-					: "All targets finished.";
+			const heading =
+				ending === "aborted"
+					? "Stopped waiting."
+					: ending === "chat"
+						? chatInterruption([...unreadChat.values()])
+						: mode === "any"
+							? "A subagent finished."
+							: "All targets finished.";
 			const lines = [heading, ...list.map(statusLine)];
 			if (finished.length > 0) {
 				const names = finished.map((subagent) => subagent.id).join(", ");
@@ -1067,21 +1360,56 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		reported.clear();
 	};
 
+	pi.on("message_start", (event) => {
+		const message = event.message;
+		if (message.role !== "custom" || message.customType !== CHAT_MESSAGE_TYPE) return;
+		const id = (message.details as ChatDelivery | undefined)?.id;
+		if (id) unreadChat.delete(id);
+	});
+
 	pi.on("agent_start", () => {
 		orchestratorBusy = true;
 	});
 
 	pi.on("agent_settled", () => {
 		orchestratorBusy = false;
+		// A steer the run never delivered (dropped by an abort, say) must not end every later wait at once.
+		unreadChat.clear();
 		if (pendingNotices.length > 0 && !noticeTimer) flushNotices();
 	});
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		resetBackground();
 		registry.clear();
+		closeChat();
 		lastViewed = undefined;
 		stopListening?.();
 		stopListening = undefined;
+
+		// In a subagent process, join the parent's chat. Messages arrive between tool calls, or before the first turn
+		// for ones held while this subagent was queued.
+		const socket = pi.getFlag(CHAT_FLAG);
+		const token = process.env[CHAT_TOKEN_ENV];
+		if (typeof socket === "string" && socket !== "" && token) {
+			const client = new ChatClient(socket, token, (delivery) =>
+				pi.sendMessage(
+					{
+						customType: CHAT_MESSAGE_TYPE,
+						content: frameMessage(delivery, false),
+						display: true,
+						details: delivery,
+					},
+					{ deliverAs: "steer" },
+				),
+			);
+			try {
+				await client.connect();
+				chatClient = client;
+			} catch {
+				client.close();
+			}
+		}
+
 		if (ctx.mode !== "tui" || !ctx.hasUI) return;
 
 		let dock: SubagentDock | undefined;
@@ -1110,6 +1438,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 							onOpen: (id) => {
 								lastViewed = id;
 							},
+							isAwaitingReply,
 							close: () => done(undefined),
 						}),
 					{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left" } },
@@ -1147,6 +1476,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 	pi.on("session_shutdown", (_event, ctx) => {
 		resetBackground();
 		registry.clear();
+		closeChat();
 		stopListening?.();
 		stopListening = undefined;
 		if (ctx.hasUI) ctx.ui.setWidget(DOCK_WIDGET_KEY, undefined);

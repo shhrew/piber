@@ -13,9 +13,11 @@ import * as path from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import type { ExtensionUIContext } from "../../core/extensions/types.ts";
+import type { CustomMessage } from "../../core/messages.ts";
 import type { JsonAgentSessionEvent } from "../../modes/json-event.ts";
 import type { RpcExtensionUIRequest } from "../../modes/rpc/rpc-types.ts";
 import type { AgentSource } from "./agents.ts";
+import { CHAT_FLAG, CHAT_MESSAGE_TYPE, CHAT_TOKEN_ENV, type ChatDelivery } from "./chat.ts";
 import { type ChildEvent, ChildRpc } from "./rpc.ts";
 import type { SlotPool } from "./slots.ts";
 
@@ -58,6 +60,8 @@ export interface SubagentOptions {
 	ui?: ExtensionUIContext;
 	/** Command that starts pi. Default: the command that started this process. */
 	command?: { executable: string; args: string[] };
+	/** The parent's chat hub and this subagent's token for it. Without it, the subagent has no chat. */
+	chat?: { socket: string; token: string };
 	/** Limits concurrent subagent processes. Each run waits for a slot here before its process starts. */
 	slots?: SlotPool;
 }
@@ -79,7 +83,14 @@ function getPiCommand(): { executable: string; args: string[] } {
 	return { executable: "pi", args: [] };
 }
 
-function isTranscriptMessage(message: AgentMessage): message is Message {
+/** A chat message a subagent received, as its session stores it. */
+export type ChatTranscriptMessage = CustomMessage<ChatDelivery> & { customType: typeof CHAT_MESSAGE_TYPE };
+
+/** What a subagent's transcript keeps: its conversation, plus the chat messages it received. */
+export type TranscriptMessage = Message | ChatTranscriptMessage;
+
+function isTranscriptMessage(message: AgentMessage): message is TranscriptMessage {
+	if (message.role === "custom") return message.customType === CHAT_MESSAGE_TYPE;
 	return message.role === "user" || message.role === "assistant" || message.role === "toolResult";
 }
 
@@ -106,6 +117,7 @@ export function buildChildArgs(
 	} else {
 		args.push("--no-session");
 	}
+	if (options.chat) args.push(`--${CHAT_FLAG}`, options.chat.socket);
 	return args;
 }
 
@@ -114,8 +126,8 @@ export class Subagent {
 	/** Unique per instance, unlike `id`, which a later pi process may reuse for a different subagent. */
 	readonly key = randomUUID();
 	status: SubagentStatus = "running";
-	/** Completed user, assistant, and tool result messages. */
-	messages: Message[] = [];
+	/** Completed user, assistant, and tool result messages, and the chat messages it received. */
+	messages: TranscriptMessage[] = [];
 	/** The assistant message being streamed, rebuilt from deltas. */
 	streaming: AssistantMessage | undefined;
 	usage: SubagentUsage = emptyUsage();
@@ -233,6 +245,7 @@ export class Subagent {
 			executable: command.executable,
 			args: [...command.args, ...buildChildArgs(this.options, this.sessionFile, promptFile)],
 			cwd: this.options.cwd,
+			env: this.options.chat ? { [CHAT_TOKEN_ENV]: this.options.chat.token } : undefined,
 			onEvent: (event) => {
 				if (event.type === "agent_settled") resolveSettled({ aborted: event.aborted });
 				else this.handleEvent(event, client);

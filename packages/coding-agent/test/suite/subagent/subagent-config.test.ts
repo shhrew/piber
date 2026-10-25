@@ -153,7 +153,18 @@ describe("subagent run planning", () => {
 
 		const plan = planSubagentRun(reviewer, { extraTools: ["edit", "read"], extraSkillGroups: ["extra"] }, null);
 
-		expect(plan.tools).toEqual(["read", "grep", "find", "ls", "bash", "edit", "skill_search", "load_skill"]);
+		expect(plan.tools).toEqual([
+			"read",
+			"grep",
+			"find",
+			"ls",
+			"bash",
+			"edit",
+			"skill_search",
+			"load_skill",
+			"chat_send",
+			"chat_peers",
+		]);
 		expect(plan.skillGroups).toEqual(["review", "extra"]);
 		expect(plan.systemPrompt).toContain("You are a senior code reviewer.");
 		expect(plan.systemPrompt).toContain("Tags: quality, review, security, tests");
@@ -167,7 +178,7 @@ describe("subagent run planning", () => {
 
 		const plan = planSubagentRun(planner, {}, subagentsDir);
 
-		expect(plan.tools).toEqual(["read"]);
+		expect(plan.tools).toEqual(["read", "chat_send", "chat_peers"]);
 		expect(plan.systemPrompt).not.toContain("## Skills");
 	});
 

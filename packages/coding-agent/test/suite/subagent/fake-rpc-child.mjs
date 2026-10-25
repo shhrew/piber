@@ -4,7 +4,9 @@
 // - crash: exit with code 3 when prompted
 // - hang: wait after a prompt until a steer ("steered: <message>") or an abort
 // - notify: send an info and a warning notification, then answer like echo
-// - auto: answer like echo, but after 1.5 s when the message contains "slow"
+// - auto: answer like echo, but after 1.5 s when the message contains "slow". With --subagent-chat, it joins the
+//   parent's chat hub, and a message containing "tell orchestrator: <text>" sends <text> to the orchestrator first.
+import { connect } from "node:net";
 import { createInterface } from "node:readline";
 
 const mode = process.argv[2];
@@ -12,6 +14,16 @@ const history = [];
 let pendingConfirm;
 
 const write = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
+
+const chatIndex = process.argv.indexOf("--subagent-chat");
+let chat;
+if (chatIndex !== -1 && process.env.PI_SUBAGENT_CHAT_TOKEN) {
+	chat = connect(process.argv[chatIndex + 1]);
+	chat.on("connect", () =>
+		chat.write(`${JSON.stringify({ type: "hello", token: process.env.PI_SUBAGENT_CHAT_TOKEN })}\n`),
+	);
+	chat.on("error", () => {});
+}
 const respond = (id, command, data) => write({ id, type: "response", command, success: true, data });
 
 const usage = {
@@ -68,6 +80,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 			}
 			if (mode === "echo" || mode === "notify") reply(`echo: ${command.message}`);
 			if (mode === "auto") {
+				const tell = /tell orchestrator: (.*)/.exec(command.message);
+				if (tell && chat) {
+					chat.write(`${JSON.stringify({ type: "send", id: "1", to: "orchestrator", text: tell[1] })}\n`);
+				}
 				const delay = command.message.includes("slow") ? 1500 : 0;
 				setTimeout(() => reply(`echo: ${command.message}`), delay);
 			}

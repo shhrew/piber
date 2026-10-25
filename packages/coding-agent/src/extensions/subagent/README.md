@@ -4,7 +4,7 @@ A built-in extension that lets the model delegate tasks to subagents. Each subag
 
 ## Agents
 
-An agent is a Markdown file. The body is the agent's whole system prompt; Pi's default prompt is not included.
+An agent is a Markdown file. The body is the agent's own system prompt; Pi's default prompt is not included. Every subagent's prompt starts with the [global subagent prompt](#global-subagent-prompt).
 
 ```markdown
 ---
@@ -14,12 +14,17 @@ model: anthropic/claude-sonnet-4-5   # optional; without it the parent's model a
 tools: [edit, write, bash]            # added to the core tools
 skillGroups: [php, testing]           # skill groups the agent can search
 pinnedSkills: [symfony]               # optional; always listed in the agent's prompt
+canMessage: [orchestrator, subagents] # optional; who it may message over chat (see Chat)
 ---
 
 You are a Symfony developer...
 ```
 
-`tools`, `skillGroups`, and `pinnedSkills` accept a YAML list or a comma-separated string.
+`tools`, `skillGroups`, `pinnedSkills`, and `canMessage` accept a YAML list or a comma-separated string.
+
+### Global subagent prompt
+
+`system-prompt.md` in this directory goes at the start of every subagent's prompt: what working as a subagent means, and how to use chat. A trusted project's `.pi/subagents/system-prompt.md` is appended to it. The full prompt is the global prompt, then the agent's own prompt, then its skills section, then a generated chat section with the subagent's chat name and who it may message.
 
 Agents are loaded from two places:
 
@@ -93,7 +98,7 @@ Three tools manage background subagents:
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `subagent_wait` | `names` (optional), `returnOnFirst` (optional, default `false`) | Each target's status once all of them have finished, or, with `returnOnFirst`, once the first has. Without `names`, it waits for every subagent still running or queued, including later chain steps. The chat shows `Wait(all)` or `Wait(any)`. |
+| `subagent_wait` | `names` (optional), `returnOnFirst` (optional, default `false`) | Each target's status once all of them have finished, or, with `returnOnFirst`, once the first has. Without `names`, it waits for every subagent still running or queued, including later chain steps. A chat message to the orchestrator ends the wait early, with the targets' status; the message follows the result, and the orchestrator can answer it, change direction, or call `subagent_wait` again. The chat shows `Wait(all)` or `Wait(any)`. |
 | `subagent_result` | `names` (one or more) | Each finished subagent's final answer, or its error, capped at 50 KB each. Running and queued subagents have no result yet; a call that returns no result at all is an error, so the orchestrator notices it asked too early. |
 | `subagent_list` | none | Every subagent in the session: running, queued (waiting for a free slot), or finished, with whether its result has been read. |
 
@@ -105,6 +110,48 @@ While the orchestrator is working, notices are held until its run settles. A mes
 
 In the chat, a background call's rows keep updating after the call returns. A wait for all or any subagents shows only its call line (`● Wait(all) · waiting for a subagent to finish`); a wait for two or more named subagents shows the mode and adds one row each with the name and description while it waits; a wait for one subagent names it on the call line (`● Wait(scout-a) · waiting for it to finish`). A finished wait is always a single line, such as `● Wait(any) · done waiting`. Background subagents stop when the session ends; after a resume, their rows show `Started in background`.
 
+## Chat
+
+Agents in a session can send each other short messages, so a swarm can share findings and steer each other while it works: the orchestrator to a subagent, a subagent to the orchestrator, a subagent to another subagent, or anyone to everyone at once.
+
+| Tool | Parameters | Use |
+|---|---|---|
+| `chat_send` | `to`: a subagent's name, `orchestrator`, or `all`; `text`; `waitForReply` (optional); `timeoutSeconds` (optional) | Send a message. With `waitForReply`, block until the recipient answers or the timeout passes. |
+| `chat_peers` | none | List who the caller may message, with what each subagent is doing and whether it is still running. |
+
+**Permissions.** An agent's `canMessage` says whom it may send to: `orchestrator`, `subagents` (any other subagent by name), and `all` (both, plus broadcasting with `to: "all"`). Agents without `canMessage` use `chat.defaultCanMessage`; the orchestrator uses `chat.orchestratorCanMessage`. An agent that may not send still receives messages. Subagents get `chat_send` and `chat_peers` only when they may send.
+
+**Delivery.**
+
+| Recipient | What happens |
+|---|---|
+| A running subagent | Gets the message after its current tool call. |
+| A queued subagent | The message is held and delivered when it starts; the sender is told. |
+| A finished subagent | The send is refused. |
+| The orchestrator | Gets the message after its current tool call while it works; when it is idle, the message starts a turn. |
+| `all` | Every running or queued subagent except the sender, and the orchestrator when a subagent sends it. |
+
+Recipients see a message as `[Chat message from scout-a (a subagent) to you, not from the user]` followed by the text, so their model does not mistake it for the user.
+
+**Waiting for a reply.** With `waitForReply`, the sender blocks until the recipient's next message to it, up to `timeoutSeconds` (default `chat.replyTimeoutSeconds`, at most `chat.maxReplyTimeoutSeconds`). While an agent waits it cannot read messages the normal way, so any other message to it ends the wait and is returned in the tool result instead. That also resolves two agents waiting on each other. A timeout leaves the message delivered; a later reply arrives as a normal message. `waitForReply` cannot be used with `to: "all"`.
+
+**Limits.** Messages longer than `chat.maxMessageLength` are refused, and so are sends beyond `chat.maxMessagesPerMinute` per agent.
+
+**Display.** Messages are drawn as bubbles. The current agent is always on the right of the label, so the arrow shows the direction: a received message sits on the left as `scout-a → orchestrator`, a sent one on the right as `worker ← orchestrator`, with its outcome (`✓ delivered`, `◷ held until worker starts`, `✗ not sent: …`) under it and the reply, if it waited for one, as a received bubble below. When the sender is waiting for a reply, the received bubble's border says `waiting for your reply` in the warning color until the sender stops waiting, then `asked for a reply`. The recipient's model is told the same: the sender is blocked until it answers, so it should reply, even if only to acknowledge. The main chat shows the orchestrator's messages, collapsed to 6 lines until expanded; the agent view shows a subagent's messages in full.
+
+```
+ ╭─ scout-a → orchestrator ──────────────╮
+ │ Is the session token cached anywhere? │
+ ╰────────────── waiting for your reply ─╯
+
+                         ╭─ scout-a ← orchestrator ─╮
+                         │ Yes, in src/cache.ts     │
+                         ╰──────────────────────────╯
+                                          ✓ delivered
+```
+
+**How it works.** The parent runs a chat hub on a local socket (a Unix socket in a private temporary directory, or a named pipe on Windows) and gives each subagent process the socket path and a secret token (in the `PI_SUBAGENT_CHAT_TOKEN` environment variable). The hub checks every message's permissions and limits, so a subagent cannot impersonate another or go past its `canMessage`.
+
 ## Configuration
 
 `config.json` in this directory sets defaults for every subagent. A trusted project can override any field in `.pi/subagents/config.json`.
@@ -114,7 +161,16 @@ In the chat, a background call's rows keep updating after the call returns. A wa
 	"coreTools": ["read", "grep", "find", "ls"],
 	"maxConcurrent": 4,
 	"defaultMode": "foreground",
-	"onBackgroundComplete": "wake"
+	"onBackgroundComplete": "wake",
+	"chat": {
+		"enabled": true,
+		"defaultCanMessage": ["orchestrator"],
+		"orchestratorCanMessage": ["subagents", "all"],
+		"maxMessageLength": 4000,
+		"maxMessagesPerMinute": 10,
+		"replyTimeoutSeconds": 120,
+		"maxReplyTimeoutSeconds": 600
+	}
 }
 ```
 
@@ -123,6 +179,7 @@ In the chat, a background call's rows keep updating after the call returns. A wa
 | `coreTools` | Tools every subagent gets (see [Tools](#tools)). |
 | `maxConcurrent` | How many subagent processes may run at once in a session. It must be a positive integer; other values are ignored. |
 | `defaultMode` | `"foreground"` or `"background"`: how a `subagent` call runs when it does not set `background`. |
+| `chat` | Subagent chat (see [Chat](#chat)): `enabled`; `defaultCanMessage` for agents without `canMessage`; `orchestratorCanMessage`; `maxMessageLength` in characters; `maxMessagesPerMinute` per agent; `replyTimeoutSeconds` and `maxReplyTimeoutSeconds` for `waitForReply`. A project's `chat` object overrides individual fields. |
 | `onBackgroundComplete` | What happens when a background subagent finishes and nothing has reported it: `"wake"` posts a notice at once, starting a turn if the orchestrator is idle or queuing it after the current one; `"notify"` posts it with the next turn; `"silent"` posts nothing, leaving the result to `subagent_wait` and `subagent_result`. |
 
 `maxConcurrent` covers every subagent the session starts: parallel tasks, separate `subagent` calls, `session` continuations, and follow-ups sent from the agent view. A subagent beyond the limit waits in a queue with the status `queued` (`◷`), and starts in order when a running one finishes. Esc in the agent view, or aborting the parent's tool call, removes it from the queue. A queued subagent cannot be steered until it starts. The limit is read again before each run, so editing `config.json` takes effect for the next subagent.
@@ -195,7 +252,9 @@ Dialogs from a subagent's extensions (confirm, select, input) appear in the pare
 | `view.ts` | The agent view |
 | `dock.ts` | The dock under the composer |
 | `slots.ts` | The `maxConcurrent` slot queue |
+| `chat.ts` | The chat hub, the subagents' chat client, permissions, and message framing |
+| `system-prompt.md` | The global subagent prompt |
 | `render.ts` | Tool call and result rendering |
-| `paths.ts` | Bundled asset location and `config.json` |
+| `paths.ts` | Bundled asset location, `config.json`, and the global prompt |
 
-The build copies `agents/`, `skills/`, and `config.json` to `dist/extensions/subagent/` and, for standalone binaries, to `subagent/` next to the executable (see `copy-assets` and `copy-binary-assets` in `package.json`).
+The build copies `agents/`, `skills/`, `config.json`, and `system-prompt.md` to `dist/extensions/subagent/` and, for standalone binaries, to `subagent/` next to the executable (see `copy-assets` and `copy-binary-assets` in `package.json`).

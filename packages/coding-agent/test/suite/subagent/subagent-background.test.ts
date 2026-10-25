@@ -248,4 +248,36 @@ describe("background subagents", () => {
 			].join("\n"),
 		);
 	}, 20_000);
+
+	it("ends a wait when a chat message reaches the orchestrator, and can wait again", async () => {
+		harness = await createSession();
+		harness.setResponses([
+			call("subagent", {
+				agent: "scout",
+				task: "slow job; tell orchestrator: need a decision",
+				name: "asker",
+				description: "Ask mid-task",
+				background: true,
+			}),
+			call("subagent_wait", {}),
+			// The orchestrator reads the message, then chooses to keep waiting.
+			call("subagent_wait", {}),
+			fauxAssistantMessage("done"),
+		]);
+
+		await harness.session.prompt("Delegate and wait");
+
+		const [first, second] = toolResults(harness, "subagent_wait");
+		expect(getMessageText(first)).toContain(
+			"Stopped waiting: asker sent you a chat message, shown after this result.",
+		);
+		expect(getMessageText(first)).toContain("- asker (Ask mid-task): running");
+		const firstIndex = harness.session.messages.indexOf(first);
+		expect(harness.session.messages[firstIndex + 1]).toMatchObject({
+			role: "custom",
+			customType: "subagent-chat",
+			details: { from: "asker", text: "need a decision" },
+		});
+		expect(getMessageText(second)).toContain("All targets finished.\n- asker (Ask mid-task): done");
+	}, 15_000);
 });
