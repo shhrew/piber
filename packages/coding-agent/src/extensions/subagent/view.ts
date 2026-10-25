@@ -1,10 +1,10 @@
 /**
  * The agent view: a full-screen overlay listing the main session and its subagents.
  *
- * List: up/down select, Enter opens, Esc or the agent-view double press closes.
+ * List: up/down select, Enter opens, Esc or the agent-view key closes.
  * Subagent: live transcript with an input line. Enter steers a running subagent or starts a follow-up
- * run on an idle one; Esc aborts a running subagent or returns to the list; the agent-view double press
- * returns to the list.
+ * run on an idle one; Esc aborts a running subagent or goes back; the agent-view key goes back. Back is
+ * the list, or the main session when the subagent was opened from the dock.
  *
  * The transcript scrolls like the fullscreen transcript: the `tui.altScreen.*` page, half-page, line,
  * top, and bottom keys and the mouse wheel. It follows new output until scrolled up, then holds its
@@ -41,9 +41,6 @@ import {
 	SPINNER_INTERVAL_MS,
 	statusIcon,
 } from "./render.ts";
-
-/** Two presses of the agent-view key within this many milliseconds open or leave the view. */
-export const DOUBLE_PRESS_MS = 400;
 
 /** Lines kept from the previous page when paging, as in the fullscreen transcript. */
 const PAGE_SCROLL_OVERLAP = 4;
@@ -90,26 +87,6 @@ export class TranscriptScroll {
 
 	get recentlyScrolled(): boolean {
 		return Date.now() - this.lastActivity < SCROLLBAR_HIDE_DELAY_MS;
-	}
-}
-
-/** Tracks presses of `app.agents.view` and reports the second press of a quick pair. */
-export class DoublePressDetector {
-	private lastPress = 0;
-
-	/** True when `data` is the agent-view key and completes a double press. */
-	isDoublePress(data: string, keybindings: KeybindingsManager): boolean {
-		if (!keybindings.matches(data, "app.agents.view")) {
-			this.lastPress = 0;
-			return false;
-		}
-		const now = Date.now();
-		if (now - this.lastPress <= DOUBLE_PRESS_MS) {
-			this.lastPress = 0;
-			return true;
-		}
-		this.lastPress = now;
-		return false;
 	}
 }
 
@@ -165,7 +142,8 @@ export class AgentView implements Component {
 	private readonly scrollbar: ScrollViewScrollbar;
 	private readonly scroll = new TranscriptScroll();
 	private scrollbarTimer: NodeJS.Timeout | undefined;
-	private readonly doublePress = new DoublePressDetector();
+	/** Opened straight onto a subagent, as from the dock: going back closes the view instead of showing the list. */
+	private readonly openedDirectly: boolean;
 	private readonly input = new Input({ prompt: "› " });
 	private readonly unsubscribe: () => void;
 	/** Redraws running subagents' spinners. */
@@ -207,6 +185,7 @@ export class AgentView implements Component {
 		const initial = options.openId ?? options.initialSelection;
 		this.selectedId = initial !== undefined && registry.find(initial) ? initial : undefined;
 		this.open = options.openId === undefined ? undefined : registry.find(options.openId);
+		this.openedDirectly = this.open !== undefined;
 	}
 
 	dispose(): void {
@@ -262,7 +241,7 @@ export class AgentView implements Component {
 
 	private handleListInput(data: string): void {
 		const kb = this.keybindings;
-		if (this.doublePress.isDoublePress(data, kb) || kb.matches(data, "tui.select.cancel")) {
+		if (kb.matches(data, "app.agents.view") || kb.matches(data, "tui.select.cancel")) {
 			this.close();
 		} else if (kb.matches(data, "tui.select.up")) {
 			this.moveSelection(-1, true);
@@ -284,13 +263,13 @@ export class AgentView implements Component {
 
 	private handleSessionInput(data: string, subagent: Subagent): void {
 		const kb = this.keybindings;
-		if (this.input.getValue() === "" && this.doublePress.isDoublePress(data, kb)) {
-			this.backToList();
+		if (this.input.getValue() === "" && kb.matches(data, "app.agents.view")) {
+			this.back();
 			return;
 		}
 		if (kb.matches(data, "app.interrupt")) {
 			if (subagent.isRunning || subagent.isQueued) void subagent.abort();
-			else this.backToList();
+			else this.back();
 			return;
 		}
 		const page = Math.max(1, this.scroll.viewportHeight - PAGE_SCROLL_OVERLAP);
@@ -332,7 +311,12 @@ export class AgentView implements Component {
 		this.scrollbarTimer.unref();
 	}
 
-	private backToList(): void {
+	/** Leave the open subagent: to the main session when it was opened directly, otherwise to the list. */
+	private back(): void {
+		if (this.openedDirectly) {
+			this.close();
+			return;
+		}
 		this.open = undefined;
 		this.transcript = undefined;
 		this.notice = undefined;
@@ -398,12 +382,13 @@ export class AgentView implements Component {
 			theme.fg("dim", subagent.sessionFile ? `session: ${subagent.sessionFile}` : "no session file"),
 		];
 		const below = this.scroll.linesBelow;
+		const back = this.openedDirectly ? "main" : "agents";
 		const hint = [
 			subagent.isQueued
-				? "waiting for a free slot · esc cancel · ←← agents"
+				? `waiting for a free slot · esc cancel · ← ${back}`
 				: subagent.isRunning
-					? "enter steer · esc abort · ←← agents"
-					: "enter follow up · esc agents",
+					? `enter steer · esc abort · ← ${back}`
+					: `enter follow up · esc ${back}`,
 			"pgup/pgdn/wheel scroll",
 			...(below > 0 ? [`↓ ${below} more`] : []),
 		].join(" · ");

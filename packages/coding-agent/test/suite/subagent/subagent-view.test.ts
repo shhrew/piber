@@ -82,31 +82,36 @@ function createSubagent(
 	return subagent;
 }
 
-/** An agent view over `subagents` in an 80x20 terminal. `opened` records each `onOpen` call. */
+/** An agent view over `subagents` in an 80x20 terminal. `opened` records each `onOpen` call; `closed()` whether it closed. */
 function createView(
 	subagents: Subagent[],
 	options: {
 		scrollbar?: "hidden" | "auto" | "always";
 		initialSelection?: string;
+		openId?: string;
 		isAwaitingReply?: (id: string) => boolean;
 	} = {},
 ) {
 	const registry = new SubagentRegistry();
 	for (const subagent of subagents) registry.add(subagent);
 	const opened: Array<string | undefined> = [];
+	let closes = 0;
 	const tui = { terminal: { rows: 20 }, requestRender: () => {} } as unknown as TUI;
 	const view = new AgentView(tui, theme, new KeybindingsManager(), registry, {
 		cwd: process.cwd(),
 		scrollbar: options.scrollbar ?? "hidden",
 		initialSelection: options.initialSelection,
+		openId: options.openId,
 		onOpen: (id) => opened.push(id),
-		close: () => {},
+		close: () => {
+			closes++;
+		},
 		isAwaitingReply: options.isAwaitingReply,
 	});
 	const lines = () => view.render(80).map((line) => stripVTControlCharacters(line));
 	/** The list row marked as selected. */
 	const selectedRow = () => lines().find((line) => line.startsWith("› "));
-	return { view, lines, selectedRow, opened };
+	return { view, lines, selectedRow, opened, closed: () => closes > 0 };
 }
 
 /** An agent view opened on a finished subagent with `count` messages, in a 20-row terminal. */
@@ -227,13 +232,29 @@ describe("subagent agent view list", () => {
 
 	it("returns to the list on the subagent that was open", () => {
 		const subagents = [createSubagent("alpha", "First job"), createSubagent("beta", "Second job")];
-		const { view, selectedRow } = createView(subagents, { initialSelection: "alpha" });
+		const { view, selectedRow, closed } = createView(subagents, { initialSelection: "alpha" });
 		view.handleInput(KEYS.enter);
 
 		view.handleInput(KEYS.left);
-		view.handleInput(KEYS.left);
 
 		expect(selectedRow()).toContain("alpha");
+		expect(closed()).toBe(false);
+
+		view.handleInput(KEYS.left);
+		expect(closed()).toBe(true);
+	});
+
+	it("returns to the main session from a subagent opened from the dock", () => {
+		const subagents = [createSubagent("alpha", "First job")];
+		const viaLeft = createView(subagents, { openId: "alpha" });
+		expect(viaLeft.lines().join("\n")).toContain("esc main");
+
+		viaLeft.view.handleInput(KEYS.left);
+		expect(viaLeft.closed()).toBe(true);
+
+		const viaEsc = createView(subagents, { openId: "alpha" });
+		viaEsc.view.handleInput("\x1b");
+		expect(viaEsc.closed()).toBe(true);
 	});
 
 	it("groups subagents under In progress, Queued, and Completed, and moves between rows without stopping on headers", async () => {

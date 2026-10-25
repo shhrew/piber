@@ -82,7 +82,7 @@ const APP_KEYBINDINGS = {
 	"app.session.resume": { defaultKeys: [], description: "Resume a session" },
 	"app.agents.view": {
 		defaultKeys: "left",
-		description: "Open the agent view (press twice with an empty editor)",
+		description: "Open the agent view (with an empty editor)",
 	},
 	"app.tree.foldOrUp": {
 		defaultKeys: process.platform === "darwin" ? ["alt+left", "ctrl+left"] : ["ctrl+left", "alt+left"],

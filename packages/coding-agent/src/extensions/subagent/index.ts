@@ -6,7 +6,7 @@
  *   tools, skill groups, and session file. Modes: single, parallel, and chain.
  * - `skill_search` and `load_skill` serve a subagent's skill groups. They are registered inactive and are
  *   enabled only in subagent processes, through the `--tools` list the parent passes.
- * - The agent view (`app.agents.view` pressed twice with an empty editor) lists the main session and its
+ * - The agent view (`app.agents.view` pressed with an empty editor) lists the main session and its
  *   subagents, shows a subagent's live transcript, and steers it.
  *
  * See README.md in this directory.
@@ -76,7 +76,7 @@ import {
 	searchSkills,
 } from "./skills.ts";
 import { SlotPool } from "./slots.ts";
-import { AgentView, DoublePressDetector } from "./view.ts";
+import { AgentView } from "./view.ts";
 
 export const SKILL_SEARCH_TOOL_NAME = "skill_search";
 export const LOAD_SKILL_TOOL_NAME = "load_skill";
@@ -1422,7 +1422,6 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 			{ placement: "belowEditor" },
 		);
 
-		const detector = new DoublePressDetector();
 		let viewOpen = false;
 		const openView = (openId?: string) => {
 			viewOpen = true;
@@ -1467,7 +1466,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 				return { consume: true };
 			}
 			if (ctx.ui.getEditorText() !== "") return undefined;
-			if (!detector.isDoublePress(data, keybindings)) return undefined;
+			if (!keybindings.matches(data, "app.agents.view")) return undefined;
 			openView();
 			return { consume: true };
 		});

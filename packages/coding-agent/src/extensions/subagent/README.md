@@ -224,14 +224,14 @@ Rows beyond the fourth are reached by moving the selection; the dock shows how m
 
 ## Agent view
 
-Press `←` twice within 400 ms while the editor is empty (keybinding `app.agents.view`, configurable in `keybindings.json`). The view lists the main session at the top, then the subagents started in this session under **In progress**, **Queued**, and **Completed** (empty sections are hidden), each by name, description, and agent. Running subagents show a spinner, queued ones `◷`, and finished ones `✓`, or `✗` when they failed or were aborted. Section headers are not selectable: ↑ and ↓ move between rows, and the selection stays on a subagent as it moves from one section to the next. It starts on the session you last opened in it: the main session at first, then whichever subagent (or the main session) you opened most recently. Going back from a subagent returns to the list on that subagent.
+Press `←` while the editor is empty (keybinding `app.agents.view`, configurable in `keybindings.json`). The view lists the main session at the top, then the subagents started in this session under **In progress**, **Queued**, and **Completed** (empty sections are hidden), each by name, description, and agent. Running subagents show a spinner, queued ones `◷`, and finished ones `✓`, or `✗` when they failed or were aborted. Section headers are not selectable: ↑ and ↓ move between rows, and the selection stays on a subagent as it moves from one section to the next. It starts on the session you last opened in it: the main session at first, then whichever subagent (or the main session) you opened most recently. Going back from a subagent returns to the list on that subagent, unless it was opened from the dock: then going back returns to the main session.
 
 | Key | List | Subagent |
 |---|---|---|
 | `↑` / `↓` | Select | |
 | `Enter` | Open the selection (the main session closes the view) | Send the input: steers a running subagent, or starts a follow-up on an idle one |
-| `Esc` | Close the view | Abort a running subagent, cancel a queued one, or go back to the list |
-| `←←` | Close the view | Go back to the list (when the input is empty) |
+| `Esc` | Close the view | Abort a running subagent, cancel a queued one, or go back |
+| `←` | Close the view | Go back (when the input is empty) |
 | `PgUp` / `PgDn`, mouse wheel | Wheel moves the selection | Scroll the transcript |
 | `Ctrl+Home` / `Ctrl+End` | | Jump to the top or bottom of the transcript |
 
