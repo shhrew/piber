@@ -153,6 +153,60 @@ describe("DefaultPackageManager", () => {
 			]);
 		});
 
+		it("should resolve default packages unless settings configure the same package", async () => {
+			const pm = new DefaultPackageManager({
+				cwd: tempDir,
+				agentDir,
+				settingsManager,
+				defaultPackages: ["npm:default-pkg@1.0.0"],
+			});
+			const packageDir = join(agentDir, "npm", "node_modules", "default-pkg");
+			const runCommandSpy = vi.spyOn(pm as any, "runCommand").mockImplementation(async () => {
+				mkdirSync(packageDir, { recursive: true });
+				writeFileSync(
+					join(packageDir, "package.json"),
+					JSON.stringify({ name: "default-pkg", version: "1.0.0", pi: { extensions: ["./index.ts"] } }),
+				);
+				writeFileSync(join(packageDir, "index.ts"), "export default function() {}");
+			});
+
+			const result = await pm.resolve();
+			expect(runCommandSpy).toHaveBeenCalledTimes(1);
+			const extension = result.extensions.find((r) => r.path === join(packageDir, "index.ts"));
+			expect(extension?.enabled).toBe(true);
+			expect(extension?.metadata).toMatchObject({
+				source: "npm:default-pkg@1.0.0",
+				scope: "user",
+				origin: "package",
+			});
+
+			settingsManager.setPackages([{ source: "npm:default-pkg", extensions: [] }]);
+			const filtered = await pm.resolve();
+			expect(runCommandSpy).toHaveBeenCalledTimes(1);
+			expect(filtered.extensions.filter((r) => r.metadata.origin === "package")).toEqual([
+				expect.objectContaining({ path: join(packageDir, "index.ts"), enabled: false }),
+			]);
+			expect(filtered.extensions[0]?.metadata.source).toBe("npm:default-pkg");
+		});
+
+		it("should skip default packages that fail to install without retrying", async () => {
+			const pm = new DefaultPackageManager({
+				cwd: tempDir,
+				agentDir,
+				settingsManager,
+				defaultPackages: ["npm:default-pkg@1.0.0"],
+			});
+			vi.spyOn(pm as any, "getLegacyGlobalNpmInstallPath").mockReturnValue(undefined);
+			const runCommandSpy = vi.spyOn(pm as any, "runCommand").mockRejectedValue(new Error("npm not found"));
+
+			expect((await pm.resolve()).extensions).toEqual([]);
+			expect((await pm.resolve()).extensions).toEqual([]);
+			expect(runCommandSpy).toHaveBeenCalledTimes(1);
+
+			settingsManager.setPackages(["npm:default-pkg@1.0.0"]);
+			await expect(pm.resolve()).rejects.toThrow("npm not found");
+		});
+
 		it("should resolve skill paths from settings", async () => {
 			const skillDir = join(agentDir, "skills", "my-skill");
 			mkdirSync(skillDir, { recursive: true });

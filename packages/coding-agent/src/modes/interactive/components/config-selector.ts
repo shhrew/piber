@@ -589,11 +589,16 @@ class ResourceList implements Component, Focusable {
 			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
 
 		const packages = [...(settings.packages ?? [])] as PackageSource[];
-		const pkgIndex = packages.findIndex((pkg) => {
+		let pkgIndex = packages.findIndex((pkg) => {
 			const source = typeof pkg === "string" ? pkg : pkg.source;
 			return source === item.metadata.source;
 		});
 
+		// A default package has no settings entry yet. Adding one replaces the default.
+		if (pkgIndex === -1 && scope === "user") {
+			packages.push(item.metadata.source);
+			pkgIndex = packages.length - 1;
+		}
 		if (pkgIndex === -1) return;
 
 		let pkg = packages[pkgIndex];

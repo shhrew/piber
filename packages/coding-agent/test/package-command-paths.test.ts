@@ -526,6 +526,27 @@ if (process.platform !== "win32") fs.chmodSync(piPath, 0o755);
 		expect(settingsManager.getProjectSettings().packages).toEqual([]);
 	});
 
+	it("adds a settings entry when toggling a default package resource in config global mode", async () => {
+		const settingsManager = SettingsManager.fromStorage(new InMemorySettingsStorage(), { projectTrusted: true });
+		const resolvedPaths = extensionPaths(join(tempDir, "pkg"), "npm:pi-tools@1.0.0", "user", ["bar.ts"]);
+		const selector = new ConfigSelectorComponent(
+			{ global: resolvedPaths, project: resolvedPaths },
+			settingsManager,
+			projectDir,
+			agentDir,
+			() => {},
+			() => {},
+			() => {},
+			24,
+			"global",
+		);
+
+		selector.getResourceList().handleInput(" ");
+		expect(settingsManager.getGlobalSettings().packages).toEqual([
+			{ source: "npm:pi-tools@1.0.0", extensions: ["-extensions/bar.ts"] },
+		]);
+	});
+
 	it("toggles built-in extensions in config global mode", async () => {
 		const settingsManager = SettingsManager.fromStorage(new InMemorySettingsStorage(), { projectTrusted: true });
 		const resolvedPaths = await new DefaultPackageManager({

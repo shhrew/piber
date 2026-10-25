@@ -747,6 +747,7 @@ function prepareWindowsNpmSelfUpdate(): void {
 
 export interface PackageCommandRuntimeOptions {
 	extensionFactories?: InlineExtension[];
+	defaultPackages?: string[];
 }
 
 interface CommandSettingsResult {
@@ -867,14 +868,22 @@ export async function handleConfigCommand(
 		.filter(isBuiltinExtension)
 		.map((input) => input.name);
 	const globalSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+	const { defaultPackages } = runtimeOptions;
 	const globalResolvedPaths = await new DefaultPackageManager({
 		cwd,
 		agentDir,
 		settingsManager: globalSettingsManager,
 		builtinExtensions,
+		defaultPackages,
 	}).resolve();
 	const projectResolvedPaths = settingsManager.isProjectTrusted()
-		? await new DefaultPackageManager({ cwd, agentDir, settingsManager, builtinExtensions }).resolve()
+		? await new DefaultPackageManager({
+				cwd,
+				agentDir,
+				settingsManager,
+				builtinExtensions,
+				defaultPackages,
+			}).resolve()
 		: globalResolvedPaths;
 
 	await selectConfig({

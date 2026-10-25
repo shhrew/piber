@@ -26,6 +26,20 @@ Use `--extension` or `-e` to try a package for one invocation without adding it 
 pi -e npm:@example/pi-tools
 ```
 
+## Default packages
+
+Pi installs [`npm:pi-web-access@0.44.0`](https://pi.dev/packages/pi-web-access) by default. It is installed under the Pi npm directory on first start, like a personal package, but it is not written to `settings.json` and `pi list` does not show it. If the install fails, for example without network access or npm, Pi starts without it and retries on the next start. With `--offline` or `PI_OFFLINE=1`, Pi does not install it.
+
+A personal or project `packages` entry for `pi-web-access` replaces the default. To turn it off, load none of its extensions:
+
+```json
+{
+  "packages": [{ "source": "npm:pi-web-access", "extensions": [] }]
+}
+```
+
+Disabling its extension in `pi config` adds an equivalent entry. To use another version, add `npm:pi-web-access@<version>` instead.
+
 ## Choose a source
 
 | Source | Example | Behavior |

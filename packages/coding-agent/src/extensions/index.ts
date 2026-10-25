@@ -14,3 +14,7 @@ export const builtInExtensions: InlineExtension[] = [
 	{ name: "mcp", factory: mcpExtension, replaceable: true, builtin: true },
 	{ name: "subagent", factory: subagentExtension, replaceable: true, builtin: true },
 ];
+
+// Installed into the user's agent dir on first start, like a personal `packages` entry. A settings
+// entry for the same package replaces the default, for example to filter or update it.
+export const defaultPackages: string[] = ["npm:pi-web-access@0.44.0"];

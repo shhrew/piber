@@ -283,6 +283,8 @@ export interface DefaultResourceLoaderOptions {
 	additionalPromptTemplatePaths?: string[];
 	additionalThemePaths?: string[];
 	extensionFactories?: InlineExtension[];
+	/** Package sources loaded unless settings configure the same package (see `PackageManagerOptions`). */
+	defaultPackages?: string[];
 	noExtensions?: boolean;
 	/** Built-in extensions not to load, by name (such as `mcp`), even when settings or `-e` enable them. */
 	disabledBuiltinExtensions?: string[];
@@ -385,6 +387,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			agentDir: this.agentDir,
 			settingsManager: this.settingsManager,
 			builtinExtensions: [...this.builtinExtensions.keys()],
+			defaultPackages: options.defaultPackages,
 		});
 		this.additionalExtensionPaths = options.additionalExtensionPaths ?? [];
 		this.additionalSkillPaths = options.additionalSkillPaths ?? [];

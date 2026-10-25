@@ -141,6 +141,11 @@ interface PackageManagerOptions {
 	settingsManager: SettingsManager;
 	/** Names of built-in extensions, resolved as `builtin:<name>` extension resources. */
 	builtinExtensions?: string[];
+	/**
+	 * Package sources resolved like personal `packages` entries, after them. A settings entry for the
+	 * same package replaces the default. A default that fails to install is skipped.
+	 */
+	defaultPackages?: string[];
 }
 
 type SourceScope = "user" | "project" | "temporary";
@@ -162,6 +167,13 @@ type LocalSource = {
 type ParsedSource = NpmSource | GitSource | LocalSource;
 
 type InstalledSourceScope = Exclude<SourceScope, "temporary">;
+
+interface PackageEntry {
+	pkg: PackageSource;
+	scope: SourceScope;
+	/** Comes from `PackageManagerOptions.defaultPackages`, not from settings. */
+	isDefault?: boolean;
+}
 
 interface ConfiguredUpdateSource {
 	source: string;
@@ -820,6 +832,8 @@ export class DefaultPackageManager implements PackageManager {
 	private agentDir: string;
 	private settingsManager: SettingsManager;
 	private builtinExtensions: string[];
+	private defaultPackages: string[];
+	private failedDefaultPackages: Set<string>;
 	private globalNpmRoot: string | undefined;
 	private globalNpmRootCommandKey: string | undefined;
 	private progressCallback: ProgressCallback | undefined;
@@ -829,6 +843,8 @@ export class DefaultPackageManager implements PackageManager {
 		this.agentDir = resolvePath(options.agentDir);
 		this.settingsManager = options.settingsManager;
 		this.builtinExtensions = options.builtinExtensions ?? [];
+		this.defaultPackages = options.defaultPackages ?? [];
+		this.failedDefaultPackages = new Set();
 	}
 
 	setProgressCallback(callback: ProgressCallback | undefined): void {
@@ -929,12 +945,16 @@ export class DefaultPackageManager implements PackageManager {
 		const projectSettings = this.settingsManager.getProjectSettings();
 
 		// Collect all packages with scope (project first so cwd resources win collisions)
-		const allPackages: Array<{ pkg: PackageSource; scope: SourceScope }> = [];
+		const allPackages: PackageEntry[] = [];
 		for (const pkg of projectSettings.packages ?? []) {
 			allPackages.push({ pkg, scope: "project" });
 		}
 		for (const pkg of globalSettings.packages ?? []) {
 			allPackages.push({ pkg, scope: "user" });
+		}
+		// Default packages come last, so dedupe keeps a settings entry for the same package instead.
+		for (const pkg of this.defaultPackages) {
+			allPackages.push({ pkg, scope: "user", isDefault: true });
 		}
 
 		// Dedupe: project scope wins over global for same package identity
@@ -1227,7 +1247,7 @@ export class DefaultPackageManager implements PackageManager {
 
 		const globalSettings = this.settingsManager.getGlobalSettings();
 		const projectSettings = this.settingsManager.getProjectSettings();
-		const allPackages: Array<{ pkg: PackageSource; scope: SourceScope }> = [];
+		const allPackages: PackageEntry[] = [];
 		for (const pkg of projectSettings.packages ?? []) {
 			allPackages.push({ pkg, scope: "project" });
 		}
@@ -1286,11 +1306,11 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async resolvePackageSources(
-		sources: Array<{ pkg: PackageSource; scope: SourceScope }>,
+		sources: PackageEntry[],
 		accumulator: ResourceAccumulator,
 		onMissing?: (source: string) => Promise<MissingSourceAction>,
 	): Promise<void> {
-		for (const { pkg, scope } of sources) {
+		for (const { pkg, scope, isDefault } of sources) {
 			const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
 			const filter = typeof pkg === "object" ? pkg : undefined;
 			const deltaBase = this.findAutoloadDeltaBase(pkg, scope, sources);
@@ -1305,17 +1325,31 @@ export class DefaultPackageManager implements PackageManager {
 				continue;
 			}
 
+			const install = async (): Promise<boolean> => {
+				if (!isDefault) {
+					await this.installParsedSource(parsed, resolvedScope);
+					return true;
+				}
+				// A default package the user did not configure must not block startup, for example
+				// without network access or npm. Do not retry it on every resolve.
+				if (this.failedDefaultPackages.has(resolvedSource)) return false;
+				try {
+					await this.installParsedSource(parsed, resolvedScope);
+					return true;
+				} catch {
+					this.failedDefaultPackages.add(resolvedSource);
+					return false;
+				}
+			};
 			const installMissing = async (): Promise<boolean> => {
 				if (isOfflineModeEnabled()) return false;
 				if (!onMissing) {
-					await this.installParsedSource(parsed, resolvedScope);
-					return true;
+					return install();
 				}
 				const action = await onMissing(resolvedSource);
 				if (action === "skip") return false;
 				if (action === "error") throw new Error(`Missing source: ${resolvedSource}`);
-				await this.installParsedSource(parsed, resolvedScope);
-				return true;
+				return install();
 			};
 
 			if (parsed.type === "npm") {
@@ -1351,7 +1385,7 @@ export class DefaultPackageManager implements PackageManager {
 	private findAutoloadDeltaBase(
 		pkg: PackageSource,
 		scope: SourceScope,
-		sources: Array<{ pkg: PackageSource; scope: SourceScope }>,
+		sources: PackageEntry[],
 	): { source: string; scope: SourceScope } | undefined {
 		if (scope !== "project" || typeof pkg !== "object" || pkg.autoload !== false) return undefined;
 		const identity = this.getPackageIdentity(pkg.source, scope);
@@ -1745,10 +1779,8 @@ export class DefaultPackageManager implements PackageManager {
 	 * keep only the project one (project wins). A project entry with autoload=false
 	 * is a delta over the global entry, so both are kept (delta first).
 	 */
-	private dedupePackages(
-		packages: Array<{ pkg: PackageSource; scope: SourceScope }>,
-	): Array<{ pkg: PackageSource; scope: SourceScope }> {
-		const result: Array<{ pkg: PackageSource; scope: SourceScope }> = [];
+	private dedupePackages(packages: PackageEntry[]): PackageEntry[] {
+		const result: PackageEntry[] = [];
 		const seen = new Map<string, number>();
 		for (const entry of packages) {
 			const identity = this.getPackageIdentity(this.getPackageSourceString(entry.pkg), entry.scope);
