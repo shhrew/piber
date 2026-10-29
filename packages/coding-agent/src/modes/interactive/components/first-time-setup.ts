@@ -1,7 +1,7 @@
 import { Container, getKeybindings, Spacer, Text } from "@earendil-works/pi-tui";
 import { APP_NAME } from "../../../config.ts";
 import { SYSTEM_THEME_NAME } from "../theme/system-theme.ts";
-import { theme } from "../theme/theme.ts";
+import { DEFAULT_THEME_NAME, theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint, rawKeyHint } from "./keybinding-hints.ts";
 
@@ -16,7 +16,9 @@ export interface FirstTimeSetupOptions {
 	onCancel: () => void;
 }
 
+/** The first option is selected and previewed when the dialog opens. */
 const THEME_OPTIONS: Array<{ value: string; label: string }> = [
+	{ value: DEFAULT_THEME_NAME, label: "Abyss (chartreuse and gold on forest green)" },
 	{ value: SYSTEM_THEME_NAME, label: "System (matches your terminal colors)" },
 	{ value: "dark", label: "Dark" },
 	{ value: "light", label: "Light" },

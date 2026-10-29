@@ -376,17 +376,23 @@ export class Theme {
 // Theme Loading
 // ============================================================================
 
+/** Themes shipped in the themes directory as `<name>.json`. */
+const BUILTIN_THEME_NAMES = ["dark", "light", "abyss"];
+
+/** The theme used when no theme is set. A theme that fails to load still falls back to the system theme. */
+export const DEFAULT_THEME_NAME = "abyss";
+
 let BUILTIN_THEMES: Record<string, ThemeJson> | undefined;
 
 function getBuiltinThemes(): Record<string, ThemeJson> {
 	if (!BUILTIN_THEMES) {
 		const themesDir = getThemesDir();
-		const darkPath = path.join(themesDir, "dark.json");
-		const lightPath = path.join(themesDir, "light.json");
-		BUILTIN_THEMES = {
-			dark: JSON.parse(stripBom(fs.readFileSync(darkPath, "utf-8"))) as ThemeJson,
-			light: JSON.parse(stripBom(fs.readFileSync(lightPath, "utf-8"))) as ThemeJson,
-		};
+		BUILTIN_THEMES = Object.fromEntries(
+			BUILTIN_THEME_NAMES.map((name) => [
+				name,
+				JSON.parse(stripBom(fs.readFileSync(path.join(themesDir, `${name}.json`), "utf-8"))) as ThemeJson,
+			]),
+		);
 	}
 	return BUILTIN_THEMES;
 }
@@ -735,12 +741,7 @@ function startThemeWatcher(): void {
 	stopThemeWatcher();
 
 	// Only watch if it's a custom theme (not built-in)
-	if (
-		!currentThemeName ||
-		currentThemeName === "dark" ||
-		currentThemeName === "light" ||
-		currentThemeName === SYSTEM_THEME_NAME
-	) {
+	if (!currentThemeName || BUILTIN_THEME_NAMES.includes(currentThemeName) || currentThemeName === SYSTEM_THEME_NAME) {
 		return;
 	}
 

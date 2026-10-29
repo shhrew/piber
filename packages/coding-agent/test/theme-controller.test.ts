@@ -2,6 +2,7 @@ import type { TerminalColors, TUI } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import {
+	DEFAULT_THEME_NAME,
 	initTheme,
 	setTerminalColorScheme,
 	setTerminalColors,
@@ -75,6 +76,14 @@ describe("InteractiveThemeController", () => {
 		expect(flushSettings).not.toHaveBeenCalled();
 	});
 
+	it("uses the default theme without a theme setting", () => {
+		const { ui } = createUi();
+		const controller = createController(ui, () => SettingsManager.inMemory());
+		controller.applyFromSettings();
+
+		expect(theme.name).toBe(DEFAULT_THEME_NAME);
+	});
+
 	it("applies the theme immediately and lets startup wait for the colors", async () => {
 		const { ui, queryTerminalColors } = createUi();
 		let answer: (colors: TerminalColors) => void = () => {};
@@ -83,7 +92,7 @@ describe("InteractiveThemeController", () => {
 				answer = resolve;
 			}),
 		);
-		const controller = createController(ui, () => SettingsManager.inMemory());
+		const controller = createController(ui, () => SettingsManager.inMemory({ theme: "system" }));
 		controller.applyFromSettings();
 
 		// Grayscale until the terminal answers.
@@ -102,7 +111,7 @@ describe("InteractiveThemeController", () => {
 			lateReply = options.onLateReply!;
 			return {};
 		});
-		const controller = createController(ui, () => SettingsManager.inMemory());
+		const controller = createController(ui, () => SettingsManager.inMemory({ theme: "system" }));
 		controller.applyFromSettings();
 		await flush();
 		expect(theme.getFgAnsi("error")).toBe("\x1b[38;5;1m");
@@ -130,7 +139,7 @@ describe("InteractiveThemeController", () => {
 	it("uses the reported scheme for the system theme when the terminal reports no colors", async () => {
 		vi.stubEnv("COLORFGBG", "");
 		const { ui, emitTerminalColorScheme } = createUi();
-		const controller = createController(ui, () => SettingsManager.inMemory());
+		const controller = createController(ui, () => SettingsManager.inMemory({ theme: "system" }));
 		controller.applyFromSettings();
 		await flush();
 		expect(theme.appearance).toBe("dark");

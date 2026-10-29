@@ -17,8 +17,8 @@ import {
 	FirstTimeSetupComponent,
 	type FirstTimeSetupResult,
 } from "../modes/interactive/components/first-time-setup.ts";
-import { SYSTEM_THEME_NAME } from "../modes/interactive/theme/system-theme.ts";
 import {
+	DEFAULT_THEME_NAME,
 	getTerminalTheme,
 	initTheme,
 	loadThemeFromPath,
@@ -87,7 +87,7 @@ export async function createStartupTui(settingsManager: SettingsManager): Promis
 	setRegisteredThemes(await loadStartupThemes(settingsManager));
 	// The system theme starts in grayscale until the terminal reports its colors.
 	markTerminalColorsPending();
-	initTheme(resolveThemeSetting(settingsManager.getThemeSetting(), getTerminalTheme()) ?? SYSTEM_THEME_NAME);
+	initTheme(resolveThemeSetting(settingsManager.getThemeSetting(), getTerminalTheme()) ?? DEFAULT_THEME_NAME);
 	setKeybindings(KeybindingsManager.create());
 	const ui: TUI = new TuiMainScreen(new ProcessTerminal(), settingsManager.getShowHardwareCursor(), getAgentDir());
 	ui.setClearOnShrink(settingsManager.getClearOnShrink());
@@ -98,7 +98,7 @@ export function startStartupTui(ui: TUI, settingsManager: SettingsManager): void
 	ui.start();
 	const themeSetting = settingsManager.getThemeSetting();
 	queryStartupTerminalColors(ui, () => {
-		setTheme(resolveThemeSetting(themeSetting, getTerminalTheme()) ?? SYSTEM_THEME_NAME);
+		setTheme(resolveThemeSetting(themeSetting, getTerminalTheme()) ?? DEFAULT_THEME_NAME);
 	});
 }
 
@@ -199,7 +199,7 @@ export async function showFirstTimeSetup(settingsManager: SettingsManager): Prom
 		};
 
 		ui.start();
-		let previewTheme = SYSTEM_THEME_NAME;
+		let previewTheme = DEFAULT_THEME_NAME;
 		setTheme(previewTheme);
 		const component = new FirstTimeSetupComponent({
 			onThemePreview: (themeName) => {

@@ -1,10 +1,10 @@
 # Customize Pi with themes
 
-Themes control the colors Pi uses in interactive mode and HTML exports. Pi includes the `system`, `dark`, and `light` themes. You can select one theme, follow your terminal's light or dark appearance, or create your own palette.
+Themes control the colors Pi uses in interactive mode and HTML exports. Pi includes the `system`, `dark`, `light`, and `abyss` themes. `abyss` is a dark theme with a bioluminescent palette: chartreuse accents, gold highlights, and forest-green panels. You can select one theme, follow your terminal's light or dark appearance, or create your own palette.
 
 ## Use your terminal's colors
 
-The `system` theme is the default. It builds Pi's colors from your terminal's theme, so Pi matches the terminal instead of bringing its own palette:
+`abyss` is the default theme. Set `theme` to `system` to match your terminal instead: the `system` theme builds Pi's colors from your terminal's theme, so Pi matches the terminal instead of bringing its own palette:
 
 - Pi queries the terminal's default foreground and background colors and its 16 ANSI colors.
 - Each Pi color takes its hue from one ANSI color, for example errors from red and links from blue.

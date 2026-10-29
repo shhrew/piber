@@ -187,13 +187,13 @@ import { getModelSearchText } from "./model-search.ts";
 import { type BlockedStatus, ProgramStatusReporter } from "./program-status-reporter.ts";
 import { shareSession } from "./session-share.ts";
 import {
+	DEFAULT_THEME_NAME,
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
 	getEditorTheme,
 	getMarkdownTheme,
 	getThemeByName,
 	onThemeChange,
-	SYSTEM_THEME_NAME,
 	setRegisteredThemes,
 	stopThemeWatcher,
 	Theme,
@@ -4901,7 +4901,7 @@ export class InteractiveMode {
 					thinkingLevel: this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
 					availableThinkingLevels: [...THINKING_LEVEL_OPTIONS],
 					modelThinkingLevels: this.settingsManager.getAllModelThinkingLevels(),
-					currentTheme: this.themeController.getThemeSelection() || SYSTEM_THEME_NAME,
+					currentTheme: this.themeController.getThemeSelection() || DEFAULT_THEME_NAME,
 					terminalTheme: this.themeController.getTerminalTheme(),
 					availableThemes: getAvailableThemes(),
 					hideThinkingBlock: this.hideThinkingBlock,
