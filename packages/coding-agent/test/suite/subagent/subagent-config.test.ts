@@ -1,15 +1,26 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import {
+	fauxAssistantMessage,
+	fauxToolCall,
+	getCurrentSystemPrompt,
+	type TranscriptContext,
+} from "@earendil-works/pi-ai";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { discoverAgents } from "../../../src/extensions/subagent/agents.ts";
-import { buildChildArgs, Subagent, type SubagentOptions } from "../../../src/extensions/subagent/child.ts";
-import subagentExtension, { planSubagentRun } from "../../../src/extensions/subagent/index.ts";
+import {
+	buildChildArgs,
+	SUBAGENT_FLAG,
+	Subagent,
+	type SubagentOptions,
+} from "../../../src/extensions/subagent/child.ts";
+import subagentExtension, { DEBUG_DIR_ENV, planSubagentRun } from "../../../src/extensions/subagent/index.ts";
 import { getSubagentAssetsDir, loadSubagentConfig } from "../../../src/extensions/subagent/paths.ts";
 import { SubagentRegistry } from "../../../src/extensions/subagent/registry.ts";
 import type { SubagentToolDetails } from "../../../src/extensions/subagent/render.ts";
 import { loadSkillGroups, searchSkills } from "../../../src/extensions/subagent/skills.ts";
+import { createTestExtensionsResult, createTestResourceLoader } from "../../utilities.ts";
 import { createHarness, getMessageText, getToolResult } from "../harness.ts";
 
 const tempDirs: string[] = [];
@@ -69,6 +80,95 @@ describe("subagent agent discovery", () => {
 		expect(untrusted.projectDir).toBeNull();
 		expect(untrusted.agents.find((agent) => agent.name === "scout")?.source).toBe("bundled");
 		expect(untrusted.agents.some((agent) => agent.name === "php")).toBe(false);
+	});
+
+	it("lists the agents in the orchestrator's system prompt, and not in a session without the subagent tool", async () => {
+		const prompts: string[] = [];
+		const record = (context: TranscriptContext) => {
+			prompts.push(getCurrentSystemPrompt(context.messages));
+			return fauxAssistantMessage("done");
+		};
+		const extensionFactories = [{ name: "subagent", factory: subagentExtension }];
+		const orchestrator = await createHarness({ extensionFactories });
+		// Subagent processes get `--tools`, which sets both lists.
+		const subagent = await createHarness({
+			extensionFactories,
+			allowedToolNames: ["read"],
+			initialActiveToolNames: ["read"],
+		});
+		try {
+			orchestrator.setResponses([record]);
+			subagent.setResponses([record]);
+			await orchestrator.session.prompt("Delegate");
+			await subagent.session.prompt("Work");
+
+			expect(prompts[0]).toContain("<subagents>\nAgents you can start with the subagent tool:\n");
+			for (const agent of discoverAgents(orchestrator.tempDir, false).agents) {
+				expect(prompts[0]).toContain(`- ${agent.name}: ${agent.description}\n`);
+			}
+			expect(prompts[1]).not.toContain("<subagents>");
+		} finally {
+			orchestrator.cleanup();
+			subagent.cleanup();
+		}
+	});
+
+	it("gives a subagent process <rules> for its tools", async () => {
+		const planner = discoverAgents(process.cwd(), false).agents.find((agent) => agent.name === "planner")!;
+		const { tools } = planSubagentRun(planner, {}, null);
+		const extensionsResult = await createTestExtensionsResult([{ name: "subagent", factory: subagentExtension }]);
+		extensionsResult.runtime.flagValues.set(SUBAGENT_FLAG, "planner");
+		const harness = await createHarness({
+			// A subagent starts with `--system-prompt`, which replaces pi's default prompt.
+			resourceLoader: { ...createTestResourceLoader({ extensionsResult }), getSystemPrompt: () => "Plan." },
+			allowedToolNames: tools,
+			initialActiveToolNames: tools,
+		});
+		try {
+			let prompt = "";
+			harness.setResponses([
+				(context: TranscriptContext) => {
+					prompt = getCurrentSystemPrompt(context.messages);
+					return fauxAssistantMessage("done");
+				},
+			]);
+			await harness.session.prompt("Work");
+
+			expect(prompt).toContain("<rules>\n- Use read to examine files instead of cat or sed.");
+			expect(prompt).not.toContain("<skills>");
+		} finally {
+			harness.cleanup();
+		}
+	});
+});
+
+describe("PIBER_DEBUG", () => {
+	afterEach(() => {
+		vi.unstubAllEnvs();
+	});
+
+	it("writes each provider request unchanged to a file named after the orchestrator or the subagent", async () => {
+		const dir = join(mkdtempSync(join(tmpdir(), "pi-subagent-debug-")), "requests");
+		tempDirs.push(join(dir, ".."));
+		vi.stubEnv(DEBUG_DIR_ENV, dir);
+		const extensionsResult = await createTestExtensionsResult([{ name: "subagent", factory: subagentExtension }]);
+		extensionsResult.runtime.flagValues.set(SUBAGENT_FLAG, "planner");
+		const orchestrator = await createHarness({
+			extensionFactories: [{ name: "subagent", factory: subagentExtension }],
+		});
+		const subagent = await createHarness({ resourceLoader: createTestResourceLoader({ extensionsResult }) });
+		try {
+			const payload = { system: "prompt", tools: [{ name: "read" }] };
+			expect(await orchestrator.session.extensionRunner.emitBeforeProviderRequest(payload)).toBe(payload);
+			await subagent.session.extensionRunner.emitBeforeProviderRequest(payload);
+
+			const files = readdirSync(dir).sort();
+			expect(files.map((file) => file.replace(/^.*Z-/, ""))).toEqual(["orchestrator.json", "planner.json"]);
+			for (const file of files) expect(JSON.parse(readFileSync(join(dir, file), "utf-8"))).toEqual(payload);
+		} finally {
+			orchestrator.cleanup();
+			subagent.cleanup();
+		}
 	});
 });
 
@@ -158,6 +258,9 @@ describe("subagent run planning", () => {
 			"grep",
 			"find",
 			"ls",
+			"web_search",
+			"fetch_content",
+			"get_search_content",
 			"bash",
 			"edit",
 			"skill_search",
@@ -167,9 +270,10 @@ describe("subagent run planning", () => {
 		]);
 		expect(plan.skillGroups).toEqual(["review", "extra"]);
 		expect(plan.systemPrompt).toContain("You are a senior code reviewer.");
-		expect(plan.systemPrompt).toContain("Tags: quality, review, security, tests");
-		expect(plan.systemPrompt).toContain("- review-checklist: General code review checklist");
-		expect(plan.systemPrompt).not.toContain("- security-review:");
+		expect(plan.systemPrompt).toContain(
+			"## Pinned skills\nAlways relevant to your work; load them with load_skill: review-checklist",
+		);
+		expect(plan.systemPrompt).not.toContain("security-review");
 	});
 
 	it("uses a trusted project's config.json for the core tools and leaves skill tools out without groups", () => {
@@ -179,7 +283,7 @@ describe("subagent run planning", () => {
 		const plan = planSubagentRun(planner, {}, subagentsDir);
 
 		expect(plan.tools).toEqual(["read", "chat_send", "chat_peers"]);
-		expect(plan.systemPrompt).not.toContain("## Skills");
+		expect(plan.systemPrompt).not.toContain("## Pinned skills");
 	});
 
 	it("reads the background settings, lets a project override them, and ignores invalid values", () => {
@@ -236,6 +340,8 @@ describe("subagent child arguments", () => {
 
 	it("starts a new named session with its own prompt, tools, and skill groups", () => {
 		expect(buildChildArgs(options, undefined, "/tmp/prompt.md")).toEqual([
+			"--subagent",
+			"diff-review",
 			"--system-prompt",
 			"/tmp/prompt.md",
 			"--no-skills",

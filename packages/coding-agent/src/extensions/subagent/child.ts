@@ -25,6 +25,11 @@ import { CHAT_FLAG, CHAT_MESSAGE_TYPE, CHAT_TOKEN_ENV, type ChatDelivery } from 
 import { type ChildEvent, ChildRpc } from "./rpc.ts";
 import type { SlotPool } from "./slots.ts";
 
+/**
+ * Extension flag that marks a pi process as a subagent and carries its id, so the extension builds its rules and
+ * skills sections and names its `PIBER_DEBUG` files.
+ */
+export const SUBAGENT_FLAG = "subagent";
 /** Extension flag that tells a child which skill groups `skill_search` and `load_skill` serve. */
 export const SKILL_GROUPS_FLAG = "subagent-skill-groups";
 
@@ -141,7 +146,14 @@ export function buildChildArgs(
 	sessionFile: string | undefined,
 	promptFile: string,
 ): string[] {
-	const args = ["--system-prompt", promptFile, "--no-skills", options.projectTrusted ? "--approve" : "--no-approve"];
+	const args = [
+		`--${SUBAGENT_FLAG}`,
+		options.id,
+		"--system-prompt",
+		promptFile,
+		"--no-skills",
+		options.projectTrusted ? "--approve" : "--no-approve",
+	];
 	args.push(...(options.tools.length > 0 ? ["--tools", options.tools.join(",")] : ["--no-tools"]));
 	if (options.skillGroups.length > 0) args.push(`--${SKILL_GROUPS_FLAG}`, options.skillGroups.join(","));
 	if (options.model) args.push("--model", options.model);

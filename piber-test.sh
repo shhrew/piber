@@ -14,6 +14,7 @@ usage() {
   echo "  skills  Skill search: listing, query and tag ranking, no match, load_skill, tool gating, extraSkillGroups"
   echo "  control Subagent control: start now, pause, resume, terminate, handback, held chat for paused subagents"
   echo "  render  Tool rendering: chat_peers, skill_search, load_skill in the main session and the agent view"
+  echo "  visibility  Prompt visibility: the orchestrator's agent list, and each agent's tools and skills sections"
 }
 
 chat_prompt() {
@@ -56,7 +57,7 @@ The bundled "review" skill group holds two skills:
      e. skill_search with query "kubernetes"
      f. load_skill with name "security-review"
      g. load_skill with name "does-not-exist"
-     Also quote the "Skills" section of your system prompt verbatim.
+     Also quote the <skills> section and the "Pinned skills" section of your system prompt verbatim.
    - `scout`, name "sam", task: Do not edit files. List the names of every tool you have. State whether skill_search and load_skill are among them. Do not call any other tool.
    - `scout`, name "sky", with `extraSkillGroups: ["review"]`, task: Do not edit files. List the names of every tool you have. Then call skill_search with query "tests" and quote the result verbatim.
 2. Give a checklist, each item marked worked or failed with the evidence:
@@ -67,7 +68,7 @@ The bundled "review" skill group holds two skills:
    - rex (e): "No skills matched", followed by the available tags (quality, review, security, tests)
    - rex (f): returns the security-review body inside a <skill name="security-review" directory="..."> wrapper
    - rex (g): an error saying the skill is not available
-   - rex prompt: Skills section lists the tags and the pinned skill review-checklist
+   - rex prompt: <skills> lists the tags and both skills by name and description only, and "Pinned skills" names review-checklist
    - sam: has neither skill_search nor load_skill
    - sky: has skill_search and load_skill, and query "tests" returns review-checklist first
 EOF
@@ -142,6 +143,27 @@ Agent view (open rex):
 EOF
 }
 
+visibility_prompt() {
+  cat <<'EOF'
+This is a manual test of what the orchestrator and each subagent can see in their system prompts. Follow these steps exactly. Do not edit any files, and tell every subagent not to edit files either.
+
+1. Quote these sections of your own system prompt verbatim, or say that a section is missing: <skills>, <subagents>. Then list the name of every tool in your tool definitions.
+2. In ONE `subagent` call with `background: false`, run one subagent for every agent listed in your <subagents> section, in parallel. Name each after its agent. Give each this task:
+   Do not edit files and do not call any tool. Answer only from your system prompt and tool definitions:
+   a. Quote these sections of your system prompt verbatim, or say that a section is missing: <rules>, <skills>, <subagents>, and any "Pinned skills" section.
+   b. List the name of every tool in your tool definitions.
+   c. List the name of every skill you can see.
+3. Give a table with one row for the orchestrator and one per subagent: its tools, its skills, and which of the sections above it has.
+4. Give a checklist, each item marked worked or failed with the evidence:
+   - orchestrator: <subagents> lists every agent with a description, and you ran one subagent for each
+   - every subagent: no subagent tool, and no <subagents> section
+   - every subagent: has a <rules> section
+   - every subagent with skills: has skill_search and load_skill, and its <skills> lists each skill by name and description only (no file paths)
+   - every subagent without skills: no <skills> section, no "Pinned skills" section, and neither skill_search nor load_skill
+   - every "Pinned skills" section names only skills listed in that subagent's <skills>
+EOF
+}
+
 if [[ $# -lt 1 ]]; then
   usage
   exit 1
@@ -162,6 +184,9 @@ case "$SCENARIO" in
     ;;
   render)
     PROMPT="$(render_prompt)"
+    ;;
+  visibility)
+    PROMPT="$(visibility_prompt)"
     ;;
   -h | --help)
     usage
@@ -192,5 +217,9 @@ elif newer_sources coding-agent; then
   echo "Building coding-agent..."
   (cd "$SCRIPT_DIR" && npm run build -w packages/coding-agent)
 fi
+
+# Write every model request of the orchestrator and its subagents to a fresh directory per run, unless set already.
+export PIBER_DEBUG="${PIBER_DEBUG:-/tmp/piber-debug/$SCENARIO-$(date +%Y%m%d-%H%M%S)}"
+echo "Model requests: $PIBER_DEBUG"
 
 exec "$SCRIPT_DIR/pi-test.sh" --built "$@" "$PROMPT"

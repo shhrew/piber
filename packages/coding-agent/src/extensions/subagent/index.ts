@@ -12,7 +12,7 @@
  * See README.md in this directory.
  */
 
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
@@ -25,6 +25,8 @@ import {
 	type ExtensionFactory,
 	type ToolRenderers,
 } from "../../core/extensions/types.ts";
+import { escapeXml } from "../../core/skills.ts";
+import { buildRules, type NormalizedBuildSystemPromptOptions } from "../../core/system-prompt.ts";
 import { stripFrontmatter } from "../../utils/frontmatter.ts";
 import { type AgentConfig, discoverAgents, findProjectSubagentsDir } from "./agents.ts";
 import {
@@ -47,7 +49,7 @@ import {
 	type SendOutcome,
 	type SendResult,
 } from "./chat.ts";
-import { emptyUsage, SKILL_GROUPS_FLAG, Subagent } from "./child.ts";
+import { emptyUsage, SKILL_GROUPS_FLAG, SUBAGENT_FLAG, Subagent } from "./child.ts";
 import { SubagentDock } from "./dock.ts";
 import {
 	type BackgroundCompletion,
@@ -86,6 +88,7 @@ import {
 	listSkillTags,
 	loadSkillGroups,
 	type SkillCatalog,
+	type SubagentSkill,
 	searchSkills,
 } from "./skills.ts";
 import { SlotPool } from "./slots.ts";
@@ -101,6 +104,10 @@ export const SUBAGENT_CONTROL_TOOL_NAME = "subagent_control";
 const BACKGROUND_NOTICE_TYPE = "subagent-background-complete";
 /** Background subagents that finish within this window are announced in one notice. */
 const NOTICE_BATCH_MS = 500;
+/** Environment variable naming a directory that receives every request sent to the model, as JSON. */
+export const DEBUG_DIR_ENV = "PIBER_DEBUG";
+/** System prompt section listing the agents the orchestrator can start. */
+export const SUBAGENTS_SECTION = "subagents";
 /** Widget key of the subagent dock under the composer. */
 const DOCK_WIDGET_KEY = "subagents";
 
@@ -360,35 +367,55 @@ function runOutput(run: SubagentRunDetails): string {
 }
 
 /**
- * The global subagent prompt, the agent's own prompt, and a skills section naming the tags to search and the
- * pinned skills. The chat section is added once the subagent has a name (see `chatPromptSection`).
+ * The global subagent prompt, the agent's own prompt, and the pinned skills. The subagent process adds the
+ * `<rules>` and `<skills>` sections itself (see `subagentPromptSections`). The chat section is added once the
+ * subagent has a name (see `chatPromptSection`).
  */
-function buildSystemPrompt(
-	agent: AgentConfig,
-	catalog: SkillCatalog,
-	hasSkillGroups: boolean,
-	globalPrompt: string,
-): string {
+function buildSystemPrompt(agent: AgentConfig, catalog: SkillCatalog, globalPrompt: string): string {
 	const parts = [globalPrompt, agent.systemPrompt.trim()].filter(Boolean);
-	if (hasSkillGroups) {
-		const tags = listSkillTags(catalog.skills);
-		const lines = [
-			"## Skills",
-			`You have a curated set of skills with instructions for specialized work. Before working in an area they cover, call ${SKILL_SEARCH_TOOL_NAME} with a query or tags, then ${LOAD_SKILL_TOOL_NAME} to read the best match.`,
-			tags.length > 0
-				? `Tags: ${tags.join(", ")}`
-				: `Call ${SKILL_SEARCH_TOOL_NAME} with no query to list every skill.`,
-		];
-		const pinned = agent.pinnedSkills
-			.map((name) => catalog.skills.find((skill) => skill.name === name))
-			.filter((skill) => skill !== undefined);
-		if (pinned.length > 0) {
-			lines.push("", `Always relevant to your work; load them with ${LOAD_SKILL_TOOL_NAME}:`);
-			for (const skill of pinned) lines.push(`- ${skill.name}: ${skill.description}`);
-		}
-		parts.push(lines.join("\n"));
+	const pinned = agent.pinnedSkills.filter((name) => catalog.skills.some((skill) => skill.name === name));
+	if (pinned.length > 0) {
+		parts.push(
+			[
+				"## Pinned skills",
+				`Always relevant to your work; load them with ${LOAD_SKILL_TOOL_NAME}: ${pinned.join(", ")}`,
+			].join("\n"),
+		);
 	}
 	return parts.join("\n\n");
+}
+
+/**
+ * The sections a subagent process adds to its prompt, in the format of pi's default prompt: `<rules>` with the
+ * tool guidelines, and `<skills>` with the name and description of each skill in its groups. Skill files are read
+ * with `load_skill`, so no locations are listed.
+ */
+export function subagentPromptSections(
+	options: NormalizedBuildSystemPromptOptions,
+	skills: readonly SubagentSkill[],
+): Record<string, string> {
+	const declaredTools = options.selectedTools.filter((name) => !options.hiddenTools.includes(name));
+	const sections: Record<string, string> = {
+		rules: buildRules(declaredTools, options.toolGuidelines, options.promptGuidelines),
+	};
+	if (skills.length > 0) {
+		const tags = listSkillTags(skills);
+		sections.skills = [
+			"The following skills provide specialized instructions for specific tasks.",
+			`Use the ${LOAD_SKILL_TOOL_NAME} tool to read a skill when the task matches its description. ${SKILL_SEARCH_TOOL_NAME} finds skills by query or tags.`,
+			...(tags.length > 0 ? [`Tags: ${tags.join(", ")}`] : []),
+			"",
+			"<available_skills>",
+			...skills.flatMap((skill) => [
+				"  <skill>",
+				`    <name>${escapeXml(skill.name)}</name>`,
+				`    <description>${escapeXml(skill.description)}</description>`,
+				"  </skill>",
+			]),
+			"</available_skills>",
+		].join("\n");
+	}
+	return sections;
 }
 
 export interface SubagentRunPlan {
@@ -435,7 +462,7 @@ export function planSubagentRun(
 		tools: unique([...config.coreTools, ...agent.tools, ...(request.extraTools ?? []), ...skillTools, ...chatTools]),
 		skillGroups,
 		catalog,
-		systemPrompt: buildSystemPrompt(agent, catalog, skillGroups.length > 0, loadGlobalSystemPrompt(projectDir)),
+		systemPrompt: buildSystemPrompt(agent, catalog, loadGlobalSystemPrompt(projectDir)),
 		chatRights,
 	};
 }
@@ -935,6 +962,16 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 			? renderChatMessage(message.details, { ...options, self: chatSelf(), isAwaitingReply }, theme)
 			: undefined,
 	);
+
+	pi.registerFlag(SUBAGENT_FLAG, {
+		type: "string",
+		description: "Run as the subagent with this id (set by the parent in subagent processes)",
+	});
+	/** This process's subagent id, or undefined in the orchestrator. */
+	const subagentId = () => {
+		const id = pi.getFlag(SUBAGENT_FLAG);
+		return typeof id === "string" && id !== "" ? id : undefined;
+	};
 
 	pi.registerFlag(SKILL_GROUPS_FLAG, {
 		type: "string",
@@ -1602,6 +1639,40 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		if (message.role !== "custom" || message.customType !== CHAT_MESSAGE_TYPE) return;
 		const id = (message.details as ChatDelivery | undefined)?.id;
 		if (id) unreadChat.delete(id);
+	});
+
+	// A subagent's own prompt replaces pi's default one, which drops its rules and skills sections.
+	// Add them back, built from this session's tools and the skill groups the parent passed.
+	pi.on("before_agent_start", (event, ctx) => {
+		if (!subagentId()) return;
+		const options = event.systemPromptOptions;
+		Object.assign(options.sections, subagentPromptSections(options, loadChildCatalog(pi, ctx).skills));
+	});
+
+	// With PIBER_DEBUG set to a directory, write every request this process sends to the model there, one JSON file
+	// per request named by time and agent. Subagent processes inherit the variable, so one setting covers them all.
+	pi.on("before_provider_request", (event) => {
+		const dir = process.env[DEBUG_DIR_ENV];
+		if (!dir) return;
+		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(
+			path.join(dir, `${stamp}-${subagentId() ?? ORCHESTRATOR}.json`),
+			`${JSON.stringify(event.payload, null, 2)}\n`,
+		);
+	});
+
+	// List the agents `subagent` can start, so the model picks one by name and description instead of guessing.
+	// Subagent processes run without the `subagent` tool, so they get no list.
+	pi.on("before_agent_start", (event, ctx) => {
+		if (!pi.getActiveTools().includes("subagent")) return;
+		const agents = discoverAgents(ctx.cwd, ctx.isProjectTrusted()).agents;
+		if (agents.length === 0) return;
+		const lines = agents.map((agent) => `- ${agent.name}: ${agent.description}`);
+		event.systemPromptOptions.sections[SUBAGENTS_SECTION] = [
+			"Agents you can start with the subagent tool:",
+			...lines,
+		].join("\n");
 	});
 
 	pi.on("agent_start", () => {

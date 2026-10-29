@@ -70,7 +70,7 @@ export interface SubagentConfig {
 }
 
 const DEFAULT_CONFIG: SubagentConfig = {
-	coreTools: ["read", "grep", "find", "ls"],
+	coreTools: ["read", "grep", "find", "ls", "web_search", "fetch_content", "get_search_content"],
 	maxConcurrent: 4,
 	defaultMode: "foreground",
 	onBackgroundComplete: "wake",

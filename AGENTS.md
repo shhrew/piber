@@ -95,10 +95,6 @@ When closing issues via commit:
 
 - Include `fixes #<number>` or `closes #<number>` in the message so merging auto-closes the issue. For multiple issues, repeat the keyword per issue (`closes #1, closes #2`); a shared keyword (`closes #1, #2`) only closes the first.
 
-## Testing pi Interactive Mode with tmux
-
-For testing pi's interactive mode, load and follow [.pi/skills/interactive-testing.md](.pi/skills/interactive-testing.md).
-
 ## Changelog
 
 Location: `packages/*/CHANGELOG.md` (one per package).
@@ -115,10 +111,6 @@ Attribution:
 
 - Internal (from issues): `Fixed foo bar ([#123](https://github.com/earendil-works/pi/issues/123))`
 - External contributions: `Added feature X ([#456](https://github.com/earendil-works/pi/pull/456) by [@username](https://github.com/username))`
-
-## Releasing
-
-For release preparation, publishing, verification, or recovery, load and follow [.pi/skills/release.md](.pi/skills/release.md).
 
 ## User Override
 

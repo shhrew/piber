@@ -37,7 +37,7 @@ Agents are loaded from two places:
 
 A subagent gets, in order:
 
-1. The core tools from `config.json` in this directory (`read`, `grep`, `find`, `ls`). A trusted project can replace them with `.pi/subagents/config.json`.
+1. The core tools from `config.json` in this directory: `read`, `grep`, `find`, `ls`, and the web tools of the `pi-web-access` package (`web_search`, `fetch_content`, `get_search_content`). Tools that are not installed are skipped. A trusted project can replace them with `.pi/subagents/config.json`.
 2. The agent's `tools`.
 3. The call's `extraTools`.
 4. `skill_search` and `load_skill`, when the agent has skill groups.
@@ -82,6 +82,8 @@ Skills are not pasted into the subagent's prompt. The prompt names the tags avai
 | Parallel | `tasks: [{ agent, task }, ...]` (at most 8 per call; how many run at once is set by `maxConcurrent`) |
 | Chain | `chain: [{ agent, task }, ...]`, where `{previous}` in a task is replaced by the previous step's output |
 | Continue | `session` (a subagent's name, or a session file path plus `agent`), `task` |
+
+While the `subagent` tool is active, the parent's system prompt has a `<subagents>` section listing each discovered agent's name and description, so the model can choose an agent without guessing names. Subagent processes run without the `subagent` tool and get no list.
 
 Every new subagent also takes `name` and `description`, at the top level in single mode or per task:
 
@@ -190,7 +192,7 @@ Reply with chat_send only if it is needed.
 
 ```json
 {
-	"coreTools": ["read", "grep", "find", "ls"],
+	"coreTools": ["read", "grep", "find", "ls", "web_search", "fetch_content", "get_search_content"],
 	"maxConcurrent": 4,
 	"defaultMode": "foreground",
 	"onBackgroundComplete": "wake",
@@ -298,6 +300,16 @@ The Chat tab lists every chat message sent in this session, oldest first, includ
 The marker after the time is `?` while the sender waits for a reply, `~` while a recipient that has not started yet holds the message, and `x` for a refused send, which shows the reason in place of the text. The log scrolls like the transcript and follows new messages until you scroll up. It keeps the last 500 messages and is cleared when a new session starts.
 
 Dialogs from a subagent's extensions (confirm, select, input) appear in the parent, prefixed with the agent name. So do their warning and error notifications; info notifications, such as per-run token statistics, are dropped.
+
+## Debugging
+
+Set `PIBER_DEBUG` to a directory to see exactly what each model receives:
+
+```bash
+PIBER_DEBUG=/tmp/piber-debug pi
+```
+
+Every request to the model is written there as JSON, with the system prompt, tool definitions, and messages, in a file named by time and agent, such as `2026-10-29T22-27-44-185Z-orchestrator.json` or `...-planner.json`. Subagent processes inherit the variable, so one setting covers the orchestrator and every subagent. Files are never deleted; clear the directory between runs. They hold the full conversation, so keep them private.
 
 ## Files
 
