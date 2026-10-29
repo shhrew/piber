@@ -61,6 +61,25 @@ describe("subagent slot pool", () => {
 		expect(started).toBe(true);
 	});
 
+	it("takes a slot past the limit for a run started ahead of the queue, and starts no queued run until below it", async () => {
+		const pool = new SlotPool(1);
+		const first = pool.tryAcquire()!;
+		let started = false;
+		void pool.acquire().then(() => {
+			started = true;
+		});
+		const forced = pool.acquireNow();
+		expect([pool.running, pool.queued]).toEqual([2, 1]);
+
+		forced();
+		await flush();
+		expect(started).toBe(false);
+
+		first();
+		await flush();
+		expect(started).toBe(true);
+	});
+
 	it("takes a free slot at once, but never ahead of runs already waiting", async () => {
 		const pool = new SlotPool(1);
 		const first = pool.tryAcquire();

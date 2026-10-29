@@ -93,10 +93,11 @@ describe("background subagents", () => {
 		);
 		expect(getMessageText(notices(harness)[0])).toBe(
 			[
-				"[Automated notice from the subagent system, not a message from the user.]",
+				'<system_notice from="subagents">',
 				"Background subagents you started have finished:",
 				"- solo (Echo me): done, 1 turn",
 				"If the user's request needs their results, read them with subagent_result and continue. Otherwise no reply is needed.",
+				"</system_notice>",
 			].join("\n"),
 		);
 		await vi.waitFor(() => expect(harness!.session.messages.at(-1)).toMatchObject({ role: "assistant" }));

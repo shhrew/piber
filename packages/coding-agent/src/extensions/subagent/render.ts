@@ -215,6 +215,8 @@ export function statusIcon(status: SubagentStatus | "pending", theme: Theme): st
 	switch (status) {
 		case "queued":
 			return theme.fg("muted", "◷");
+		case "paused":
+			return theme.fg("warning", "‖");
 		case "running":
 		case "pending":
 			return theme.fg("accent", spinnerFrame());
@@ -244,6 +246,8 @@ export function describeRowStatus(row: SubagentRow, theme: Theme, now?: number):
 	switch (row.status) {
 		case "queued":
 			return theme.fg("muted", "Queued");
+		case "paused":
+			return theme.fg("warning", "Paused") + suffix();
 		case "pending":
 			return theme.fg("muted", "Starting");
 		case "running":
@@ -391,7 +395,8 @@ export function renderSubagentResult(
 			const current = details?.live && stored.key ? options.lookup?.(stored.key) : undefined;
 			const run = current ?? stored;
 			// A background subagent from an earlier pi process: its last stored state is stale, so do not spin.
-			const detached = details?.background && !current && ["pending", "queued", "running"].includes(run.status);
+			const detached =
+				details?.background && !current && ["pending", "queued", "running", "paused"].includes(run.status);
 			const row = rowFromRun(run, theme);
 			let line = `${detached ? theme.fg("muted", "○") : statusIcon(row.status, theme)} `;
 			if (multi) {
@@ -690,6 +695,7 @@ export function renderListResult(details: SubagentToolDetails | undefined, outpu
 	const parts = [
 		[count(["running", "pending"]), "running"],
 		[count(["queued"]), "queued"],
+		[count(["paused"]), "paused"],
 		[count(["done"]), "done"],
 		[count(["failed", "aborted"]), "failed"],
 	] as const;

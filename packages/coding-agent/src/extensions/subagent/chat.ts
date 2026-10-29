@@ -14,7 +14,7 @@
  * `cancel {id}`, `peers {id}`. Hub to client: `welcome {name}`, `reply {id, ok, text}`, `deliver {delivery}`.
  *
  * Delivery: a running, connected subagent gets a message at once (its extension steers it in after the current
- * tool call); a queued or still-connecting one gets it when it connects; a finished one cannot get it. The
+ * tool call); a queued, paused, or still-connecting one gets it when it connects; a finished one cannot get it. The
  * orchestrator's messages go through `deliverToOrchestrator`.
  *
  * Waiting for a reply: `waitForReply` blocks the sender until the recipient messages it back. A waiting agent's
@@ -80,19 +80,20 @@ function replyRequest(from: string): string {
 }
 
 /**
- * The text a recipient's model reads. Chat messages reach the model in the user role, so the first line says who
- * sent it and that the user did not.
+ * The text a recipient's model reads. Chat messages reach the model in the user role, so the message is wrapped in an
+ * `<agent_message>` tag naming its sender, which tells the model the user did not write it.
  */
-export function frameMessage(delivery: ChatDelivery, recipientIsOrchestrator: boolean): string {
-	const sender =
-		delivery.from === ORCHESTRATOR
-			? "the orchestrator"
-			: `${delivery.from} (${recipientIsOrchestrator ? "one of your subagents" : "a subagent"})`;
-	const audience = delivery.to === BROADCAST ? "to everyone" : "to you";
+export function frameMessage(delivery: ChatDelivery): string {
+	const to = delivery.to === BROADCAST ? BROADCAST : "you";
 	const reply = delivery.awaitingReply
 		? replyRequest(delivery.from)
 		: `Reply with ${CHAT_SEND_TOOL_NAME} only if it is needed.`;
-	return [`[Chat message from ${sender} ${audience}, not from the user]`, delivery.text, reply].join("\n");
+	return [
+		`<agent_message from="${delivery.from}" to="${to}" awaiting_reply="${delivery.awaitingReply}">`,
+		delivery.text,
+		"</agent_message>",
+		reply,
+	].join("\n");
 }
 
 export interface SendRequest {
@@ -132,7 +133,7 @@ export interface ChatPeer {
 	name: string;
 	description: string;
 	agent: string;
-	state: "running" | "queued" | "finished";
+	state: "running" | "queued" | "paused" | "finished";
 }
 
 /** The session's subagents, read live: the hub never caches their state. */
@@ -364,9 +365,11 @@ export class ChatHub {
 		const outcome = this.route(to, delivery);
 		record(delivery.id, outcome === "held" ? 1 : 0);
 		const sent =
-			outcome === "held"
-				? `Held for ${to}, which has not started yet; it gets the message when it starts.`
-				: `Delivered to ${to}.`;
+			outcome !== "held"
+				? `Delivered to ${to}.`
+				: this.options.directory.find(to)?.state === "paused"
+					? `Held for ${to}, which is paused; it gets the message when it resumes.`
+					: `Held for ${to}, which has not started yet; it gets the message when it starts.`;
 		if (!request.waitForReply) return { ok: true, text: sent, outcome };
 		const timeout = Math.min(request.timeoutSeconds ?? config.replyTimeoutSeconds, config.maxReplyTimeoutSeconds);
 		return this.waitForReply(from, delivery, Math.max(1, timeout), signal);
@@ -396,7 +399,9 @@ export class ChatHub {
 						? "running"
 						: peer.state === "queued"
 							? "queued, gets messages when it starts"
-							: "finished, cannot receive messages";
+							: peer.state === "paused"
+								? "paused, gets messages when it resumes"
+								: "finished, cannot receive messages";
 				lines.push(`- ${peer.name} (${peer.description}; ${peer.agent}): ${state}`);
 			}
 		}

@@ -319,7 +319,7 @@ describe("subagent agent view list", () => {
 			{
 				role: "custom",
 				customType: "subagent-chat",
-				content: "[Chat message from the orchestrator to you, not from the user]\nCheck b.ts",
+				content: '<agent_message from="orchestrator" to="you" awaiting_reply="true">\nCheck b.ts\n</agent_message>',
 				display: true,
 				details: { id: "m1", from: "orchestrator", to: "scout", text: "Check b.ts", awaitingReply: true },
 				timestamp: 0,
@@ -367,7 +367,7 @@ describe("subagent agent view list", () => {
 		expect(sent?.startsWith(" ╭")).toBe(false);
 		expect(screen.some((line) => line.trim() === "✓ delivered")).toBe(true);
 		expect(screen.some((line) => line.includes("╭─ worker → scout"))).toBe(true);
-		expect(screen.join("\n")).not.toContain("[Chat message");
+		expect(screen.join("\n")).not.toContain("<agent_message");
 	});
 });
 

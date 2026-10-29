@@ -6,7 +6,7 @@
  *     ◷ 3 queued
  *
  * It lists running subagents, then ones that finished in the last `FADE_MS`, at most `MAX_ROWS` at a time, and
- * renders nothing when there is nothing to show. Queued subagents appear only as a count.
+ * renders nothing when there is nothing to show. Queued and paused subagents appear only as counts.
  *
  * ↓ in an empty composer focuses it: ↑/↓ move, Enter opens the selection in the agent view, Esc or ↑ past the
  * top returns to the composer, and any other key returns to the composer and is handled there.
@@ -115,7 +115,8 @@ export class SubagentDock implements Component {
 		const now = Date.now();
 		const subagents = this.visibleSubagents(now);
 		const queued = this.registry.list().filter((subagent) => subagent.isQueued).length;
-		if (subagents.length === 0 && queued === 0) {
+		const paused = this.registry.list().filter((subagent) => subagent.isPaused).length;
+		if (subagents.length === 0 && queued === 0 && paused === 0) {
 			this.focusedId = undefined;
 			return [];
 		}
@@ -155,6 +156,7 @@ export class SubagentDock implements Component {
 		const hidden = subagents.length - shown.length;
 		if (hidden > 0) summary.push(theme.fg("dim", `+${hidden} more`));
 		if (queued > 0) summary.push(`${theme.fg("muted", "◷")} ${theme.fg("dim", `${queued} queued`)}`);
+		if (paused > 0) summary.push(`${theme.fg("warning", "‖")} ${theme.fg("dim", `${paused} paused`)}`);
 		if (this.isFocused) summary.push(theme.fg("dim", "↑↓ select · enter open · esc back"));
 		if (summary.length > 0) lines.push(truncateToWidth(`  ${summary.join(theme.fg("dim", " · "))}`, width));
 		return lines;

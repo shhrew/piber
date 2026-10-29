@@ -1,6 +1,7 @@
 /**
  * Limits how many subagent processes run at once. Every run takes a slot before its process starts and
- * returns it when the process stops. Runs that find no free slot wait in first-come order.
+ * returns it when the process stops. Runs that find no free slot wait in first-come order, unless started ahead
+ * of the queue with `acquireNow`.
  */
 
 interface Waiter {
@@ -24,12 +25,25 @@ export class SlotPool {
 		return this.waiting.length;
 	}
 
+	get capacity(): number {
+		return this.limit;
+	}
+
 	/**
 	 * Take a free slot at once and return the function that gives it back, or undefined when the run must queue.
 	 * It never takes a slot ahead of runs already waiting.
 	 */
 	tryAcquire(): (() => void) | undefined {
 		if (this.active >= this.limit || this.waiting.length > 0) return undefined;
+		this.active++;
+		return this.releaser();
+	}
+
+	/**
+	 * Take a slot at once even when none is free, for a run started ahead of the queue. Until running runs drop
+	 * below the limit again, no queued run starts.
+	 */
+	acquireNow(): () => void {
 		this.active++;
 		return this.releaser();
 	}

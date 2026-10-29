@@ -84,6 +84,7 @@ export const LOAD_SKILL_TOOL_NAME = "load_skill";
 export const SUBAGENT_WAIT_TOOL_NAME = "subagent_wait";
 export const SUBAGENT_RESULT_TOOL_NAME = "subagent_result";
 export const SUBAGENT_LIST_TOOL_NAME = "subagent_list";
+export const SUBAGENT_CONTROL_TOOL_NAME = "subagent_control";
 /** Custom message type of the notice posted when background subagents finish. */
 const BACKGROUND_NOTICE_TYPE = "subagent-background-complete";
 /** Background subagents that finish within this window are announced in one notice. */
@@ -189,6 +190,28 @@ interface ChatToolDetails {
 	message?: ChatDelivery;
 }
 
+const ControlParams = Type.Object({
+	action: Type.Union(
+		[
+			Type.Literal("pause"),
+			Type.Literal("resume"),
+			Type.Literal("start"),
+			Type.Literal("terminate"),
+			Type.Literal("handback"),
+		],
+		{ description: "What to do with the named subagents" },
+	),
+	names: Type.Array(Type.String(), { minItems: 1, description: "Names of the subagents to act on" }),
+	message: Type.Optional(
+		Type.String({
+			description:
+				"For resume, start, and handback: a note for the subagent, such as what to focus on or what its report must include",
+		}),
+	),
+});
+
+type ControlAction = Static<typeof ControlParams>["action"];
+
 const ResultParams = Type.Object({
 	names: Type.Array(Type.String(), {
 		minItems: 1,
@@ -272,6 +295,7 @@ function statusDetails(subagent: Subagent): SubagentRunDetails {
 function statusLine(subagent: Subagent): string {
 	const label = `- ${subagent.id} (${subagent.options.description})`;
 	if (subagent.isQueued) return `${label}: queued`;
+	if (subagent.isPaused) return `${label}: paused`;
 	if (subagent.isRunning) return `${label}: running`;
 	if (subagent.status === "failed") {
 		return `${label}: failed${subagent.errorMessage ? `: ${subagent.errorMessage.split("\n")[0]}` : ""}`;
@@ -281,7 +305,12 @@ function statusLine(subagent: Subagent): string {
 }
 
 function isSettled(subagent: Subagent): boolean {
-	return !subagent.isRunning && !subagent.isQueued;
+	return !subagent.isRunning && !subagent.isQueued && !subagent.isPaused;
+}
+
+/** Running or queued: it will settle without the orchestrator's help, unlike a paused one. */
+function isActive(subagent: Subagent): boolean {
+	return subagent.isRunning || subagent.isQueued;
 }
 
 function failedRun(request: RunRequest, id: string, errorMessage: string): SubagentRunDetails {
@@ -439,7 +468,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		name: subagent.id,
 		description: subagent.options.description,
 		agent: subagent.options.agentName,
-		state: subagent.isRunning ? "running" : subagent.isQueued ? "queued" : "finished",
+		state: subagent.isRunning ? "running" : subagent.isQueued ? "queued" : subagent.isPaused ? "paused" : "finished",
 	});
 	const chatDirectory: ChatDirectory = {
 		find: (name) => {
@@ -462,7 +491,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 				pi.sendMessage(
 					{
 						customType: CHAT_MESSAGE_TYPE,
-						content: frameMessage(delivery, true),
+						content: frameMessage(delivery),
 						display: true,
 						details: delivery,
 					},
@@ -505,7 +534,10 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		const existing = request.session ? registry.find(request.session) : undefined;
 		if (existing) {
 			if (!isSettled(existing)) {
-				return { failure: failedRun(request, existing.id, `Subagent ${existing.id} is still ${existing.status}`) };
+				const hint = existing.isPaused ? `; resume it with ${SUBAGENT_CONTROL_TOOL_NAME}` : "";
+				return {
+					failure: failedRun(request, existing.id, `Subagent ${existing.id} is still ${existing.status}${hint}`),
+				};
 			}
 			return { subagent: existing, message: request.task };
 		}
@@ -581,6 +613,12 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		return toDetails(subagent, step);
 	};
 
+	/**
+	 * Subagents a foreground `subagent` call is waiting on. They cannot be paused: the call would wait for the
+	 * resume, and the orchestrator cannot resume them while that call holds its turn.
+	 */
+	const foreground = new Set<string>();
+
 	/** Start (or continue) one subagent and wait for it to settle. */
 	const runOne = async (
 		request: RunRequest,
@@ -590,14 +628,23 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 	): Promise<SubagentRunDetails> => {
 		const prepared = prepareRun(request, ctx);
 		if ("failure" in prepared) return prepared.failure;
-		return watchRun(prepared.subagent, prepared.message, request.step, signal, onProgress);
+		const key = prepared.subagent.key;
+		foreground.add(key);
+		try {
+			return await watchRun(prepared.subagent, prepared.message, request.step, signal, onProgress);
+		} finally {
+			foreground.delete(key);
+		}
 	};
 
 	// --- Background subagents ---------------------------------------------------------------------------------
 
-	/** Background chains still working through their steps; waiting for all subagents also waits for these. */
-	const backgroundJobs = new Set<Promise<void>>();
-	const jobListeners = new Set<() => void>();
+	/**
+	 * Background chains still working through their steps, each with its current step's subagent. Waiting for all
+	 * subagents also waits for these, unless the current step is paused.
+	 */
+	const backgroundChains = new Set<{ current: Subagent }>();
+	const chainListeners = new Set<() => void>();
 	/** Subagents whose outcome a wait or result call already gave the orchestrator, so no notice repeats it. */
 	const reported = new Set<string>();
 	/** Subagents whose result `subagent_result` returned, for `subagent_list`. */
@@ -608,14 +655,6 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 	let noticeTimer: NodeJS.Timeout | undefined;
 	/** From the orchestrator's agent_start to agent_settled: notices are held while it works. */
 	let orchestratorBusy = false;
-
-	const trackJob = (job: Promise<void>) => {
-		backgroundJobs.add(job);
-		void job.finally(() => {
-			backgroundJobs.delete(job);
-			for (const listener of [...jobListeners]) listener();
-		});
-	};
 
 	/** Post one notice for the background subagents that finished in the last batch window. */
 	const flushNotices = () => {
@@ -629,12 +668,13 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 			if (subagents.length === 0) continue;
 			for (const subagent of subagents) reported.add(subagent.key);
 			const content = [
-				// The model receives this in the user role, so say plainly that the user did not write it and what is
-				// expected; without that, models remark on a "user message" that is not from the user.
-				"[Automated notice from the subagent system, not a message from the user.]",
+				// The model receives this in the user role, so the tag says the user did not write it, and the text says
+				// what is expected; without that, models remark on a "user message" that is not from the user.
+				'<system_notice from="subagents">',
 				"Background subagents you started have finished:",
 				...subagents.map(statusLine),
 				`If the user's request needs their results, read them with ${SUBAGENT_RESULT_TOOL_NAME} and continue. Otherwise no reply is needed.`,
+				"</system_notice>",
 			].join("\n");
 			pi.sendMessage(
 				{
@@ -686,17 +726,23 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 				started.push(first.subagent);
 				results.push(toDetails(first.subagent, 1));
 				// Later steps start as earlier ones finish, each with the previous step's output.
-				trackJob(
-					(async () => {
-						let run = await runInBackground(first.subagent, first.message, 1, completion);
-						for (let i = 1; i < chain.length && !isFailedRun(run); i++) {
-							const task = chain[i].task.replace(/\{previous\}/g, getFinalOutput(run.messages));
-							const next = prepareRun({ ...shared, ...chain[i], task, step: i + 1 }, ctx);
-							if ("failure" in next) break;
-							run = await runInBackground(next.subagent, next.message, i + 1, completion);
-						}
-					})().catch(() => {}),
-				);
+				const job = { current: first.subagent };
+				backgroundChains.add(job);
+				void (async () => {
+					let run = await runInBackground(first.subagent, first.message, 1, completion);
+					for (let i = 1; i < chain.length && !isFailedRun(run); i++) {
+						const task = chain[i].task.replace(/\{previous\}/g, getFinalOutput(run.messages));
+						const next = prepareRun({ ...shared, ...chain[i], task, step: i + 1 }, ctx);
+						if ("failure" in next) break;
+						job.current = next.subagent;
+						run = await runInBackground(next.subagent, next.message, i + 1, completion);
+					}
+				})()
+					.catch(() => {})
+					.finally(() => {
+						backgroundChains.delete(job);
+						for (const listener of [...chainListeners]) listener();
+					});
 			}
 		} else {
 			const parallel = params.tasks !== undefined && params.tasks.length > 0;
@@ -1125,6 +1171,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 			"By default it returns only once ALL targets have finished.",
 			"Set returnOnFirst only to handle results one at a time as each subagent finishes.",
 			"A chat message to you ends the wait early, so you can answer it or change direction; the subagents keep running, and you may call it again to keep waiting.",
+			`Paused subagents are not waited for, since they only continue once resumed with ${SUBAGENT_CONTROL_TOOL_NAME}.`,
 			`Returns each target's status. Then read finished subagents' results with ${SUBAGENT_RESULT_TOOL_NAME}.`,
 		].join(" "),
 		promptSnippet: "Wait for background subagents to finish",
@@ -1162,7 +1209,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 				return added;
 			};
 			collect();
-			if (targets.size === 0 && (params.names !== undefined || backgroundJobs.size === 0)) {
+			if (targets.size === 0 && (params.names !== undefined || backgroundChains.size === 0)) {
 				return {
 					content: [{ type: "text", text: "No subagents are running or queued." }],
 					details: { mode: "parallel", results: [] },
@@ -1176,10 +1223,12 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 				});
 			emitProgress();
 
+			// Paused targets make no progress until the orchestrator resumes them, so the wait does not hold for them.
 			const done = (): boolean => {
 				const list = [...targets.values()];
-				if (mode === "any") return list.some(isSettled);
-				return list.every(isSettled) && (params.names !== undefined || backgroundJobs.size === 0);
+				const chainsBusy = [...backgroundChains].some((chain) => !chain.current.isPaused);
+				const idle = !list.some(isActive) && (params.names !== undefined || !chainsBusy);
+				return idle || (mode === "any" && list.some(isSettled));
 			};
 			// Ends when the targets finish, the call is aborted, or a chat message to the orchestrator arrives.
 			const ending = await new Promise<"done" | "aborted" | "chat">((resolve) => {
@@ -1188,7 +1237,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 					if (finished) return;
 					finished = true;
 					unsubscribe();
-					jobListeners.delete(check);
+					chainListeners.delete(check);
 					chatListeners.delete(onChat);
 					signal?.removeEventListener("abort", onAbort);
 					resolve(reason);
@@ -1200,7 +1249,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 				const onAbort = () => finish("aborted");
 				const onChat = () => finish("chat");
 				const unsubscribe = registry.onChange(check);
-				jobListeners.add(check);
+				chainListeners.add(check);
 				chatListeners.add(onChat);
 				signal?.addEventListener("abort", onAbort, { once: true });
 				if (signal?.aborted) finish("aborted");
@@ -1210,19 +1259,28 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 
 			const list = [...targets.values()];
 			const finished = list.filter(isSettled);
+			const paused = list.filter((subagent) => subagent.isPaused);
 			for (const subagent of finished) reported.add(subagent.key);
 			const heading =
 				ending === "aborted"
 					? "Stopped waiting."
 					: ending === "chat"
 						? chatInterruption([...unreadChat.values()])
-						: mode === "any"
-							? "A subagent finished."
-							: "All targets finished.";
+						: paused.length > 0 && !(mode === "any" && finished.length > 0)
+							? "No target is running or queued."
+							: mode === "any"
+								? "A subagent finished."
+								: "All targets finished.";
 			const lines = [heading, ...list.map(statusLine)];
 			if (finished.length > 0) {
 				const names = finished.map((subagent) => subagent.id).join(", ");
 				lines.push(`Read results with ${SUBAGENT_RESULT_TOOL_NAME}: ${names}.`);
+			}
+			if (paused.length > 0) {
+				const names = paused.map((subagent) => subagent.id).join(", ");
+				lines.push(
+					`Paused, so not waited for: ${names}. Resume them or ask for a handback with ${SUBAGENT_CONTROL_TOOL_NAME}.`,
+				);
 			}
 			return {
 				content: [{ type: "text", text: lines.join("\n") }],
@@ -1273,6 +1331,12 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 					continue;
 				}
 				results.push(statusDetails(subagent));
+				if (subagent.isPaused) {
+					sections.push(
+						`### ${subagent.id} (not finished)\n\nNo result yet: paused. Resume it, or have it report what it has with a handback, using ${SUBAGENT_CONTROL_TOOL_NAME}.`,
+					);
+					continue;
+				}
 				if (!isSettled(subagent)) {
 					const state = subagent.isQueued ? "queued" : "running";
 					sections.push(
@@ -1314,7 +1378,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		name: SUBAGENT_LIST_TOOL_NAME,
 		label: "Subagent List",
 		description: [
-			"List this session's subagents and their status: running, queued (waiting for a free slot),",
+			"List this session's subagents and their status: running, queued (waiting for a free slot), paused,",
 			`or finished, with whether you have read its result. Check it before ${SUBAGENT_RESULT_TOOL_NAME} to read only finished subagents.`,
 		].join(" "),
 		promptSnippet: "List subagents and their status",
@@ -1331,9 +1395,11 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 			}
 			const running = subagents.filter((subagent) => subagent.isRunning);
 			const queued = subagents.filter((subagent) => subagent.isQueued);
+			const paused = subagents.filter((subagent) => subagent.isPaused);
 			const finished = subagents.filter(isSettled);
 			const unread = finished.filter((subagent) => !resultsRead.has(subagent.key));
-			const heading = `Subagents: ${running.length} running, ${queued.length} queued, ${finished.length} finished (${unread.length} result${unread.length === 1 ? "" : "s"} not read).`;
+			const pausedCount = paused.length > 0 ? `${paused.length} paused, ` : "";
+			const heading = `Subagents: ${running.length} running, ${queued.length} queued, ${pausedCount}${finished.length} finished (${unread.length} result${unread.length === 1 ? "" : "s"} not read).`;
 			const lines = subagents.map((subagent) => {
 				if (!isSettled(subagent)) return statusLine(subagent);
 				return `${statusLine(subagent)}; result ${resultsRead.has(subagent.key) ? "read" : "not read"}`;
@@ -1350,6 +1416,107 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 
 		renderResult(result, _options, theme, context) {
 			return renderListResult(result.details, context.outputPad, theme);
+		},
+	});
+
+	/** Apply `action` to one subagent and return the line for the orchestrator, or throw why it cannot. */
+	const control = async (subagent: Subagent, action: ControlAction, note: string | undefined): Promise<string> => {
+		switch (action) {
+			case "pause":
+				if (foreground.has(subagent.key)) {
+					throw new Error(
+						"a foreground subagent call is waiting for it, so it could not be resumed; use handback or terminate",
+					);
+				}
+				if (!isActive(subagent) && !subagent.isPaused)
+					throw new Error(`it has already finished (${subagent.status})`);
+				await subagent.pause();
+				return subagent.isPaused
+					? "paused; its slot is free"
+					: `finished before it could pause: ${subagent.status}`;
+			case "resume":
+				await subagent.resume(note);
+				return subagent.isQueued ? "resumed; queued for the next free slot" : "resumed";
+			case "start":
+				await subagent.startNow(note);
+				return "started ahead of the queue";
+			case "terminate":
+				if (isSettled(subagent)) throw new Error(`it has already finished (${subagent.status})`);
+				await subagent.abort();
+				return "terminated";
+			case "handback": {
+				const wasPaused = subagent.isPaused;
+				await subagent.handback(note);
+				if (!wasPaused) return "asked to stop and report what it has";
+				return `resumed to report what it has${subagent.isQueued ? "; queued for the next free slot" : ""}`;
+			}
+		}
+	};
+
+	pi.registerTool<typeof ControlParams, SubagentToolDetails>({
+		name: SUBAGENT_CONTROL_TOOL_NAME,
+		label: "Subagent Control",
+		description: [
+			"Manage running, queued, and paused subagents, for when slots are limited (maxConcurrent) or a subagent's findings change the plan. Actions:",
+			"pause: stop a running or queued subagent and free its slot for the next queued one. Its session is kept; chat messages to it are held until it resumes.",
+			"resume: continue a paused subagent where it stopped. It takes the next free slot, or queues.",
+			"start: start a queued or paused subagent now, ahead of the queue, even when every slot is busy. To stay within the limit, start it first, then pause another: the freed slot covers it.",
+			"terminate: stop a running, queued, or paused subagent for good. It ends as aborted.",
+			`handback: ask a running subagent to stop and end with a report of what it has so far; a paused one is resumed to write it. Read the report with ${SUBAGENT_RESULT_TOOL_NAME} once it finishes.`,
+			"message adds a note for the subagent on resume, start, and handback.",
+		].join(" "),
+		promptSnippet: "Pause, resume, start, terminate, or ask subagents to hand back",
+		parameters: ControlParams,
+		renderShell: "self",
+
+		async execute(_toolCallId, params) {
+			const note = params.message?.trim() || undefined;
+			const lines: string[] = [];
+			const results: SubagentRunDetails[] = [];
+			let applied = 0;
+			// One at a time, in the given order, so `start` then `pause` keeps within the slot limit.
+			for (const name of unique(params.names)) {
+				const subagent = registry.find(name);
+				if (!subagent) {
+					lines.push(
+						`- ${name}: unknown subagent. List this session's subagents with ${SUBAGENT_LIST_TOOL_NAME}.`,
+					);
+					continue;
+				}
+				try {
+					lines.push(`- ${subagent.id}: ${await control(subagent, params.action, note)}`);
+					applied++;
+				} catch (error) {
+					lines.push(`- ${subagent.id}: not done: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				results.push(statusDetails(subagent));
+			}
+			lines.push(`Slots: ${slots.running} of ${slots.capacity} in use, ${slots.queued} queued.`);
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: { mode: "parallel", results },
+				isError: applied === 0 || undefined,
+			};
+		},
+
+		renderCall(args, theme, context) {
+			const action =
+				args.action === "handback"
+					? "Requesting Answer"
+					: args.action
+						? `${args.action[0].toUpperCase()}${args.action.slice(1)}`
+						: "Control";
+			return renderCallLine(action, (args.names ?? []).join(", "), "", theme, context);
+		},
+
+		renderResult(result, { expanded }, theme, context) {
+			const first = result.content[0];
+			return renderSubagentResult(
+				result.details,
+				first?.type === "text" ? first.text : "",
+				{ expanded, isError: context.isError, outputPad: context.outputPad },
+				theme,
+			);
 		},
 	});
 
@@ -1400,7 +1567,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 				pi.sendMessage(
 					{
 						customType: CHAT_MESSAGE_TYPE,
-						content: frameMessage(delivery, false),
+						content: frameMessage(delivery),
 						display: true,
 						details: delivery,
 					},

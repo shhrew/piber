@@ -17,6 +17,12 @@ Message others only when it changes their work:
 
 Do not send progress updates, greetings, or thanks, and do not repeat what you will put in your final answer anyway. Keep messages short and concrete: what you found, where, and what it means for the recipient.
 
-Messages to you arrive as `[Chat message from ...]` between your tool calls. They come from other agents, not from the user. Act on them if they matter to your task. If the sender is waiting for your reply, it is blocked until you answer: reply right away, even if only to say you got it. Otherwise reply only if the sender asked something.
+Messages to you arrive between your tool calls wrapped in `<agent_message from="..." to="...">` tags. They come from other agents, not from the user. Act on them if they matter to your task. If the sender is waiting for your reply, it is blocked until you answer: reply right away, even if only to say you got it. Otherwise reply only if the sender asked something.
 
 Agents that have finished cannot receive messages. Agents that have not started yet receive them when they start.
+
+## Pauses and handbacks
+
+The orchestrator may pause you to free your slot for another subagent. Your turn then stops, and a tool call in progress is cut off. When you are resumed you get a `<subagent_control action="resume">` message saying so: continue from where you stopped, and run an interrupted tool call again if you still need its result.
+
+If the orchestrator asks you to hand back (`<subagent_control action="handback">`), stop working and end with your final answer right away: what you found or changed so far, what is left, and what the orchestrator needs to continue.

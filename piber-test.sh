@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Runs pi-test.sh with a scenario prompt for testing a feature by hand.
+# Runs the built CLI, rebuilding first when sources changed: from source, pi and every subagent start several times slower.
 # Usage: ./piber-test.sh <scenario> [pi-test.sh args...]
 set -euo pipefail
 
@@ -9,8 +10,9 @@ usage() {
   echo "Usage: $0 <scenario> [pi-test.sh args...]"
   echo
   echo "Scenarios:"
-  echo "  chat   Subagent chat: subagent to subagent, reply waits, orchestrator replies, held messages, broadcast"
-  echo "  skills Skill search: listing, query and tag ranking, no match, load_skill, tool gating, extraSkillGroups"
+  echo "  chat    Subagent chat: subagent to subagent, reply waits, orchestrator replies, held messages, broadcast"
+  echo "  skills  Skill search: listing, query and tag ranking, no match, load_skill, tool gating, extraSkillGroups"
+  echo "  control Subagent control: start now, pause, resume, terminate, handback, held chat for paused subagents"
 }
 
 chat_prompt() {
@@ -70,6 +72,40 @@ The bundled "review" skill group holds two skills:
 EOF
 }
 
+control_prompt() {
+  cat <<'EOF'
+This is a manual test of subagent_control. It assumes the default maxConcurrent of 4. Follow these steps exactly. Do not edit any files, and tell every subagent not to edit files either. After each step, quote the tool result verbatim before going on.
+
+1. In ONE `subagent` call with `background: true`, start these six `worker` subagents in this order:
+   - names "w1", "w2", "w3", "w4", each with task: Do not edit files. Run `sleep 90` with bash. Then finish with: every message or notice you received from the orchestrator or the subagent system, quoted verbatim, and whether your sleep finished or was interrupted.
+   - names "w5", "w6", each with task: Do not edit files. Run `sleep 20` with bash, then `echo <your name> done`, and finish with its output.
+   w5 and w6 should start queued.
+2. Call subagent_list.
+3. Call subagent_control with action "start" and names ["w6"].
+4. Call subagent_control with action "pause" and names ["w1"].
+5. Call subagent_list at once. w5 should still be queued: the slot w1 freed covers w6, which started past the limit.
+6. Send w1 with chat_send, without waiting: "Held message: sent while you were paused."
+7. Call subagent_wait with names ["w1"]. It should return at once, since w1 is paused.
+8. Call subagent_control with action "pause" and names ["w3"], then with action "handback", names ["w3"], and message "Say what you were doing when you were paused."
+9. Call subagent_control with action "terminate" and names ["w4"].
+10. Call subagent_control with action "handback" and names ["w2"]. w2 is in the middle of its sleep, so it only sees the request once the sleep ends.
+11. Call subagent_control with action "resume", names ["w1"], and message "Skip the rest of your sleep and finish now."
+12. Call subagent_wait with no names until every subagent has finished. If a chat message ends the wait early, answer it briefly and wait again.
+13. Read every result with subagent_result. Then give a checklist, each item marked worked or failed with the evidence:
+   - step 2: 4 running, 2 queued (w5, w6)
+   - start: w6 "started ahead of the queue", slots 5 of 4 in use
+   - pause: w1 "paused; its slot is free", slots 4 of 4 in use with 1 queued
+   - step 5: w1 paused and w5 still queued
+   - held chat: chat_send said it was held because w1 is paused, and w1's result quotes the held message
+   - wait on a paused subagent: returned at once with "Paused, so not waited for: w1"
+   - pause then handback: w3's result quotes the handback request and its note, and reports its work so far
+   - handback while running: w2's result quotes the handback request, after its sleep finished
+   - terminate: w4 ended as aborted
+   - resume: w1's result quotes the resume notice with the note "Skip the rest of your sleep and finish now."
+   - queue: w5 started and finished
+EOF
+}
+
 if [[ $# -lt 1 ]]; then
   usage
   exit 1
@@ -85,6 +121,9 @@ case "$SCENARIO" in
   skills)
     PROMPT="$(skills_prompt)"
     ;;
+  control)
+    PROMPT="$(control_prompt)"
+    ;;
   -h | --help)
     usage
     exit 0
@@ -97,4 +136,22 @@ case "$SCENARIO" in
     ;;
 esac
 
-exec "$SCRIPT_DIR/pi-test.sh" "$@" "$PROMPT"
+# Rebuild only what changed since the last build. The bundle is written last, so its age stands for the whole build.
+# coding-agent depends on the other packages' dist, so a change in any of them needs the full build. build:offline skips
+# refetching the model catalog, which would change the generated model data.
+BUNDLE="$SCRIPT_DIR/packages/coding-agent/dist/bundle/cli.js"
+DEPENDENCIES=(telemetry chord tui codemode mcp ai durable env agent)
+newer_sources() {
+  local dirs=()
+  for pkg in "$@"; do dirs+=("$SCRIPT_DIR/packages/$pkg/src"); done
+  [[ -n "$(find "${dirs[@]}" -type f -newer "$BUNDLE" -print -quit)" ]]
+}
+if [[ ! -f "$BUNDLE" ]] || newer_sources "${DEPENDENCIES[@]}"; then
+  echo "Building all packages..."
+  (cd "$SCRIPT_DIR" && npm run build:offline)
+elif newer_sources coding-agent; then
+  echo "Building coding-agent..."
+  (cd "$SCRIPT_DIR" && npm run build -w packages/coding-agent)
+fi
+
+exec "$SCRIPT_DIR/pi-test.sh" --built "$@" "$PROMPT"

@@ -94,15 +94,37 @@ Every mode accepts `cwd`, `extraTools`, and `extraSkillGroups`, at the top level
 
 By default a `subagent` call runs in the foreground: it returns when its subagents finish, and the orchestrator waits. With `background: true` (or `defaultMode: "background"` in the config), the call starts its subagents and returns at once with their names, and the orchestrator keeps working. A background chain starts its later steps as earlier ones finish.
 
-Three tools manage background subagents:
+Four tools manage background subagents:
 
 | Tool | Parameters | Returns |
 |---|---|---|
 | `subagent_wait` | `names` (optional), `returnOnFirst` (optional, default `false`) | Each target's status once all of them have finished, or, with `returnOnFirst`, once the first has. Without `names`, it waits for every subagent still running or queued, including later chain steps. A chat message to the orchestrator ends the wait early, with the targets' status; the message follows the result, and the orchestrator can answer it, change direction, or call `subagent_wait` again. The chat shows `Wait(all)` or `Wait(any)`. |
 | `subagent_result` | `names` (one or more) | Each finished subagent's final answer, or its error, capped at 50 KB each. Running and queued subagents have no result yet; a call that returns no result at all is an error, so the orchestrator notices it asked too early. |
-| `subagent_list` | none | Every subagent in the session: running, queued (waiting for a free slot), or finished, with whether its result has been read. |
+| `subagent_list` | none | Every subagent in the session: running, queued (waiting for a free slot), paused, or finished, with whether its result has been read. |
+| `subagent_control` | `action`, `names`, `message` (optional) | Pause, resume, start now, terminate, or ask for a handback (see [Controlling subagents](#controlling-subagents)). |
 
 A subagent is `queued` only while it waits for a free slot (see `maxConcurrent`); one that finds a free slot starts at once.
+
+### Controlling subagents
+
+`subagent_control` lets the orchestrator manage its subagents while they work, mainly when slots are scarce or a subagent's findings change the plan. It takes `action`, `names` (one or more), and an optional `message`, a note passed to the subagent on `resume`, `start`, and `handback`. Names are handled one at a time, in order.
+
+| Action | Applies to | What happens |
+|---|---|---|
+| `pause` | running, queued | The child process stops (its current turn is aborted) and its slot goes to the next queued subagent. The session file is kept. Chat messages to it are held until it resumes. |
+| `resume` | paused | A new process continues the session, told that it was paused and to rerun an interrupted tool call. It takes the next free slot, or queues. A subagent paused before its task reached it gets the task instead. |
+| `start` | queued, paused | Starts it at once, ahead of the queue, even when every slot is busy. |
+| `terminate` | running, queued, paused | Stops it for good, as `aborted`. Its session can still be continued with `session`. |
+| `handback` | running, paused | Asks it to stop and end with a report of what it has so far: a steer for a running subagent (seen after its current tool call), a resume for a paused one. The report is its result, read like any other. |
+
+**Start now and the limit.** The queue is first-come, so a slot freed by `pause` goes to the queue's head, not to a chosen subagent. `start` skips the queue and runs past `maxConcurrent`; no queued subagent starts until running ones drop below the limit again. To start a chosen subagent within the limit, `start` it first, then `pause` another: the freed slot covers the one that started early.
+
+```
+start w6   →  w1 w2 w3 w4 w6 running (5 of 4), w5 queued
+pause w1   →  w2 w3 w4 w6 running (4 of 4), w5 still queued, w1 paused
+```
+
+A paused subagent is neither running nor finished. `subagent_wait` does not wait for it, since it only continues once resumed, and says which targets are paused. `subagent_result` has no result for it yet. A pause does not end its background run, so it gets no completion notice until it finishes after a resume, and a background chain waits on a paused step. Subagents of a foreground `subagent` call cannot be paused: the call would wait for the resume, which the orchestrator cannot send while that call holds its turn. A subagent that runs without a session file (`--no-session`) cannot be paused once its task has reached it.
 
 When a background subagent finishes and no wait or result call has reported it, the orchestrator is told, as `onBackgroundComplete` sets. Subagents that finish within half a second of each other share one notice. The notice gives each subagent's status and points to `subagent_result`; it never includes the output.
 
@@ -127,11 +149,21 @@ Agents in a session can send each other short messages, so a swarm can share fin
 |---|---|
 | A running subagent | Gets the message after its current tool call. |
 | A queued subagent | The message is held and delivered when it starts; the sender is told. |
+| A paused subagent | The message is held and delivered when it resumes; the sender is told. |
 | A finished subagent | The send is refused. |
 | The orchestrator | Gets the message after its current tool call while it works; when it is idle, the message starts a turn. |
-| `all` | Every running or queued subagent except the sender, and the orchestrator when a subagent sends it. |
+| `all` | Every running, queued, or paused subagent except the sender, and the orchestrator when a subagent sends it. |
 
-Recipients see a message as `[Chat message from scout-a (a subagent) to you, not from the user]` followed by the text, so their model does not mistake it for the user.
+Recipients see a message wrapped in a tag, followed by a line saying whether the sender waits for a reply, so their model does not mistake it for the user:
+
+```
+<agent_message from="scout-a" to="you" awaiting_reply="false">
+Found it in src/a.ts
+</agent_message>
+Reply with chat_send only if it is needed.
+```
+
+`to` is `you` or `all`. Other messages the system sends in the user role are tagged the same way: background completion notices as `<system_notice from="subagents">`, and resume and handback requests as `<subagent_control action="resume">` or `action="handback"`, with the orchestrator's `message` inside as `<note from="orchestrator">`.
 
 **Waiting for a reply.** With `waitForReply`, the sender blocks until the recipient's next message to it, up to `timeoutSeconds` (default `chat.replyTimeoutSeconds`, at most `chat.maxReplyTimeoutSeconds`). While an agent waits it cannot read messages the normal way, so any other message to it ends the wait and is returned in the tool result instead. That also resolves two agents waiting on each other. A timeout leaves the message delivered; a later reply arrives as a normal message. `waitForReply` cannot be used with `to: "all"`.
 
@@ -182,7 +214,7 @@ Recipients see a message as `[Chat message from scout-a (a subagent) to you, not
 | `chat` | Subagent chat (see [Chat](#chat)): `enabled`; `defaultCanMessage` for agents without `canMessage`; `orchestratorCanMessage`; `maxMessageLength` in characters; `maxMessagesPerMinute` per agent; `replyTimeoutSeconds` and `maxReplyTimeoutSeconds` for `waitForReply`. A project's `chat` object overrides individual fields. |
 | `onBackgroundComplete` | What happens when a background subagent finishes and nothing has reported it: `"wake"` posts a notice at once, starting a turn if the orchestrator is idle or queuing it after the current one; `"notify"` posts it with the next turn; `"silent"` posts nothing, leaving the result to `subagent_wait` and `subagent_result`. |
 
-`maxConcurrent` covers every subagent the session starts: parallel tasks, separate `subagent` calls, `session` continuations, and follow-ups sent from the agent view. A subagent beyond the limit waits in a queue with the status `queued` (`◷`), and starts in order when a running one finishes. Esc in the agent view, or aborting the parent's tool call, removes it from the queue. A queued subagent cannot be steered until it starts. The limit is read again before each run, so editing `config.json` takes effect for the next subagent.
+`maxConcurrent` covers every subagent the session starts: parallel tasks, separate `subagent` calls, `session` continuations, and follow-ups sent from the agent view. A subagent beyond the limit waits in a queue with the status `queued` (`◷`), and starts in order when a running one finishes. Esc in the agent view, or aborting the parent's tool call, removes it from the queue. A queued subagent cannot be steered until it starts. The orchestrator can reorder this with `subagent_control` (see [Controlling subagents](#controlling-subagents)). The limit is read again before each run, so editing `config.json` takes effect for the next subagent.
 
 ## Sessions
 
@@ -204,7 +236,7 @@ The bullet turns green when the call succeeds and red when it fails. A running r
 
 ### Dock
 
-A short list under the composer shows what is happening now: running subagents, then subagents that finished in the last 10 seconds, at most 4 rows. A running row shows only a phase: `Thinking`, `Responding`, or `Working` (calling tools, or between turns). Queued subagents are only counted. The dock renders nothing when there is nothing to show.
+A short list under the composer shows what is happening now: running subagents, then subagents that finished in the last 10 seconds, at most 4 rows. A running row shows only a phase: `Thinking`, `Responding`, or `Working` (calling tools, or between turns). Queued and paused subagents are only counted (`◷ 2 queued · ‖ 1 paused`). The dock renders nothing when there is nothing to show.
 
 ```
   ⠋ scout-a  Read a.txt · Thinking · 2 turns · 8s
@@ -226,13 +258,13 @@ Rows beyond the fourth are reached by moving the selection; the dock shows how m
 
 Press `←` while the editor is empty (keybinding `app.agents.view`, configurable in `keybindings.json`). The view has two tabs, **Agents** and **Chat**; it opens on Agents, and `→` (keybinding `app.agents.chat`) switches to Chat.
 
-The Agents tab lists the main session at the top, then the subagents started in this session under **In progress**, **Queued**, and **Completed** (empty sections are hidden), each by name, description, and agent. Running subagents show a spinner, queued ones `◷`, and finished ones `✓`, or `✗` when they failed or were aborted. Section headers are not selectable: ↑ and ↓ move between rows, and the selection stays on a subagent as it moves from one section to the next. It starts on the session you last opened in it: the main session at first, then whichever subagent (or the main session) you opened most recently. Going back from a subagent returns to the list on that subagent, unless it was opened from the dock: then going back returns to the main session.
+The Agents tab lists the main session at the top, then the subagents started in this session under **In progress**, **Queued**, **Paused**, and **Completed** (empty sections are hidden), each by name, description, and agent. Running subagents show a spinner, queued ones `◷`, paused ones `‖`, and finished ones `✓`, or `✗` when they failed or were aborted. Section headers are not selectable: ↑ and ↓ move between rows, and the selection stays on a subagent as it moves from one section to the next. It starts on the session you last opened in it: the main session at first, then whichever subagent (or the main session) you opened most recently. Going back from a subagent returns to the list on that subagent, unless it was opened from the dock: then going back returns to the main session.
 
 | Key | Agents | Subagent | Chat |
 |---|---|---|---|
 | `↑` / `↓` | Select | | |
-| `Enter` | Open the selection (the main session closes the view) | Send the input: steers a running subagent, or starts a follow-up on an idle one | |
-| `Esc` | Close the view | Abort a running subagent, cancel a queued one, or go back | Close the view |
+| `Enter` | Open the selection (the main session closes the view) | Send the input: steers a running subagent, resumes a paused one with it, or starts a follow-up on an idle one | |
+| `Esc` | Close the view | Abort a running or paused subagent, cancel a queued one, or go back | Close the view |
 | `←` | Close the view | Go back (when the input is empty) | Back to Agents |
 | `→` | Show Chat | | |
 | `PgUp` / `PgDn`, mouse wheel | Wheel moves the selection | Scroll the transcript | Scroll the log |
@@ -258,10 +290,10 @@ Dialogs from a subagent's extensions (confirm, select, input) appear in the pare
 
 | File | Purpose |
 |---|---|
-| `index.ts` | Tools (`subagent`, `subagent_wait`, `subagent_result`, `subagent_list`, and the skill tools), run planning, background notices, and the agent-view trigger |
+| `index.ts` | Tools (`subagent`, `subagent_wait`, `subagent_result`, `subagent_list`, `subagent_control`, and the skill tools), run planning, background notices, and the agent-view trigger |
 | `agents.ts` | Agent discovery |
 | `skills.ts` | Skill groups, tags, and search |
-| `child.ts` | One subagent process and its transcript |
+| `child.ts` | One subagent process and its transcript, and pausing, resuming, and handing back |
 | `rpc.ts` | RPC client for the child process |
 | `registry.ts` | Subagents started in this session |
 | `view.ts` | The agent view |

@@ -5,8 +5,8 @@
  * the agent-view key closes.
  * Chat: every chat message in the session, one compact entry each, scrolled like a transcript. The agent-view
  * key returns to Agents; Esc closes.
- * Subagent: live transcript with an input line. Enter steers a running subagent or starts a follow-up
- * run on an idle one; Esc aborts a running subagent or goes back; the agent-view key goes back. Back is
+ * Subagent: live transcript with an input line. Enter steers a running subagent, resumes a paused one with the
+ * input, or starts a follow-up run on an idle one; Esc aborts a running or paused subagent or goes back; the agent-view key goes back. Back is
  * the list, or the main session when the subagent was opened from the dock.
  *
  * The transcript scrolls like the fullscreen transcript: the `tui.altScreen.*` page, half-page, line,
@@ -106,7 +106,11 @@ function listSections(subagents: readonly Subagent[]): ListSection[] {
 	return [
 		{ title: "In progress", subagents: subagents.filter((subagent) => subagent.isRunning) },
 		{ title: "Queued", subagents: subagents.filter((subagent) => subagent.isQueued) },
-		{ title: "Completed", subagents: subagents.filter((subagent) => !subagent.isRunning && !subagent.isQueued) },
+		{ title: "Paused", subagents: subagents.filter((subagent) => subagent.isPaused) },
+		{
+			title: "Completed",
+			subagents: subagents.filter((subagent) => !subagent.isRunning && !subagent.isQueued && !subagent.isPaused),
+		},
 	].filter((section) => section.subagents.length > 0);
 }
 
@@ -301,7 +305,7 @@ export class AgentView implements Component {
 			return;
 		}
 		if (kb.matches(data, "app.interrupt")) {
-			if (subagent.isRunning || subagent.isQueued) void subagent.abort();
+			if (subagent.isRunning || subagent.isQueued || subagent.isPaused) void subagent.abort();
 			else this.back();
 			return;
 		}
@@ -375,7 +379,10 @@ export class AgentView implements Component {
 		if (!subagent || !text) return;
 		this.input.setValue("");
 		this.scroll.scrollToBottom();
-		this.notice = { text: subagent.isRunning ? "Steering message sent" : "Follow-up started", isError: false };
+		this.notice = {
+			text: subagent.isRunning ? "Steering message sent" : subagent.isPaused ? "Resumed" : "Follow-up started",
+			isError: false,
+		};
 		subagent.send(text).catch((error: unknown) => {
 			this.notice = { text: `Error: ${error instanceof Error ? error.message : String(error)}`, isError: true };
 			this.tui.requestRender();
@@ -439,9 +446,11 @@ export class AgentView implements Component {
 		const hint = [
 			subagent.isQueued
 				? `waiting for a free slot · esc cancel · ← ${back}`
-				: subagent.isRunning
-					? `enter steer · esc abort · ← ${back}`
-					: `enter follow up · esc ${back}`,
+				: subagent.isPaused
+					? `enter resume · esc terminate · ← ${back}`
+					: subagent.isRunning
+						? `enter steer · esc abort · ← ${back}`
+						: `enter follow up · esc ${back}`,
 			"pgup/pgdn/wheel scroll",
 			...(below > 0 ? [`↓ ${below} more`] : []),
 		].join(" · ");

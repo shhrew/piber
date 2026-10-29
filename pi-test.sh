@@ -3,12 +3,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Check for --no-env flag
+# Check for --no-env and --built flags
 NO_ENV=false
+BUILT=false
 ARGS=()
 for arg in "$@"; do
   if [[ "$arg" == "--no-env" ]]; then
     NO_ENV=true
+  elif [[ "$arg" == "--built" ]]; then
+    BUILT=true
   else
     ARGS+=("$arg")
   fi
@@ -52,6 +55,11 @@ if [[ "$NO_ENV" == "true" ]]; then
   unset AZURE_OPENAI_BASE_URL
   unset AZURE_OPENAI_RESOURCE_NAME
   echo "Running without API keys..."
+fi
+
+# --built runs the bundle from `npm run build` instead of the sources.
+if [[ "$BUILT" == "true" ]]; then
+  exec node "$SCRIPT_DIR/packages/coding-agent/dist/bundle/cli.js" ${ARGS[@]+"${ARGS[@]}"}
 fi
 
 # --import takes a module specifier, so pass the resolver as a file URL (raw paths break on #, ?, %).

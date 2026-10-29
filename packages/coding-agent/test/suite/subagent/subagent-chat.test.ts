@@ -50,19 +50,22 @@ describe("chat permissions and prompts", () => {
 			text: "Found it in src/a.ts",
 			awaitingReply: true,
 		};
-		expect(frameMessage(delivery, false)).toBe(
+		expect(frameMessage(delivery)).toBe(
 			[
-				"[Chat message from scout-a (a subagent) to you, not from the user]",
+				'<agent_message from="scout-a" to="you" awaiting_reply="true">',
 				"Found it in src/a.ts",
+				"</agent_message>",
 				'scout-a is blocked waiting for your reply: answer now with chat_send to "scout-a", even if only to say you got it.',
 			].join("\n"),
 		);
 		const broadcast = { id: "m2", from: ORCHESTRATOR, to: "all", text: "Stop editing a.ts", awaitingReply: false };
-		expect(frameMessage(broadcast, false).split("\n")[0]).toBe(
-			"[Chat message from the orchestrator to everyone, not from the user]",
-		);
-		expect(frameMessage({ ...delivery, awaitingReply: false }, true).split("\n")[0]).toBe(
-			"[Chat message from scout-a (one of your subagents) to you, not from the user]",
+		expect(frameMessage(broadcast)).toBe(
+			[
+				'<agent_message from="orchestrator" to="all" awaiting_reply="false">',
+				"Stop editing a.ts",
+				"</agent_message>",
+				"Reply with chat_send only if it is needed.",
+			].join("\n"),
 		);
 	});
 
@@ -424,7 +427,7 @@ describe("chat in a subagent process", () => {
 
 		await hub.send(ORCHESTRATOR, { to: "child", text: "Also check b.ts" });
 		await vi.waitFor(() => expect(chatMessages(harness)).toHaveLength(1));
-		expect(getMessageText(chatMessages(harness)[0])).toContain("[Chat message from the orchestrator to you");
+		expect(getMessageText(chatMessages(harness)[0])).toContain('<agent_message from="orchestrator" to="you"');
 		expect(getMessageText(chatMessages(harness)[0])).toContain("Also check b.ts");
 	});
 });
@@ -464,9 +467,7 @@ describe("chat from a real subagent process to the orchestrator", () => {
 			},
 		);
 		expect(chatMessages(harness)[0].details?.from).toBe("finder");
-		expect(getMessageText(chatMessages(harness)[0])).toContain(
-			"[Chat message from finder (one of your subagents) to you",
-		);
+		expect(getMessageText(chatMessages(harness)[0])).toContain('<agent_message from="finder" to="you"');
 		await vi.waitFor(() => expect(harness.getPendingResponseCount()).toBe(0), { timeout: 10_000 });
 	}, 20_000);
 });

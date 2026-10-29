@@ -4,6 +4,10 @@
  * The process runs only while the subagent works. When it settles the process stops, and the next message
  * (a follow-up from the agent view, or a `session` continuation from the parent) starts a new process on the
  * same session file.
+ *
+ * A run can be paused: its process stops and its slot is given back, but `run()` keeps waiting until the
+ * subagent is resumed (a new process on the same session file, told why its turn stopped) or aborted. So a caller
+ * waiting on `run()` sees a pause only as a longer run.
  */
 
 import { randomUUID } from "node:crypto";
@@ -24,8 +28,11 @@ import type { SlotPool } from "./slots.ts";
 /** Extension flag that tells a child which skill groups `skill_search` and `load_skill` serve. */
 export const SKILL_GROUPS_FLAG = "subagent-skill-groups";
 
-/** `queued`: waiting for a free slot in the parent's `SlotPool` before its process starts. */
-export type SubagentStatus = "queued" | "running" | "done" | "failed" | "aborted";
+/**
+ * `queued`: waiting for a free slot in the parent's `SlotPool` before its process starts. `paused`: stopped by
+ * `pause()` with its slot given back, until `resume()` or `abort()`.
+ */
+export type SubagentStatus = "queued" | "running" | "paused" | "done" | "failed" | "aborted";
 
 export interface SubagentUsage {
 	input: number;
@@ -99,6 +106,35 @@ function preview(text: string, length: number): string {
 	return line.length > length ? `${line.slice(0, length)}...` : line;
 }
 
+/** The orchestrator's note, if any, as a tag to append to what a subagent is told. */
+function noteLines(note: string | undefined): string[] {
+	const text = note?.trim();
+	return text ? ['<note from="orchestrator">', text, "</note>"] : [];
+}
+
+/** A control message in the user role, tagged so the subagent's model knows the user did not write it. */
+function controlPrompt(action: "resume" | "handback", text: string, note: string | undefined): string {
+	return [`<subagent_control action="${action}">`, text, ...noteLines(note), "</subagent_control>"].join("\n");
+}
+
+/** What a resumed subagent is told, so its model knows why its last turn stopped. */
+export function resumePrompt(note?: string): string {
+	return controlPrompt(
+		"resume",
+		"The orchestrator paused you and has now resumed you. Continue your task from where you stopped. A tool call the pause interrupted did not finish: run it again if you still need its result.",
+		note,
+	);
+}
+
+/** What a subagent asked to hand back is told: stop and report. */
+export function handbackPrompt(note?: string): string {
+	return controlPrompt(
+		"handback",
+		"Stop working on your task now and do not start anything new. End with your final answer: what you found or changed so far, what is left to do, and anything the orchestrator needs to continue. It may resume you later.",
+		note,
+	);
+}
+
 /** Arguments for the child, apart from `--mode rpc`. `sessionFile` continues a session; otherwise one is created. */
 export function buildChildArgs(
 	options: SubagentOptions,
@@ -140,8 +176,22 @@ export class Subagent {
 	finishedAt: number | undefined;
 	stderr = "";
 	private client: ChildRpc | null = null;
+	/** The current process has received its message, so steering reaches it in order. */
+	private ready = false;
+	/** Steering messages sent before the current process received its message. */
+	private pendingSteers: string[] = [];
 	/** Set for the whole of a run, queued or not. `abort()` uses it, so an abort is never lost between steps. */
 	private cancel: AbortController | undefined;
+	/** Set while a run is queued or running: `pause()` aborts it. */
+	private pauseControl: AbortController | undefined;
+	/** Set while queued: `startNow()` aborts it to leave the queue and take a slot past the limit. */
+	private boost: AbortController | undefined;
+	/** Set while paused: continues the run with the given message. */
+	private resumeWith: ((next: { message: string; now: boolean }) => void) | undefined;
+	/** The message a pause kept from reaching the child, sent again on resume. */
+	private unsentMessage: string | undefined;
+	/** Whether this run's first message reached the child, so there is work to resume or hand back. */
+	private taskStarted = false;
 	private listeners = new Set<() => void>();
 
 	constructor(options: SubagentOptions) {
@@ -156,7 +206,12 @@ export class Subagent {
 
 	/** Between taking a slot and settling, including while its process starts. */
 	get isRunning(): boolean {
-		return this.cancel !== undefined && this.status !== "queued";
+		return this.cancel !== undefined && this.status !== "queued" && this.status !== "paused";
+	}
+
+	/** Paused by `pause()`: no process and no slot, until resumed or aborted. */
+	get isPaused(): boolean {
+		return this.cancel !== undefined && this.status === "paused";
 	}
 
 	/** Subscribe to any change: status, messages, streaming text, or usage. */
@@ -184,7 +239,8 @@ export class Subagent {
 	/**
 	 * Send `message` and wait until the subagent settles. Waits for a free slot first when the parent limits
 	 * concurrency, then starts the child process, continuing the session file when there is one, and stops it
-	 * afterwards. Aborting `signal`, or `abort()`, cancels the wait or aborts the subagent.
+	 * afterwards. Aborting `signal`, or `abort()`, cancels the wait or aborts the subagent. While paused, it keeps
+	 * waiting for `resume()`.
 	 */
 	async run(message: string, signal?: AbortSignal): Promise<void> {
 		if (this.cancel) throw new Error(`Subagent ${this.id} is already running`);
@@ -194,38 +250,104 @@ export class Subagent {
 		this.stopReason = undefined;
 		this.errorMessage = undefined;
 		this.finishedAt = undefined;
+		this.taskStarted = false;
 
-		let release: (() => void) | undefined;
 		try {
-			// Take a free slot at once, so a subagent is `queued` only while it really waits for one.
-			release = this.options.slots?.tryAcquire();
-			if (this.options.slots && !release) {
-				this.status = "queued";
+			let next = { message, now: false };
+			while (true) {
+				const pause = new AbortController();
+				this.pauseControl = pause;
+				const delivered = await this.runStep(next.message, next.now, AbortSignal.any([runSignal, pause.signal]));
+				this.pauseControl = undefined;
+				// A pause that came after the process ended on its own, or failed, leaves that outcome.
+				if (!pause.signal.aborted || runSignal.aborted || this.status !== "aborted") return;
+				this.unsentMessage = delivered ? undefined : next.message;
+				this.status = "paused";
 				this.emit();
-				try {
-					release = await this.options.slots.acquire(runSignal);
-				} catch {
+				const resumed = await this.waitForResume(runSignal);
+				if (!resumed) {
 					this.status = "aborted";
 					return;
 				}
+				next = resumed;
 			}
-			await this.runProcess(message, runSignal);
 		} finally {
-			release?.();
+			this.pauseControl = undefined;
+			this.unsentMessage = undefined;
 			this.cancel = undefined;
 			this.finishedAt = Date.now();
 			this.emit();
 		}
 	}
 
-	private async runProcess(message: string, signal: AbortSignal): Promise<void> {
+	/**
+	 * Take a slot, then run one process. Without `now`, waits in the queue when no slot is free; `startNow()` ends
+	 * the wait early. Resolves with whether `message` reached the child.
+	 */
+	private async runStep(message: string, now: boolean, signal: AbortSignal): Promise<boolean> {
+		const slots = this.options.slots;
+		// Take a free slot at once, so a subagent is `queued` only while it really waits for one.
+		let release = slots && (now ? slots.acquireNow() : slots.tryAcquire());
+		try {
+			if (slots && !release) {
+				this.status = "queued";
+				this.emit();
+				const boost = new AbortController();
+				this.boost = boost;
+				try {
+					release = await slots.acquire(AbortSignal.any([signal, boost.signal]));
+				} catch {
+					if (signal.aborted) {
+						this.status = "aborted";
+						return false;
+					}
+					release = slots.acquireNow();
+				} finally {
+					this.boost = undefined;
+				}
+			}
+			return await this.runProcess(message, signal);
+		} finally {
+			release?.();
+		}
+	}
+
+	private waitForResume(signal: AbortSignal): Promise<{ message: string; now: boolean } | undefined> {
+		return new Promise((resolve) => {
+			const finish = (next: { message: string; now: boolean } | undefined) => {
+				this.resumeWith = undefined;
+				signal.removeEventListener("abort", onAbort);
+				resolve(next);
+			};
+			const onAbort = () => finish(undefined);
+			this.resumeWith = finish;
+			if (signal.aborted) onAbort();
+			else signal.addEventListener("abort", onAbort, { once: true });
+		});
+	}
+
+	/** Resolves once `done` holds, checked on every change. */
+	private until(done: () => boolean): Promise<void> {
+		if (done()) return Promise.resolve();
+		return new Promise((resolve) => {
+			const stop = this.onChange(() => {
+				if (!done()) return;
+				stop();
+				resolve();
+			});
+		});
+	}
+
+	/** Resolves with whether `message` reached the child. */
+	private async runProcess(message: string, signal: AbortSignal): Promise<boolean> {
 		this.status = "running";
 		this.startedAt = Date.now();
 		this.emit();
 		if (signal.aborted) {
 			this.status = "aborted";
-			return;
+			return false;
 		}
+		let delivered = false;
 
 		const promptDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
 		const promptFile = path.join(promptDir, "system-prompt.md");
@@ -275,7 +397,13 @@ export class Subagent {
 			}
 			this.emit();
 
+			// An abort before the prompt has nothing to stop in the child, so the prompt must not go out.
+			if (signal.aborted) throw new Error("Subagent was aborted");
 			await Promise.race([client.prompt(message), exited]);
+			delivered = true;
+			this.taskStarted = true;
+			this.ready = true;
+			for (const steer of this.pendingSteers.splice(0)) await Promise.race([client.steer(steer), exited]);
 			const { aborted } = await Promise.race([settled, exited]);
 			this.status = aborted ? "aborted" : this.stopReason === "error" ? "failed" : "done";
 		} catch (error) {
@@ -286,28 +414,97 @@ export class Subagent {
 		} finally {
 			signal.removeEventListener("abort", onAbort);
 			this.client = null;
+			this.ready = false;
+			this.pendingSteers = [];
 			this.streaming = undefined;
 			await client.stop();
 			await fs.promises.rm(promptDir, { recursive: true, force: true });
 			this.emit();
 		}
+		return delivered;
 	}
 
-	/** Steer the running subagent, or start a follow-up run when it is idle. */
+	/**
+	 * Steer the running subagent, resume a paused one with `message`, or start a follow-up run when it is idle.
+	 * A steer sent while the process starts is delivered once it has received its task.
+	 */
 	async send(message: string): Promise<void> {
 		if (this.isQueued) throw new Error("This subagent is queued and has not started yet");
+		if (this.isPaused) {
+			await this.continueWith(this.unsentMessage ? `${this.unsentMessage}\n\n${message}` : message, false);
+			return;
+		}
 		if (this.isRunning) {
-			if (!this.client) throw new Error("This subagent is still starting");
-			await this.client.steer(message);
+			await this.steer(message);
 			return;
 		}
 		if (!this.sessionFile) throw new Error("This subagent has no session file to continue");
 		await this.run(message);
 	}
 
-	/** Cancel the current run: leave the queue, or abort the running subagent. */
+	/**
+	 * Stop the running or queued subagent and give back its slot, keeping its session so `resume()` can continue
+	 * it. Resolves once it is paused, or has settled because it finished first.
+	 */
+	async pause(): Promise<void> {
+		if (this.isPaused) return;
+		if (!this.pauseControl) throw new Error(`${this.id} is not running or queued`);
+		// Before its message reaches the child, a resume sends it again; after, only a session file keeps the work.
+		if (this.ready && !this.sessionFile) {
+			throw new Error(`${this.id} runs without a session file, so it could not resume; terminate it instead`);
+		}
+		this.pauseControl.abort();
+		await this.until(() => this.isPaused || !this.cancel);
+	}
+
+	/**
+	 * Continue a paused subagent where it stopped. It takes the next free slot, queueing when there is none, or
+	 * with `now`, starts at once past the limit. `note` is passed on from the orchestrator. Resolves once it is
+	 * queued or running.
+	 */
+	async resume(note?: string, now = false): Promise<void> {
+		if (!this.isPaused) throw new Error(`${this.id} is not paused`);
+		const message = this.unsentMessage ? [this.unsentMessage, ...noteLines(note)].join("\n") : resumePrompt(note);
+		await this.continueWith(message, now);
+	}
+
+	/** Start a queued subagent at once, ahead of the queue and past the slot limit; resume a paused one the same way. */
+	async startNow(note?: string): Promise<void> {
+		if (this.isPaused) return this.resume(note, true);
+		if (!this.isQueued || !this.boost) throw new Error(`${this.id} is not queued or paused`);
+		this.boost.abort();
+		await this.until(() => !this.isQueued);
+	}
+
+	/**
+	 * Ask the subagent to stop and end with a report of its work so far. A running one is steered; a paused one is
+	 * resumed to write the report, taking the next free slot.
+	 */
+	async handback(note?: string): Promise<void> {
+		if (this.isQueued) throw new Error(`${this.id} is queued and has not started: start it or terminate it`);
+		if (this.isPaused) {
+			if (!this.taskStarted) throw new Error(`${this.id} was paused before it started: resume it or terminate it`);
+			await this.continueWith(handbackPrompt(note), false);
+			return;
+		}
+		if (!this.isRunning) throw new Error(`${this.id} is not running`);
+		await this.steer(handbackPrompt(note));
+	}
+
+	/** Cancel the current run: leave the queue, abort the running subagent, or end a pause. Resolves once settled. */
 	async abort(): Promise<void> {
 		this.cancel?.abort();
+		await this.until(() => !this.cancel);
+	}
+
+	private async continueWith(message: string, now: boolean): Promise<void> {
+		this.resumeWith?.({ message, now });
+		await this.until(() => !this.isPaused);
+	}
+
+	private async steer(message: string): Promise<void> {
+		if (this.client && this.ready) await this.client.steer(message);
+		else this.pendingSteers.push(message);
 	}
 
 	private emit(): void {
