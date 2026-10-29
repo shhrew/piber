@@ -16,6 +16,7 @@ import {
 	type Component,
 	Container,
 	Spacer,
+	Text,
 	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
@@ -25,6 +26,7 @@ import type { Theme, ThemeColor } from "../../modes/interactive/theme/theme.ts";
 import type { AgentSource } from "./agents.ts";
 import { BROADCAST, type ChatDelivery, type SendOutcome } from "./chat.ts";
 import type { SubagentStatus, SubagentUsage } from "./child.ts";
+import type { SkillSearchMatch } from "./skills.ts";
 
 /** The frames and timing of pi-tui's `Loader`, the spinner next to "Working", which does not export them. */
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -422,7 +424,7 @@ interface WaitArgs {
 }
 
 /**
- * `● Wait(any) · waiting for a subagent to finish`, then `· done waiting` once the wait returns. The argument is
+ * `● Waiting(any) · waiting for a subagent to finish`, then `· done waiting` once the wait returns. The argument is
  * the one target's name, or otherwise the mode: several named targets are listed in the rows below instead.
  */
 export function renderWaitCall(args: WaitArgs, theme: Theme, state: CallState): Component {
@@ -430,7 +432,7 @@ export function renderWaitCall(args: WaitArgs, theme: Theme, state: CallState): 
 	const mode = args.returnOnFirst ? "any" : "all";
 	const target = single ? "it" : mode === "any" ? "a subagent" : "subagents";
 	const summary = state.isPartial ? `· waiting for ${target} to finish` : "· done waiting";
-	return renderCallLine("Wait", single ?? mode, summary, theme, state);
+	return renderCallLine("Waiting", single ?? mode, summary, theme, state);
 }
 
 /**
@@ -653,12 +655,160 @@ export function renderChatSendResult(
 	return container;
 }
 
-/** `⎿  3 agents you can message`. */
-export function renderChatPeersResult(text: string, outputPad: number, theme: Theme): Component {
-	const count = text.split("\n").filter((line) => line.startsWith("- ")).length;
-	const elbow = `${" ".repeat(outputPad)}  ${theme.fg("muted", "⎿")}  `;
-	const summary = count === 0 ? (text.split("\n")[0] ?? "") : `${count} you can message`;
-	return new SingleLines([elbow + theme.fg("dim", summary)]);
+/** One line of `ChatHub.peers`: `- name (description; agent): state`, `- orchestrator`, or `- all: ...`. */
+interface PeerLine {
+	name: string;
+	description?: string;
+	agent?: string;
+	state?: string;
+}
+
+function parsePeerLine(line: string): PeerLine | undefined {
+	const match = /^- ([^\s:(]+)(?: \((.*); ([^;]+)\))?(?:: (.*))?$/.exec(line);
+	if (!match) return undefined;
+	return { name: match[1], description: match[2], agent: match[3], state: match[4] };
+}
+
+/** `●` running, `◷` queued, `‖` paused, `○` finished; none for the orchestrator and `all`. */
+function peerIcon(peer: PeerLine, theme: Theme): string {
+	if (!peer.agent) return "";
+	if (peer.state?.startsWith("running")) return `${theme.fg("accent", "●")} `;
+	if (peer.state?.startsWith("queued")) return `${theme.fg("muted", "◷")} `;
+	if (peer.state?.startsWith("paused")) return `${theme.fg("warning", "‖")} `;
+	return `${theme.fg("dim", "○")} `;
+}
+
+/**
+ * The agents `chat_peers` listed, each with its state icon: `⎿  orchestrator · ● alpha · ◷ bravo · all`. Expanded,
+ * one row each with the subagent's description, agent, and state.
+ */
+export function renderChatPeersResult(
+	text: string,
+	options: { expanded: boolean; outputPad: number },
+	theme: Theme,
+): Component {
+	const pad = " ".repeat(options.outputPad);
+	const elbow = `${pad}  ${theme.fg("muted", "⎿")}  `;
+	const peers = text.split("\n").flatMap((line) => parsePeerLine(line) ?? []);
+	if (peers.length === 0) {
+		const none = text.includes("- no other subagents yet") ? "No other subagents yet" : text.split("\n")[0];
+		return new SingleLines([elbow + theme.fg("dim", none ?? "")]);
+	}
+	const label = (peer: PeerLine) => peerIcon(peer, theme) + theme.fg(peer.agent ? "accent" : "toolOutput", peer.name);
+	if (!options.expanded) return new SingleLines([elbow + peers.map(label).join(theme.fg("dim", " · "))]);
+
+	const width = Math.max(...peers.map((peer) => peer.name.length + (peer.agent ? 2 : 0)));
+	return new SingleLines(
+		peers.map((peer, index) => {
+			const about = peer.agent ? `${peer.description} · ${peer.agent} · ${peer.state}` : (peer.state ?? "");
+			const gap = " ".repeat(width - peer.name.length - (peer.agent ? 2 : 0) + 2);
+			return `${index === 0 ? elbow : `${pad}     `}${label(peer)}${gap}${theme.fg("dim", about)}`;
+		}),
+	);
+}
+
+interface SkillSearchArgs {
+	query?: string;
+	tags?: string[];
+	limit?: number;
+}
+
+/** What `skill_search` returned, for its renderer. */
+export interface SkillSearchDetails {
+	matches: SkillSearchMatch[];
+	/** Skills the agent has, matched or not. */
+	available: number;
+	/** Every tag of those skills, suggested when nothing matched. */
+	tags: string[];
+}
+
+/** `● Search skills(path traversal) #security · up to 3`, or `● Search skills(all)` with neither a query nor tags. */
+export function renderSkillSearchCall(args: SkillSearchArgs, theme: Theme, state: CallState): Component {
+	const query = args.query?.trim();
+	const tags = (args.tags ?? []).map((tag) => `#${tag}`).join(" ");
+	const limit = args.limit !== undefined ? `· up to ${args.limit}` : "";
+	const argument = query || (tags ? undefined : "all");
+	return renderCallLine("Search skills", argument, [tags, limit].filter(Boolean).join(" "), theme, state);
+}
+
+/**
+ * `⎿  2 matches · security-review, review-checklist`, or `⎿  No match · try #php #review`. Expanded, one row per
+ * match with its description and tags.
+ */
+export function renderSkillSearchResult(
+	details: SkillSearchDetails | undefined,
+	fallbackText: string,
+	options: { expanded: boolean; isError: boolean; outputPad: number },
+	theme: Theme,
+): Component {
+	const pad = " ".repeat(options.outputPad);
+	const elbow = `${pad}  ${theme.fg("muted", "⎿")}  `;
+	const dim = (text: string) => theme.fg("dim", text);
+	if (!details || options.isError) {
+		return new SingleLines([elbow + theme.fg(options.isError ? "error" : "dim", fallbackText.split("\n")[0] ?? "")]);
+	}
+	if (details.available === 0) return new SingleLines([elbow + dim("No skills available")]);
+	const matches = details.matches;
+	if (matches.length === 0) {
+		const hint = details.tags.length > 0 ? ` · try ${details.tags.map((tag) => `#${tag}`).join(" ")}` : "";
+		return new SingleLines([elbow + theme.fg("warning", "No match") + dim(hint)]);
+	}
+	const count = `${matches.length} match${matches.length > 1 ? "es" : ""}`;
+	if (!options.expanded) {
+		const names = matches.map((match) => theme.fg("accent", match.name)).join(dim(", "));
+		return new SingleLines([`${elbow}${dim(`${count} · `)}${names}`]);
+	}
+	const width = Math.max(...matches.map((match) => match.name.length));
+	return new SingleLines([
+		elbow + dim(count),
+		...matches.map((match) => {
+			const tags =
+				match.tags.length > 0 ? ` ${theme.fg("muted", match.tags.map((tag) => `#${tag}`).join(" "))}` : "";
+			return `${pad}     ${theme.fg("accent", match.name.padEnd(width))}  ${dim(match.description)}${tags}`;
+		}),
+	]);
+}
+
+/** What `load_skill` returned, for its renderer. */
+export interface LoadSkillDetails {
+	name: string;
+	description: string;
+	directory: string;
+	/** Lines in the skill's body. */
+	lines: number;
+}
+
+/** `● Load skill(security-review)`. */
+export function renderLoadSkillCall(args: { name?: string }, theme: Theme, state: CallState): Component {
+	return renderCallLine("Load skill", args.name || "...", "", theme, state);
+}
+
+/**
+ * `⎿  42 lines · Review code for security issues`. Expanded, the skill's directory and its body follow. The body is
+ * read back from the result text, which wraps it in a `<skill>` tag after one line of instructions.
+ */
+export function renderLoadSkillResult(
+	details: LoadSkillDetails | undefined,
+	text: string,
+	options: { expanded: boolean; isError: boolean; outputPad: number },
+	theme: Theme,
+): Component {
+	const pad = " ".repeat(options.outputPad);
+	const elbow = `${pad}  ${theme.fg("muted", "⎿")}  `;
+	if (!details || options.isError) {
+		return new SingleLines([elbow + theme.fg(options.isError ? "error" : "dim", text.split("\n")[0] ?? "")]);
+	}
+	const summary = new SingleLines([
+		`${elbow}${theme.fg("dim", `${details.lines} line${details.lines === 1 ? "" : "s"}`)}${details.description ? theme.fg("dim", ` · ${details.description}`) : ""}`,
+	]);
+	if (!options.expanded) return summary;
+	const body = /^<skill[^>]*>\n[^\n]*\n\n([\s\S]*)\n<\/skill>$/.exec(text)?.[1] ?? text;
+	const container = new Container();
+	container.addChild(summary);
+	container.addChild(new SingleLines([`${pad}     ${theme.fg("muted", shortenPath(details.directory))}`]));
+	container.addChild(new Spacer(1));
+	container.addChild(new Text(theme.fg("toolOutput", body), options.outputPad + 5, 0));
+	return container;
 }
 
 /**

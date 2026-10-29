@@ -1,12 +1,14 @@
 import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, JsonObject, JsonValue, ToolResultMessage } from "@earendil-works/pi-ai";
 import type { TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import type { ToolRenderers } from "../../../src/core/extensions/types.ts";
 import { KeybindingsManager } from "../../../src/core/keybindings.ts";
 import { ChatLog, type ChatLogEntry } from "../../../src/extensions/subagent/chat.ts";
 import { Subagent, type SubagentOptions } from "../../../src/extensions/subagent/child.ts";
 import { SubagentRegistry } from "../../../src/extensions/subagent/registry.ts";
+import { renderSkillSearchCall, renderSkillSearchResult } from "../../../src/extensions/subagent/render.ts";
 import { SlotPool } from "../../../src/extensions/subagent/slots.ts";
 import { AgentView, TranscriptScroll } from "../../../src/extensions/subagent/view.ts";
 import { initTheme, theme } from "../../../src/modes/interactive/theme/theme.ts";
@@ -94,6 +96,7 @@ function createView(
 		openId?: string;
 		isAwaitingReply?: (id: string) => boolean;
 		chatLog?: ChatLog;
+		toolRenderers?: ReadonlyMap<string, ToolRenderers>;
 	} = {},
 ) {
 	const registry = new SubagentRegistry();
@@ -112,6 +115,7 @@ function createView(
 		},
 		isAwaitingReply: options.isAwaitingReply,
 		chatLog: options.chatLog,
+		toolRenderers: options.toolRenderers,
 	});
 	const lines = () => view.render(80).map((line) => stripVTControlCharacters(line));
 	/** The list row marked as selected. */
@@ -368,6 +372,53 @@ describe("subagent agent view list", () => {
 		expect(screen.some((line) => line.trim() === "✓ delivered")).toBe(true);
 		expect(screen.some((line) => line.includes("╭─ worker → scout"))).toBe(true);
 		expect(screen.join("\n")).not.toContain("<agent_message");
+	});
+});
+
+describe("subagent agent view tool renderers", () => {
+	it("draws extension tools in a subagent's transcript with their renderers, and others as plain text", () => {
+		const subagent = createSubagent("rex", "Review auth");
+		const call = (id: string, name: string, args: JsonObject): AssistantMessage => ({
+			...assistant(""),
+			content: [{ type: "toolCall", id, name, arguments: args }],
+		});
+		const result = (id: string, name: string, text: string, details: JsonValue | undefined): ToolResultMessage => ({
+			role: "toolResult",
+			toolCallId: id,
+			toolName: name,
+			content: [{ type: "text", text }],
+			details,
+			isError: false,
+			timestamp: 0,
+		});
+		subagent.messages.push(
+			call("c1", "skill_search", { query: "auth" }),
+			result("c1", "skill_search", "- auth: Auth flows", {
+				matches: [{ name: "auth", description: "Auth flows", tags: [] }],
+				available: 1,
+				tags: [],
+			}),
+			call("c2", "other_tool", { x: 1 }),
+			result("c2", "other_tool", "plain output", undefined),
+		);
+		const skillSearch: ToolRenderers = {
+			renderShell: "self",
+			renderCall: (args, theme, context) => renderSkillSearchCall(args as { query?: string }, theme, context),
+			renderResult: (toolResult, { expanded }, theme, context) =>
+				renderSkillSearchResult(toolResult.details, "", { ...context, expanded }, theme),
+		};
+		const { view, lines } = createView([subagent], {
+			initialSelection: "rex",
+			toolRenderers: new Map([["skill_search", skillSearch]]),
+		});
+		view.handleInput(KEYS.enter);
+		const screen = lines().join("\n");
+
+		expect(screen).toContain("● Search skills(auth)");
+		expect(screen).toContain("⎿  1 match · auth");
+		expect(screen).not.toContain('skill_search query="auth"');
+		expect(screen).toContain("other_tool");
+		expect(screen).toContain("plain output");
 	});
 });
 

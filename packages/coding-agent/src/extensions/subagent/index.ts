@@ -18,7 +18,13 @@ import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-co
 import type { Message } from "@earendil-works/pi-ai";
 import { getKeybindings } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
-import type { ExtensionAPI, ExtensionContext, ExtensionFactory } from "../../core/extensions/types.ts";
+import {
+	defineTool,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type ExtensionFactory,
+	type ToolRenderers,
+} from "../../core/extensions/types.ts";
 import { stripFrontmatter } from "../../utils/frontmatter.ts";
 import { type AgentConfig, discoverAgents, findProjectSubagentsDir } from "./agents.ts";
 import {
@@ -55,6 +61,7 @@ import {
 	currentPhase,
 	getFinalOutput,
 	isFailedRun,
+	type LoadSkillDetails,
 	renderBackgroundNotice,
 	renderCallLine,
 	renderChatMessage,
@@ -62,10 +69,15 @@ import {
 	renderChatSendCall,
 	renderChatSendResult,
 	renderListResult,
+	renderLoadSkillCall,
+	renderLoadSkillResult,
+	renderSkillSearchCall,
+	renderSkillSearchResult,
 	renderSubagentCall,
 	renderSubagentResult,
 	renderWaitCall,
 	renderWaitResult,
+	type SkillSearchDetails,
 	type SubagentRunDetails,
 	type SubagentToolDetails,
 } from "./render.ts";
@@ -182,6 +194,16 @@ const ChatSendParams = Type.Object({
 });
 
 const ChatPeersParams = Type.Object({});
+
+const SkillSearchParams = Type.Object({
+	query: Type.Optional(Type.String({ description: "Words to match against skill names, descriptions, and tags" })),
+	tags: Type.Optional(Type.Array(Type.String(), { description: "Tags to match, such as php or symfony" })),
+	limit: Type.Optional(Type.Number({ description: `Maximum results. Default: ${DEFAULT_SKILL_SEARCH_LIMIT}` })),
+});
+
+const LoadSkillParams = Type.Object({
+	name: Type.String({ description: "Skill name, as returned by skill_search" }),
+});
 
 interface ChatToolDetails {
 	to: string;
@@ -437,6 +459,13 @@ export function createSubagentExtension(options: SubagentExtensionOptions = {}):
 export default createSubagentExtension();
 
 function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): void {
+	/** Renderers of this extension's tools, so the agent view draws them in subagent transcripts too. */
+	const toolRenderers = new Map<string, ToolRenderers>();
+	const registerTool: ExtensionAPI["registerTool"] = (tool) => {
+		// defineTool widens the generic definition to one that fits any tool's renderers.
+		toolRenderers.set(tool.name, defineTool(tool));
+		pi.registerTool(tool);
+	};
 	const registry = new SubagentRegistry();
 	/** Live state of a subagent instance, for rows of background launches and waits. */
 	const lookup = (key: string) => {
@@ -808,7 +837,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 	/** Whether a message's sender is still blocked waiting for its reply. Only the parent's hub knows. */
 	const isAwaitingReply = (id: string) => chatHub?.isAwaitingReply(id) === true;
 
-	pi.registerTool<typeof ChatSendParams, ChatToolDetails>({
+	registerTool<typeof ChatSendParams, ChatToolDetails>({
 		name: CHAT_SEND_TOOL_NAME,
 		label: "Chat Send",
 		description: [
@@ -870,7 +899,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		},
 	});
 
-	pi.registerTool<typeof ChatPeersParams, undefined>({
+	registerTool<typeof ChatPeersParams, undefined>({
 		name: CHAT_PEERS_TOOL_NAME,
 		label: "Chat Peers",
 		description:
@@ -888,12 +917,16 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		},
 
 		renderCall(_args, theme, context) {
-			return renderCallLine("Peers", undefined, "", theme, context);
+			return renderCallLine("List chat peers", undefined, "", theme, context);
 		},
 
-		renderResult(result, _options, theme, context) {
+		renderResult(result, { expanded }, theme, context) {
 			const first = result.content[0];
-			return renderChatPeersResult(first?.type === "text" ? first.text : "", context.outputPad, theme);
+			return renderChatPeersResult(
+				first?.type === "text" ? first.text : "",
+				{ expanded, outputPad: context.outputPad },
+				theme,
+			);
 		},
 	});
 
@@ -908,25 +941,22 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		description: "Skill groups served by skill_search and load_skill (set by the parent in subagent processes)",
 	});
 
-	pi.registerTool({
+	registerTool<typeof SkillSearchParams, SkillSearchDetails | undefined>({
 		name: SKILL_SEARCH_TOOL_NAME,
 		label: "Skill Search",
 		description:
 			"Search the skills available to you by query and tags. Returns each match's name, description, and tags. Call it with no query to list every skill, then load a match with load_skill.",
-		parameters: Type.Object({
-			query: Type.Optional(
-				Type.String({ description: "Words to match against skill names, descriptions, and tags" }),
-			),
-			tags: Type.Optional(Type.Array(Type.String(), { description: "Tags to match, such as php or symfony" })),
-			limit: Type.Optional(Type.Number({ description: `Maximum results. Default: ${DEFAULT_SKILL_SEARCH_LIMIT}` })),
-		}),
+		parameters: SkillSearchParams,
 		defaultActive: false,
+		renderShell: "self",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const catalog = loadChildCatalog(pi, ctx);
 			if (catalog.skills.length === 0) {
-				return { content: [{ type: "text", text: "No skills are available to this agent." }], details: undefined };
+				const details = { matches: [], available: 0, tags: [] };
+				return { content: [{ type: "text", text: "No skills are available to this agent." }], details };
 			}
 			const matches = searchSkills(catalog.skills, params.query, params.tags, params.limit);
+			const tags = listSkillTags(catalog.skills);
 			const text =
 				matches.length > 0
 					? `${matches
@@ -935,17 +965,32 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 								return `- ${match.name}: ${match.description}${tags}`;
 							})
 							.join("\n")}\n\nRead a skill with ${LOAD_SKILL_TOOL_NAME}.`
-					: `No skills matched. Available tags: ${listSkillTags(catalog.skills).join(", ") || "none"}.`;
-			return { content: [{ type: "text", text }], details: undefined };
+					: `No skills matched. Available tags: ${tags.join(", ") || "none"}.`;
+			return { content: [{ type: "text", text }], details: { matches, available: catalog.skills.length, tags } };
+		},
+
+		renderCall(args, theme, context) {
+			return renderSkillSearchCall(args, theme, context);
+		},
+
+		renderResult(result, { expanded }, theme, context) {
+			const first = result.content[0];
+			return renderSkillSearchResult(
+				result.details,
+				first?.type === "text" ? first.text : "",
+				{ expanded, isError: context.isError, outputPad: context.outputPad },
+				theme,
+			);
 		},
 	});
 
-	pi.registerTool({
+	registerTool<typeof LoadSkillParams, LoadSkillDetails | undefined>({
 		name: LOAD_SKILL_TOOL_NAME,
 		label: "Load Skill",
 		description: "Read the instructions of a skill found with skill_search.",
-		parameters: Type.Object({ name: Type.String({ description: "Skill name, as returned by skill_search" }) }),
+		parameters: LoadSkillParams,
 		defaultActive: false,
+		renderShell: "self",
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const skill = loadChildCatalog(pi, ctx).skills.find((candidate) => candidate.name === params.name);
 			if (!skill) {
@@ -959,11 +1004,31 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 			}
 			const body = stripFrontmatter(readFileSync(skill.filePath, "utf-8")).trim();
 			const text = `<skill name="${skill.name}" directory="${skill.baseDir}">\nResolve relative paths in this skill against its directory.\n\n${body}\n</skill>`;
-			return { content: [{ type: "text", text }], details: undefined };
+			const details = {
+				name: skill.name,
+				description: skill.description,
+				directory: skill.baseDir,
+				lines: body.split("\n").length,
+			};
+			return { content: [{ type: "text", text }], details };
+		},
+
+		renderCall(args, theme, context) {
+			return renderLoadSkillCall(args, theme, context);
+		},
+
+		renderResult(result, { expanded }, theme, context) {
+			const first = result.content[0];
+			return renderLoadSkillResult(
+				result.details,
+				first?.type === "text" ? first.text : "",
+				{ expanded, isError: context.isError, outputPad: context.outputPad },
+				theme,
+			);
 		},
 	});
 
-	pi.registerTool<typeof SubagentParams, SubagentToolDetails>({
+	registerTool<typeof SubagentParams, SubagentToolDetails>({
 		name: "subagent",
 		label: "Subagent",
 		description: [
@@ -1163,7 +1228,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		return lines.join("\n");
 	};
 
-	pi.registerTool<typeof WaitParams, SubagentToolDetails>({
+	registerTool<typeof WaitParams, SubagentToolDetails>({
 		name: SUBAGENT_WAIT_TOOL_NAME,
 		label: "Subagent Wait",
 		description: [
@@ -1306,7 +1371,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		},
 	});
 
-	pi.registerTool<typeof ResultParams, SubagentToolDetails>({
+	registerTool<typeof ResultParams, SubagentToolDetails>({
 		name: SUBAGENT_RESULT_TOOL_NAME,
 		label: "Subagent Result",
 		description: [
@@ -1374,7 +1439,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		},
 	});
 
-	pi.registerTool<typeof ListParams, SubagentToolDetails>({
+	registerTool<typeof ListParams, SubagentToolDetails>({
 		name: SUBAGENT_LIST_TOOL_NAME,
 		label: "Subagent List",
 		description: [
@@ -1453,7 +1518,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		}
 	};
 
-	pi.registerTool<typeof ControlParams, SubagentToolDetails>({
+	registerTool<typeof ControlParams, SubagentToolDetails>({
 		name: SUBAGENT_CONTROL_TOOL_NAME,
 		label: "Subagent Control",
 		description: [
@@ -1611,6 +1676,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 							},
 							isAwaitingReply,
 							chatLog,
+							toolRenderers,
 							close: () => done(undefined),
 						}),
 					{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left" } },

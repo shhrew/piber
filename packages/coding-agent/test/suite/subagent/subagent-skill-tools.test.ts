@@ -64,6 +64,13 @@ describe("subagent skill tools", () => {
 		expect(getMessageText(load)).toContain("Use autowiring.");
 		expect(getMessageText(load)).toContain(join(harness.tempDir, ".pi", "subagents", "skills", "php", "symfony"));
 		expect(getMessageText(load)).not.toContain("tags:");
+		// The bundled review group adds its own skills and tags.
+		expect(search.details).toMatchObject({
+			matches: [{ name: "symfony", description: "Symfony services", tags: ["php", "symfony"] }],
+			tags: expect.arrayContaining(["php", "symfony", "review"]),
+		});
+		expect(outsideSearch.details).toMatchObject({ matches: [], available: 3 });
+		expect(load.details).toMatchObject({ name: "symfony", description: "Symfony services", lines: 1 });
 		expect(outsideLoad.isError).toBe(true);
 		expect(getMessageText(outsideLoad)).toContain('Skill "kubernetes" is not available.');
 	});

@@ -371,13 +371,13 @@ describe("wait rendering", () => {
 
 	it("shows only the call line when waiting for all or any subagents", () => {
 		expect(plain(renderWaitCall({}, theme, waiting).render(100))).toEqual([
-			" ● Wait(all) · waiting for subagents to finish",
+			" ● Waiting(all) · waiting for subagents to finish",
 		]);
 		expect(plain(renderWaitCall({ returnOnFirst: true }, theme, waiting).render(100))).toEqual([
-			" ● Wait(any) · waiting for a subagent to finish",
+			" ● Waiting(any) · waiting for a subagent to finish",
 		]);
 		expect(plain(renderWaitCall({}, theme, { ...waiting, isPartial: false }).render(100))).toEqual([
-			" ● Wait(all) · done waiting",
+			" ● Waiting(all) · done waiting",
 		]);
 		expect(renderWaitResult({ returnOnFirst: true }, details, "", options, theme).render(100)).toEqual([]);
 	});
@@ -386,10 +386,10 @@ describe("wait rendering", () => {
 		const several = plain(
 			renderWaitCall({ names: ["scout-a", "scout-b"], returnOnFirst: true }, theme, waiting).render(100),
 		);
-		expect(several).toEqual([" ● Wait(any) · waiting for a subagent to finish"]);
+		expect(several).toEqual([" ● Waiting(any) · waiting for a subagent to finish"]);
 
 		const one = plain(renderWaitCall({ names: ["scout-a"], returnOnFirst: true }, theme, waiting).render(100));
-		expect(one).toEqual([" ● Wait(scout-a) · waiting for it to finish"]);
+		expect(one).toEqual([" ● Waiting(scout-a) · waiting for it to finish"]);
 		expect(renderWaitResult({ names: ["a"] }, details, "", options, theme).render(100)).toEqual([]);
 	});
 

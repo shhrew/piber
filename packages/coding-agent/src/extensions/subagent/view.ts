@@ -29,6 +29,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import type { ToolRenderers } from "../../core/extensions/types.ts";
 import { allToolNames, createToolDefinition, type ToolName } from "../../core/tools/index.ts";
 import { AssistantMessageComponent } from "../../modes/interactive/components/assistant-message.ts";
 import { ToolExecutionComponent } from "../../modes/interactive/components/tool-execution.ts";
@@ -138,6 +139,8 @@ export interface AgentViewOptions {
 	isAwaitingReply?: (id: string) => boolean;
 	/** The session's chat messages, for the Chat tab. */
 	chatLog?: ChatLog;
+	/** Renderers of extension tools by name. Built-in tools use their own; others fall back to plain text. */
+	toolRenderers?: ReadonlyMap<string, ToolRenderers>;
 }
 
 function userText(message: Extract<Message, { role: "user" }>): string {
@@ -160,6 +163,7 @@ export class AgentView implements Component {
 	private readonly scrollbar: ScrollViewScrollbar;
 	private readonly scroll = new TranscriptScroll();
 	private readonly chatLog: ChatLog | undefined;
+	private readonly toolRenderers: ReadonlyMap<string, ToolRenderers> | undefined;
 	private readonly chatScroll = new TranscriptScroll();
 	private tab: Tab = "agents";
 	private scrollbarTimer: NodeJS.Timeout | undefined;
@@ -198,6 +202,7 @@ export class AgentView implements Component {
 		this.input.focused = true;
 		this.input.onSubmit = (value) => this.submit(value);
 		this.chatLog = options.chatLog;
+		this.toolRenderers = options.toolRenderers;
 		const stopRegistry = registry.onChange(() => this.tui.requestRender());
 		const stopChat = this.chatLog?.onChange(() => this.tui.requestRender());
 		this.unsubscribe = () => {
@@ -614,9 +619,11 @@ export class AgentView implements Component {
 						chatSends.set(part.id, to);
 						continue;
 					}
-					const definition = allToolNames.has(part.name as ToolName)
-						? createToolDefinition(part.name as ToolName, this.cwd)
-						: undefined;
+					const definition =
+						this.toolRenderers?.get(part.name) ??
+						(allToolNames.has(part.name as ToolName)
+							? createToolDefinition(part.name as ToolName, this.cwd)
+							: undefined);
 					const component = new ToolExecutionComponent(
 						part.name,
 						part.id,

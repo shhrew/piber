@@ -13,6 +13,7 @@ usage() {
   echo "  chat    Subagent chat: subagent to subagent, reply waits, orchestrator replies, held messages, broadcast"
   echo "  skills  Skill search: listing, query and tag ranking, no match, load_skill, tool gating, extraSkillGroups"
   echo "  control Subagent control: start now, pause, resume, terminate, handback, held chat for paused subagents"
+  echo "  render  Tool rendering: chat_peers, skill_search, load_skill in the main session and the agent view"
 }
 
 chat_prompt() {
@@ -106,6 +107,41 @@ This is a manual test of subagent_control. It assumes the default maxConcurrent 
 EOF
 }
 
+render_prompt() {
+  cat <<'EOF'
+This is a manual test of how tool calls are drawn. A human checks the screen; you only make the calls. Follow these steps exactly. Do not edit any files, and tell every subagent not to edit files either.
+
+1. Call chat_peers. No subagents exist yet.
+2. In ONE `subagent` call with `background: true`, start these three subagents in parallel:
+   - `reviewer`, name "rex", task: Do not edit files and do not review any code. Make these calls in order, then finish with "rex done":
+     a. skill_search with no arguments
+     b. skill_search with query "path traversal", tags ["security"], and limit 3
+     c. skill_search with query "kubernetes"
+     d. load_skill with name "security-review"
+     e. load_skill with name "does-not-exist"
+     f. chat_peers
+   - `worker`, name "wendy", task: Do not edit files. Run `sleep 45` with bash, then finish with "wendy done".
+   - `scout`, name "quick", task: Do not edit files and do not call any tool. Finish with "quick done".
+3. Call chat_peers again right away.
+4. Call subagent_wait with names ["quick"], then call chat_peers once more.
+5. Call subagent_wait with no names until every subagent has finished.
+6. Finally, print this checklist verbatim for the human tester, and nothing else:
+
+Main session (click a tool call or press the expand key to expand it):
+- [ ] step 1 chat_peers: `⎿  No other subagents yet`
+- [ ] step 3 chat_peers: `⎿  ● rex · ● wendy · ● quick · all`; expanded, one row each with description, agent, and state
+- [ ] step 4 chat_peers: quick shows `○` (finished)
+Agent view (open rex):
+- [ ] a: `● Search skills(all)` then `⎿  2 matches · review-checklist, security-review`; expanded, rows with description and #tags
+- [ ] b: `● Search skills(path traversal) #security · up to 3`, security-review first
+- [ ] c: `● Search skills(kubernetes)` then `⎿  No match · try #quality #review #security #tests`
+- [ ] d: `● Load skill(security-review)` then `⎿  N lines · <description>`; expanded, the skill directory and body
+- [ ] e: red bullet, `⎿  Skill "does-not-exist" is not available. Use skill_search.` in red
+- [ ] f: `● List chat peers` then `⎿  orchestrator`
+- [ ] no tool call in rex or wendy is drawn as a green text block
+EOF
+}
+
 if [[ $# -lt 1 ]]; then
   usage
   exit 1
@@ -123,6 +159,9 @@ case "$SCENARIO" in
     ;;
   control)
     PROMPT="$(control_prompt)"
+    ;;
+  render)
+    PROMPT="$(render_prompt)"
     ;;
   -h | --help)
     usage

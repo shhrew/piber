@@ -98,7 +98,7 @@ Four tools manage background subagents:
 
 | Tool | Parameters | Returns |
 |---|---|---|
-| `subagent_wait` | `names` (optional), `returnOnFirst` (optional, default `false`) | Each target's status once all of them have finished, or, with `returnOnFirst`, once the first has. Without `names`, it waits for every subagent still running or queued, including later chain steps. A chat message to the orchestrator ends the wait early, with the targets' status; the message follows the result, and the orchestrator can answer it, change direction, or call `subagent_wait` again. The chat shows `Wait(all)` or `Wait(any)`. |
+| `subagent_wait` | `names` (optional), `returnOnFirst` (optional, default `false`) | Each target's status once all of them have finished, or, with `returnOnFirst`, once the first has. Without `names`, it waits for every subagent still running or queued, including later chain steps. A chat message to the orchestrator ends the wait early, with the targets' status; the message follows the result, and the orchestrator can answer it, change direction, or call `subagent_wait` again. The chat shows `Waiting(all)` or `Waiting(any)`. |
 | `subagent_result` | `names` (one or more) | Each finished subagent's final answer, or its error, capped at 50 KB each. Running and queued subagents have no result yet; a call that returns no result at all is an error, so the orchestrator notices it asked too early. |
 | `subagent_list` | none | Every subagent in the session: running, queued (waiting for a free slot), paused, or finished, with whether its result has been read. |
 | `subagent_control` | `action`, `names`, `message` (optional) | Pause, resume, start now, terminate, or ask for a handback (see [Controlling subagents](#controlling-subagents)). |
@@ -130,7 +130,7 @@ When a background subagent finishes and no wait or result call has reported it, 
 
 While the orchestrator is working, notices are held until its run settles. A message posted mid-run would only be delivered at the end of the run, after the orchestrator may already have read those results; holding it lets the extension drop subagents that a wait or result call reported in the meantime, and post nothing if none are left.
 
-In the chat, a background call's rows keep updating after the call returns. A wait for all or any subagents shows only its call line (`● Wait(all) · waiting for a subagent to finish`); a wait for two or more named subagents shows the mode and adds one row each with the name and description while it waits; a wait for one subagent names it on the call line (`● Wait(scout-a) · waiting for it to finish`). A finished wait is always a single line, such as `● Wait(any) · done waiting`. Background subagents stop when the session ends; after a resume, their rows show `Started in background`.
+In the chat, a background call's rows keep updating after the call returns. A wait for all or any subagents shows only its call line (`● Waiting(all) · waiting for a subagent to finish`); a wait for two or more named subagents shows the mode and adds one row each with the name and description while it waits; a wait for one subagent names it on the call line (`● Waiting(scout-a) · waiting for it to finish`). A finished wait is always a single line, such as `● Waiting(any) · done waiting`. Background subagents stop when the session ends; after a resume, their rows show `Started in background`.
 
 ## Chat
 
@@ -233,6 +233,19 @@ The main chat shows each `subagent` call as a compact line with one status row p
 ```
 
 The bullet turns green when the call succeeds and red when it fails. A running row shows only a phase, as in the dock: `Thinking`, `Responding`, or `Working`. Clicking the call or pressing Ctrl+O adds the latest command each subagent ran (`→ read a.txt`) under its row. A subagent's task, session, and output are in the agent view.
+
+The chat and skill tools are drawn the same way, with their arguments on the call line and a one-line summary below. Expanding one shows a row per peer or match, or a loaded skill's directory and body.
+
+```
+● List chat peers
+  ⎿  orchestrator · ● scout-a · ◷ scout-b · ○ worker · all
+● Search skills(path traversal) #security
+  ⎿  1 match · security-review
+● Load skill(security-review)
+  ⎿  38 lines · Review code for security issues
+```
+
+Peers are marked `●` running, `◷` queued, `‖` paused, and `○` finished. The agent view draws these tools the same way in subagent transcripts.
 
 ### Dock
 
