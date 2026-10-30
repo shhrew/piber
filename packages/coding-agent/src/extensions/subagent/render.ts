@@ -463,6 +463,7 @@ export function renderWaitResult(
 
 interface ChatSendArgs {
 	to?: string;
+	replyTo?: number | string;
 	text?: string;
 	waitForReply?: boolean;
 }
@@ -477,11 +478,11 @@ function bubbleBounds(width: number, pad: number): { room: number; maxWidth: num
 }
 
 export interface ChatBubbleSpec {
-	/** `in` for a received message, drawn on the left; `out` for a sent one, drawn on the right. */
+	/** `in` for a received message, drawn on the right; `out` for a sent one, drawn on the left. */
 	direction: "in" | "out";
 	/** The other agent: the sender of a received message, the recipient of a sent one. */
 	peer: string;
-	/** The agent whose transcript this is, or `all` for a received broadcast. */
+	/** The agent whose transcript this is, or `all` for a received broadcast. Drawn first in the label. */
 	self: string;
 	text: string;
 	/** Text set into the bottom border, such as `waiting for your reply`. */
@@ -494,13 +495,13 @@ export interface ChatBubbleSpec {
 }
 
 /**
- * A chat message in a rounded box: received ones on the left, sent ones on the right. The current agent is always
- * on the right of the label, so the arrow shows the direction:
+ * A chat message in a rounded box: sent ones on the left, received ones on the right. The current agent is always
+ * first in the label, so the arrow points from sender to recipient:
  *
- *     ╭─ scout-a → orchestrator ──────────────╮
+ *     ╭─ orchestrator → scout-a ──────────────╮
  *     │ Is the session token cached anywhere? │
- *     ╰────────────── waiting for your reply ─╯
- *                             ╭─ scout-a ← orchestrator ─╮
+ *     ╰───────────────── waiting for a reply ─╯
+ *                             ╭─ orchestrator ← scout-a ─╮
  *                             │ Yes, in src/cache.ts     │
  *                             ╰──────────────────────────╯
  */
@@ -521,8 +522,8 @@ export class ChatBubble implements Component {
 		const color = spec.color ?? (spec.direction === "in" ? "borderMuted" : "borderAccent");
 		const border = (text: string) => theme.fg(color, text);
 		const name = (agent: string) => (agent === BROADCAST ? "everyone" : agent);
-		const arrow = spec.direction === "in" ? "→" : "←";
-		const label = `${theme.fg("accent", theme.bold(name(spec.peer)))} ${theme.fg("muted", `${arrow} ${name(spec.self)}`)}`;
+		const arrow = spec.direction === "in" ? "←" : "→";
+		const label = `${theme.fg("muted", `${name(spec.self)} ${arrow}`)} ${theme.fg("accent", theme.bold(name(spec.peer)))}`;
 		const maxInner = maxWidth - 4;
 		let lines = wrapTextWithAnsi(spec.text.replace(/\t/g, "  ").trim(), Math.max(1, maxInner));
 		if (!spec.expanded && lines.length > CHAT_PREVIEW_LINES) {
@@ -543,14 +544,14 @@ export class ChatBubble implements Component {
 		const bottom = footer
 			? border(`╰${"─".repeat(inner - 1 - visibleWidth(footer))} ${footer} ─╯`)
 			: border(`╰${"─".repeat(inner + 2)}╯`);
-		const indent = " ".repeat(spec.pad + (spec.direction === "out" ? room - (inner + 4) : 0));
+		const indent = " ".repeat(spec.pad + (spec.direction === "in" ? room - (inner + 4) : 0));
 		return [top, ...body, bottom].map((line) => indent + line);
 	}
 
 	invalidate(): void {}
 }
 
-/** Lines flush with the right edge of sent bubbles, for a send's outcome. */
+/** Lines flush with the left edge of sent bubbles, for a send's outcome. */
 class SentStatus implements Component {
 	private readonly text: string;
 	private readonly pad: number;
@@ -561,32 +562,38 @@ class SentStatus implements Component {
 	}
 
 	render(width: number): string[] {
-		const { room, maxWidth } = bubbleBounds(width, this.pad);
-		return wrapTextWithAnsi(this.text, maxWidth).map(
-			(line) => " ".repeat(this.pad + Math.max(0, room - visibleWidth(line))) + line,
-		);
+		const { maxWidth } = bubbleBounds(width, this.pad);
+		return wrapTextWithAnsi(this.text, maxWidth).map((line) => " ".repeat(this.pad) + line);
 	}
 
 	invalidate(): void {}
 }
 
-/** A sent message as a bubble on the right, with `waiting for a reply` in its border while a reply wait runs. */
+/**
+ * A sent message as a bubble on the left, with `waiting for a reply` in its border while a reply wait runs.
+ * `recipient` names the agent a reply sent with `replyTo` only goes to; it is read on every render, since the
+ * result that resolves it can arrive after the call is drawn.
+ */
 export function renderChatSendCall(
 	args: ChatSendArgs,
 	theme: Theme,
-	state: CallState & { expanded: boolean; self: string },
+	state: CallState & { expanded: boolean; self: string; recipient?: () => string | undefined },
 ): Component {
+	const footer = [
+		args.replyTo !== undefined ? `reply to #${args.replyTo}` : undefined,
+		args.waitForReply && state.isPartial ? "waiting for a reply" : undefined,
+	].filter(Boolean);
 	return new ChatBubble(
-		{
+		() => ({
 			direction: "out",
-			peer: args.to ?? "...",
+			peer: args.to ?? state.recipient?.() ?? "...",
 			self: state.self,
 			text: args.text ?? "",
-			footer: args.waitForReply && state.isPartial ? "waiting for a reply" : undefined,
+			footer: footer.join(" · ") || undefined,
 			color: state.isError ? "error" : undefined,
 			expanded: state.expanded,
 			pad: state.outputPad,
-		},
+		}),
 		theme,
 	);
 }
@@ -595,14 +602,17 @@ export function renderChatSendCall(
 export interface ChatSendOutcome {
 	text: string;
 	outcome?: SendOutcome;
+	/** The id the hub gave the sent message. */
+	messageId?: string;
 	/** The reply, or the message that ended the wait. */
 	message?: ChatDelivery;
 }
 
-/** `✓ delivered`, `◷ held until worker starts`, `✗ not sent: …`: how a send ended, under its bubble. */
+/** `✓ #4 delivered`, `◷ #4 held until worker starts`, `✗ not sent: …`: how a send ended, under its bubble. */
 function sendStatus(result: ChatSendOutcome, to: string, isError: boolean, theme: Theme): string {
+	const id = result.messageId ? `#${result.messageId} ` : "";
 	const status = (icon: string, color: ThemeColor, text: string) =>
-		`${theme.fg(color, icon)} ${theme.fg("dim", text)}`;
+		`${theme.fg(color, icon)} ${theme.fg("dim", id + text)}`;
 	switch (result.outcome) {
 		case "delivered":
 		case "reply":
@@ -610,7 +620,7 @@ function sendStatus(result: ChatSendOutcome, to: string, isError: boolean, theme
 		case "held":
 			return status("◷", "muted", `held until ${to} starts`);
 		case "broadcast":
-			return status("✓", "success", result.text.replace(/^Sent to everyone: /, "").replace(/\.$/, ""));
+			return status("✓", "success", result.text.replace(/^.*? sent to everyone: /, "").replace(/\.$/, ""));
 		case "interrupted":
 			return status(
 				"✓",
@@ -629,7 +639,7 @@ function sendStatus(result: ChatSendOutcome, to: string, isError: boolean, theme
 }
 
 /**
- * The send's outcome on the right, under the sent bubble; then, when the wait returned a message (the reply, or
+ * The send's outcome under the sent bubble, on the left; then, when the wait returned a message (the reply, or
  * one that ended the wait), that message as a received bubble.
  */
 export function renderChatSendResult(
@@ -812,7 +822,7 @@ export function renderLoadSkillResult(
 }
 
 /**
- * A received message as a bubble on the left. When the sender is waiting for a reply, the border says so: in the
+ * A received message as a bubble on the right. When the sender is waiting for a reply, the border says so: in the
  * warning color while the sender is still blocked, as `isAwaitingReply` reports, dim once it no longer is.
  */
 export function renderChatMessage(
@@ -822,12 +832,17 @@ export function renderChatMessage(
 ): Component {
 	return new ChatBubble(() => {
 		const waiting = delivery.awaitingReply && options.isAwaitingReply?.(delivery.id) === true;
+		const footer = [
+			delivery.id ? `#${delivery.id}` : undefined,
+			delivery.replyTo ? `reply to #${delivery.replyTo}` : undefined,
+			waiting ? "waiting for your reply" : delivery.awaitingReply ? "asked for a reply" : undefined,
+		].filter(Boolean);
 		return {
 			direction: "in",
 			peer: delivery.from,
 			self: delivery.to === BROADCAST ? BROADCAST : options.self,
 			text: delivery.text,
-			footer: waiting ? "waiting for your reply" : delivery.awaitingReply ? "asked for a reply" : undefined,
+			footer: footer.join(" · ") || undefined,
 			color: waiting ? "warning" : undefined,
 			expanded: options.expanded,
 			pad: options.outputPad,

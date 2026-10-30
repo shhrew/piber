@@ -44,7 +44,7 @@ describe("chat permissions and prompts", () => {
 
 	it("frames messages so the recipient knows the user did not write them", () => {
 		const delivery: ChatDelivery = {
-			id: "m1",
+			id: "1",
 			from: "scout-a",
 			to: "worker",
 			text: "Found it in src/a.ts",
@@ -52,19 +52,26 @@ describe("chat permissions and prompts", () => {
 		};
 		expect(frameMessage(delivery)).toBe(
 			[
-				'<agent_message from="scout-a" to="you" awaiting_reply="true">',
+				'<agent_message id="1" from="scout-a" to="you" awaiting_reply="true">',
 				"Found it in src/a.ts",
 				"</agent_message>",
-				'scout-a is blocked waiting for your reply: answer now with chat_send to "scout-a", even if only to say you got it.',
+				"scout-a is blocked waiting for your reply: answer now with chat_send replyTo 1, even if only to say you got it.",
 			].join("\n"),
 		);
-		const broadcast = { id: "m2", from: ORCHESTRATOR, to: "all", text: "Stop editing a.ts", awaitingReply: false };
+		const broadcast = {
+			id: "2",
+			from: ORCHESTRATOR,
+			to: "all",
+			text: "Stop editing a.ts",
+			awaitingReply: false,
+			replyTo: "1",
+		};
 		expect(frameMessage(broadcast)).toBe(
 			[
-				'<agent_message from="orchestrator" to="all" awaiting_reply="false">',
+				'<agent_message id="2" from="orchestrator" to="all" reply_to="1" awaiting_reply="false">',
 				"Stop editing a.ts",
 				"</agent_message>",
-				"Reply with chat_send only if it is needed.",
+				"Reply with chat_send replyTo 2 only if it is needed.",
 			].join("\n"),
 		);
 	});
@@ -144,12 +151,14 @@ describe("chat hub", () => {
 
 		expect(await scout.client.send({ to: "worker", text: "Use src/auth.ts" })).toEqual({
 			ok: true,
-			text: "Delivered to worker.",
+			text: "Message 1 delivered to worker.",
 			outcome: "delivered",
+			messageId: "1",
+			to: "worker",
 		});
 		await vi.waitFor(() =>
 			expect(worker.inbox).toEqual([
-				{ id: expect.any(String), from: "scout", to: "worker", text: "Use src/auth.ts", awaitingReply: false },
+				{ id: "1", from: "scout", to: "worker", text: "Use src/auth.ts", awaitingReply: false },
 			]),
 		);
 		expect(await worker.client.send({ to: "orchestrator", text: "Blocked on config" })).toMatchObject({ ok: true });
@@ -178,8 +187,10 @@ describe("chat hub", () => {
 		expect((await scout.client.send({ to: "all", text: "x" })).text).toBe("You are not allowed to message everyone.");
 		expect(await hub.send(ORCHESTRATOR, { to: "worker", text: "Carry on" })).toEqual({
 			ok: true,
-			text: "Delivered to worker.",
+			text: "Message 3 delivered to worker.",
 			outcome: "delivered",
+			messageId: "3",
+			to: "worker",
 		});
 	});
 
@@ -188,7 +199,7 @@ describe("chat hub", () => {
 		const later = join("later", ["orchestrator"], "queued");
 
 		expect((await hub.send(ORCHESTRATOR, { to: "later", text: "Start with a.ts" })).text).toBe(
-			"Held for later, which has not started yet; it gets the message when it starts.",
+			"Message 1 held for later, which has not started yet; it gets the message when it starts.",
 		);
 
 		peers.get("later")!.state = "running";
@@ -212,8 +223,10 @@ describe("chat hub", () => {
 
 		expect(await lead.client.send({ to: "all", text: "Switching to plan B" })).toEqual({
 			ok: true,
-			text: "Sent to everyone: 2 delivered, 1 held until they start.",
+			text: "Message 1 sent to everyone: 2 delivered, 1 held until they start.",
 			outcome: "broadcast",
+			messageId: "1",
+			to: "all",
 		});
 		await vi.waitFor(() => expect(helper.inbox.map((delivery) => delivery.to)).toEqual(["all"]));
 		expect(toOrchestrator.map((delivery) => delivery.from)).toEqual(["lead"]);
@@ -221,7 +234,7 @@ describe("chat hub", () => {
 			'waitForReply cannot be used with to: "all".',
 		);
 		expect((await hub.send(ORCHESTRATOR, { to: "all", text: "Wrap up" })).text).toBe(
-			"Sent to everyone: 2 delivered, 1 held until they start.",
+			"Message 2 sent to everyone: 2 delivered, 1 held until they start.",
 		);
 	});
 
@@ -314,7 +327,7 @@ describe("waiting for replies", () => {
 
 		expect(await asking).toMatchObject({
 			ok: true,
-			text: "answerer replied:\nsrc/auth.ts",
+			text: "answerer replied with message 2:\nsrc/auth.ts",
 			outcome: "reply",
 			message: { from: "answerer", text: "src/auth.ts" },
 		});
@@ -334,7 +347,7 @@ describe("waiting for replies", () => {
 		);
 
 		const result = await asking;
-		expect(result.text).toContain("While you waited for slow, other messaged you:\nStop: a.ts is mine");
+		expect(result.text).toContain("While you waited for slow, other sent you message 2:\nStop: a.ts is mine");
 		expect(result.text).toContain("You stopped waiting for slow; its reply will arrive as a chat message.");
 		await new Promise((resolve) => setTimeout(resolve, 100));
 		expect(asker.inbox).toEqual([]);
@@ -350,9 +363,9 @@ describe("waiting for replies", () => {
 		const bWaits = b.client.send({ to: "a", text: "Done with y?", waitForReply: true });
 
 		// b's question ends a's wait as its reply; b then waits until a answers.
-		expect((await aWaits).text).toBe("b replied:\nDone with y?");
+		expect((await aWaits).text).toBe("b replied with message 2:\nDone with y?");
 		await a.client.send({ to: "b", text: "Yes" });
-		expect((await bWaits).text).toBe("a replied:\nYes");
+		expect((await bWaits).text).toBe("a replied with message 3:\nYes");
 	});
 
 	it("times out, and a later reply then arrives as a normal message", async () => {
@@ -361,7 +374,9 @@ describe("waiting for replies", () => {
 		const quiet = await join("quiet", ["subagents"]).connect();
 
 		const result = await asker.client.send({ to: "quiet", text: "Anyone?", waitForReply: true, timeoutSeconds: 1 });
-		expect(result.text).toBe("Sent to quiet. No reply within 1 s; a later reply will arrive as a chat message.");
+		expect(result.text).toBe(
+			"Message 1 sent to quiet. No reply within 1 s; a later reply will arrive as a chat message.",
+		);
 
 		await quiet.client.send({ to: "asker", text: "Late answer" });
 		await vi.waitFor(() => expect(asker.inbox.map((delivery) => delivery.text)).toEqual(["Late answer"]));
@@ -377,7 +392,84 @@ describe("waiting for replies", () => {
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		controller.abort();
 
-		expect(await asking).toEqual({ ok: false, text: "Stopped waiting for a reply.", outcome: "stopped" });
+		expect(await asking).toEqual({
+			ok: false,
+			text: "Stopped waiting for a reply.",
+			outcome: "stopped",
+			messageId: "1",
+			to: "quiet",
+		});
+	});
+});
+
+describe("replying to a message by id", () => {
+	it("sends a reply to the original sender, and it ends that sender's wait", async () => {
+		const { join } = createHub();
+		const asker = await join("asker", ["subagents"]).connect();
+		const answerer = await join("answerer", ["subagents"]).connect();
+
+		const asking = asker.client.send({ to: "answerer", text: "Which file?", waitForReply: true });
+		await vi.waitFor(() => expect(answerer.inbox).toHaveLength(1));
+		expect(await answerer.client.send({ replyTo: "1", text: "src/auth.ts" })).toMatchObject({
+			ok: true,
+			text: "Message 2 delivered to asker.",
+			to: "asker",
+		});
+
+		expect(await asking).toMatchObject({
+			outcome: "reply",
+			text: "answerer replied with message 2:\nsrc/auth.ts",
+			message: { id: "2", from: "answerer", to: "asker", replyTo: "1" },
+		});
+	});
+
+	it("does not take a reply to another message as the awaited reply", async () => {
+		const { join } = createHub();
+		const asker = await join("asker", ["subagents"]).connect();
+		const answerer = await join("answerer", ["subagents"]).connect();
+
+		await asker.client.send({ to: "answerer", text: "First question" });
+		const asking = asker.client.send({ to: "answerer", text: "Second question", waitForReply: true });
+		await vi.waitFor(() => expect(answerer.inbox).toHaveLength(2));
+		await answerer.client.send({ replyTo: "1", text: "Answer to the first" });
+
+		const result = await asking;
+		expect(result.outcome).toBe("interrupted");
+		expect(result.text).toContain(
+			"While you waited for answerer, answerer sent you message 3, replying to message 1:\nAnswer to the first",
+		);
+	});
+
+	it("replies to a broadcast go to its sender only", async () => {
+		const { hub, join, toOrchestrator } = createHub();
+		const helper = await join("helper", ["orchestrator"]).connect();
+		await hub.send(ORCHESTRATOR, { to: "all", text: "Who owns a.ts?" });
+		await vi.waitFor(() => expect(helper.inbox).toHaveLength(1));
+
+		expect((await helper.client.send({ replyTo: "1", text: "I do" })).ok).toBe(true);
+		expect(toOrchestrator).toEqual([
+			{ id: "2", from: "helper", to: "orchestrator", text: "I do", awaitingReply: false, replyTo: "1" },
+		]);
+	});
+
+	it("refuses unknown ids, messages not sent to the replier, other recipients, and no recipient", async () => {
+		const { hub, join } = createHub();
+		const scout = await join("scout", ["all"]).connect();
+		await join("worker", ["all"]).connect();
+		await hub.send(ORCHESTRATOR, { to: "worker", text: "Edit a.ts" });
+
+		expect((await scout.client.send({ replyTo: "9", text: "x" })).text).toBe("There is no message 9.");
+		expect((await scout.client.send({ replyTo: "1", text: "x" })).text).toBe(
+			"Message 1 was not sent to you, so you cannot reply to it.",
+		);
+		await hub.send(ORCHESTRATOR, { to: "scout", text: "Read b.ts" });
+		expect((await scout.client.send({ to: "worker", replyTo: "2", text: "x" })).text).toBe(
+			"Message 2 is from orchestrator; a reply goes to its sender. Leave out to.",
+		);
+		expect((await scout.client.send({ text: "x" })).text).toBe(
+			"Set to, or replyTo with the id of the message you answer.",
+		);
+		expect((await scout.client.send({ to: ORCHESTRATOR, replyTo: "2", text: "ok" })).ok).toBe(true);
 	});
 });
 
@@ -417,18 +509,34 @@ describe("chat in a subagent process", () => {
 		await harness.session.prompt("Report back");
 
 		expect(toOrchestrator).toEqual([
-			{ id: expect.any(String), from: "child", to: "orchestrator", text: "Found the bug", awaitingReply: false },
+			{ id: "1", from: "child", to: "orchestrator", text: "Found the bug", awaitingReply: false },
 		]);
 		const results = harness.session.messages.filter(
 			(message): message is ToolResultMessage => message.role === "toolResult",
 		);
-		expect(getMessageText(results[0])).toBe("Delivered to orchestrator.");
+		expect(getMessageText(results[0])).toBe("Message 1 delivered to orchestrator.");
 		expect(getMessageText(results[1])).toBe("You are child. You can message:\n- orchestrator");
 
 		await hub.send(ORCHESTRATOR, { to: "child", text: "Also check b.ts" });
 		await vi.waitFor(() => expect(chatMessages(harness)).toHaveLength(1));
-		expect(getMessageText(chatMessages(harness)[0])).toContain('<agent_message from="orchestrator" to="you"');
+		expect(getMessageText(chatMessages(harness)[0])).toContain('<agent_message id="2" from="orchestrator" to="you"');
 		expect(getMessageText(chatMessages(harness)[0])).toContain("Also check b.ts");
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("chat_send", { replyTo: 2, text: "Checked b.ts" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("done"),
+		]);
+		await harness.session.prompt("Answer it");
+		expect(toOrchestrator.at(-1)).toEqual({
+			id: "3",
+			from: "child",
+			to: "orchestrator",
+			text: "Checked b.ts",
+			awaitingReply: false,
+			replyTo: "2",
+		});
 	});
 });
 
@@ -467,7 +575,7 @@ describe("chat from a real subagent process to the orchestrator", () => {
 			},
 		);
 		expect(chatMessages(harness)[0].details?.from).toBe("finder");
-		expect(getMessageText(chatMessages(harness)[0])).toContain('<agent_message from="finder" to="you"');
+		expect(getMessageText(chatMessages(harness)[0])).toContain('<agent_message id="1" from="finder" to="you"');
 		await vi.waitFor(() => expect(harness.getPendingResponseCount()).toBe(0), { timeout: 10_000 });
 	}, 20_000);
 });

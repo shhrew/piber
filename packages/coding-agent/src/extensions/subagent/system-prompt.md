@@ -17,7 +17,9 @@ Message others only when it changes their work:
 
 Do not send progress updates, greetings, or thanks, and do not repeat what you will put in your final answer anyway. Keep messages short and concrete: what you found, where, and what it means for the recipient.
 
-Messages to you arrive between your tool calls wrapped in `<agent_message from="..." to="...">` tags. They come from other agents, not from the user. Act on them if they matter to your task. If the sender is waiting for your reply, it is blocked until you answer: reply right away, even if only to say you got it. Otherwise reply only if the sender asked something.
+Messages to you arrive between your tool calls wrapped in `<agent_message id="..." from="..." to="...">` tags. They come from other agents, not from the user. Act on them if they matter to your task. If the sender is waiting for your reply, it is blocked until you answer: reply right away, even if only to say you got it. Otherwise reply only if the sender asked something.
+
+To answer a message, call `chat_send` with `replyTo` set to its id (such as `7`) and leave out `to`: the reply goes to the sender, and the sender knows which message you are answering. A message that answers another has a `reply_to` attribute naming it. Every send returns the id of the message you sent.
 
 Agents that have finished cannot receive messages. Agents that have not started yet receive them when they start.
 

@@ -140,7 +140,7 @@ Agents in a session can send each other short messages, so a swarm can share fin
 
 | Tool | Parameters | Use |
 |---|---|---|
-| `chat_send` | `to`: a subagent's name, `orchestrator`, or `all`; `text`; `waitForReply` (optional); `timeoutSeconds` (optional) | Send a message. With `waitForReply`, block until the recipient answers or the timeout passes. |
+| `chat_send` | `to`: a subagent's name, `orchestrator`, or `all`; `replyTo`: the numeric id of the message being answered; `text`; `waitForReply` (optional); `timeoutSeconds` (optional) | Send a message, or reply to one. With `waitForReply`, block until the recipient answers or the timeout passes. |
 | `chat_peers` | none | List who the caller may message, with what each subagent is doing and whether it is still running. |
 
 **Permissions.** An agent's `canMessage` says whom it may send to: `orchestrator`, `subagents` (any other subagent by name), and `all` (both, plus broadcasting with `to: "all"`). Agents without `canMessage` use `chat.defaultCanMessage`; the orchestrator uses `chat.orchestratorCanMessage`. An agent that may not send still receives messages. Subagents get `chat_send` and `chat_peers` only when they may send.
@@ -159,29 +159,31 @@ Agents in a session can send each other short messages, so a swarm can share fin
 Recipients see a message wrapped in a tag, followed by a line saying whether the sender waits for a reply, so their model does not mistake it for the user:
 
 ```
-<agent_message from="scout-a" to="you" awaiting_reply="false">
+<agent_message id="4" from="scout-a" to="you" awaiting_reply="false">
 Found it in src/a.ts
 </agent_message>
-Reply with chat_send only if it is needed.
+Reply with chat_send replyTo 4 only if it is needed.
 ```
 
 `to` is `you` or `all`. Other messages the system sends in the user role are tagged the same way: background completion notices as `<system_notice from="subagents">`, and resume and handback requests as `<subagent_control action="resume">` or `action="handback"`, with the orchestrator's `message` inside as `<note from="orchestrator">`.
 
-**Waiting for a reply.** With `waitForReply`, the sender blocks until the recipient's next message to it, up to `timeoutSeconds` (default `chat.replyTimeoutSeconds`, at most `chat.maxReplyTimeoutSeconds`). While an agent waits it cannot read messages the normal way, so any other message to it ends the wait and is returned in the tool result instead. That also resolves two agents waiting on each other. A timeout leaves the message delivered; a later reply arrives as a normal message. `waitForReply` cannot be used with `to: "all"`.
+**Message ids and replies.** The hub numbers every message in the session: 1, 2, and so on. The sender gets the id in its tool result (`Message 4 delivered to worker.`). To answer a message, an agent calls `chat_send` with `replyTo` and no `to`; the reply goes to the original sender and its tag carries `reply_to="4"`. Two questions from the same sender can then be answered separately. The hub refuses a `replyTo` that names an unknown message, one not sent to the replier (directly or to `all`), or a `to` other than the original sender. It remembers the last 500 messages. The TUI shows ids as `#4`.
+
+**Waiting for a reply.** With `waitForReply`, the sender blocks until the recipient's next message to it that has no `replyTo` or answers the awaited message, up to `timeoutSeconds` (default `chat.replyTimeoutSeconds`, at most `chat.maxReplyTimeoutSeconds`). While an agent waits it cannot read messages the normal way, so any other message to it, including one from the recipient answering a different message, ends the wait and is returned in the tool result instead. That also resolves two agents waiting on each other. A timeout leaves the message delivered; a later reply arrives as a normal message. `waitForReply` cannot be used with `to: "all"`.
 
 **Limits.** Messages longer than `chat.maxMessageLength` are refused, and so are sends beyond `chat.maxMessagesPerMinute` per agent.
 
-**Display.** Messages are drawn as bubbles. The current agent is always on the right of the label, so the arrow shows the direction: a received message sits on the left as `scout-a → orchestrator`, a sent one on the right as `worker ← orchestrator`, with its outcome (`✓ delivered`, `◷ held until worker starts`, `✗ not sent: …`) under it and the reply, if it waited for one, as a received bubble below. When the sender is waiting for a reply, the received bubble's border says `waiting for your reply` in the warning color until the sender stops waiting, then `asked for a reply`. The recipient's model is told the same: the sender is blocked until it answers, so it should reply, even if only to acknowledge. The main chat shows the orchestrator's messages, collapsed to 6 lines until expanded; the agent view shows a subagent's messages in full.
+**Display.** Messages are drawn as bubbles. The current agent is always first in the label, so the arrow points from sender to recipient: a sent message sits on the left as `orchestrator → worker`, a received one on the right as `orchestrator ← scout-a`. A sent bubble has its outcome (`✓ #5 delivered`, `◷ #5 held until worker starts`, `✗ not sent: …`) under it, and the reply, if it waited for one, as a received bubble below. A received bubble's border shows its id and, for a reply, `reply to #4`; a sent reply is labeled with the recipient's name and has `reply to #4` in its border. When the sender is waiting for a reply, the border adds `waiting for your reply` in the warning color until the sender stops waiting, then `asked for a reply`. The recipient's model is told the same: the sender is blocked until it answers, so it should reply, even if only to acknowledge. The main chat shows the orchestrator's messages, collapsed to 6 lines until expanded; the agent view shows a subagent's messages in full.
 
 ```
- ╭─ scout-a → orchestrator ──────────────╮
- │ Is the session token cached anywhere? │
- ╰────────────── waiting for your reply ─╯
+                         ╭─ orchestrator ← scout-a ──────────────╮
+                         │ Is the session token cached anywhere? │
+                         ╰───────── #4 · waiting for your reply ─╯
 
-                         ╭─ scout-a ← orchestrator ─╮
-                         │ Yes, in src/cache.ts     │
-                         ╰──────────────────────────╯
-                                          ✓ delivered
+ ╭─ orchestrator → scout-a ─╮
+ │ Yes, in src/cache.ts     │
+ ╰──────────── reply to #4 ─╯
+ ✓ #5 delivered
 ```
 
 **How it works.** The parent runs a chat hub on a local socket (a Unix socket in a private temporary directory, or a named pipe on Windows) and gives each subagent process the socket path and a secret token (in the `PI_SUBAGENT_CHAT_TOKEN` environment variable). The hub checks every message's permissions and limits, so a subagent cannot impersonate another or go past its `canMessage`.
@@ -290,14 +292,16 @@ The transcript scrolls like the fullscreen transcript. It uses the same configur
 The Chat tab lists every chat message sent in this session, oldest first, including sends the hub refused. The tab label shows the count. Each message is one entry, with long text wrapped under its own column:
 
 ```
- 12:01   orchestrator → scout-a  Check b.ts too
- 12:02 ? scout-a → worker        Use verifyToken from b.ts, or the helper in
-                                 auth/session.ts?
- 12:02 ~ orchestrator → tester   Run auth tests next
- 12:03 x worker → all            You are not allowed to message everyone.
+ 12:01   #1 orchestrator → scout-a  Check b.ts too
+ 12:02 ? #2 scout-a → worker        Use verifyToken from b.ts, or the helper in
+                                    auth/session.ts?
+ 12:02 ~ #3 orchestrator → tester   Run auth tests next
+ 12:03   #4 worker → scout-a        ↩ #2 verifyToken
+ 12:03 x    worker → all            Tests pass
+                                    ✗ You are not allowed to message everyone.
 ```
 
-The marker after the time is `?` while the sender waits for a reply, `~` while a recipient that has not started yet holds the message, and `x` for a refused send, which shows the reason in place of the text. The log scrolls like the transcript and follows new messages until you scroll up. It keeps the last 500 messages and is cleared when a new session starts.
+The message id follows the marker; a refused send has none, and a reply's text starts with `↩` and the id it answers. The marker after the time is `?` while the sender waits for a reply, `~` while a recipient that has not started yet holds the message, and `x` for a refused send, which shows the reason in red under the text. The log scrolls like the transcript and follows new messages until you scroll up. It keeps the last 500 messages and is cleared when a new session starts.
 
 Dialogs from a subagent's extensions (confirm, select, input) appear in the parent, prefixed with the agent name. So do their warning and error notifications; info notifications, such as per-run token statistics, are dropped.
 

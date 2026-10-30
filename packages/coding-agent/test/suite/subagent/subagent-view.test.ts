@@ -95,6 +95,7 @@ function createView(
 		initialSelection?: string;
 		openId?: string;
 		isAwaitingReply?: (id: string) => boolean;
+		chatSenderOf?: (id: string) => string | undefined;
 		chatLog?: ChatLog;
 		toolRenderers?: ReadonlyMap<string, ToolRenderers>;
 	} = {},
@@ -114,6 +115,7 @@ function createView(
 			closes++;
 		},
 		isAwaitingReply: options.isAwaitingReply,
+		chatSenderOf: options.chatSenderOf,
 		chatLog: options.chatLog,
 		toolRenderers: options.toolRenderers,
 	});
@@ -325,7 +327,7 @@ describe("subagent agent view list", () => {
 				customType: "subagent-chat",
 				content: '<agent_message from="orchestrator" to="you" awaiting_reply="true">\nCheck b.ts\n</agent_message>',
 				display: true,
-				details: { id: "m1", from: "orchestrator", to: "scout", text: "Check b.ts", awaitingReply: true },
+				details: { id: "1", from: "orchestrator", to: "scout", text: "Check b.ts", awaitingReply: true },
 				timestamp: 0,
 			},
 			{
@@ -343,12 +345,13 @@ describe("subagent agent view list", () => {
 				role: "toolResult",
 				toolCallId: "c1",
 				toolName: "chat_send",
-				content: [{ type: "text", text: "worker replied:\nok" }],
+				content: [{ type: "text", text: "worker replied with message 3:\nok" }],
 				details: {
 					to: "worker",
 					ok: true,
 					outcome: "reply",
-					message: { id: "m2", from: "worker", to: "scout", text: "ok", awaitingReply: false },
+					messageId: "2",
+					message: { id: "3", from: "worker", to: "scout", text: "ok", awaitingReply: false, replyTo: "2" },
 				},
 				isError: false,
 				timestamp: 0,
@@ -356,22 +359,53 @@ describe("subagent agent view list", () => {
 		);
 		const { view, lines } = createView([subagent], {
 			initialSelection: "scout",
-			isAwaitingReply: (id) => id === "m1",
+			isAwaitingReply: (id) => id === "1",
 		});
 		view.handleInput(KEYS.enter);
 		const screen = lines();
 
-		const received = screen.findIndex((line) => line.includes("╭─ orchestrator → scout"));
+		const received = screen.findIndex((line) => line.includes("╭─ scout ← orchestrator"));
 		expect(received).toBeGreaterThanOrEqual(0);
-		expect(screen[received].startsWith(" ╭")).toBe(true);
+		expect(screen[received].trimEnd().endsWith("╮")).toBe(true);
+		expect(screen[received].startsWith(" ╭")).toBe(false);
 		expect(screen[received + 1]).toContain("Check b.ts");
-		expect(screen[received + 2]).toContain("waiting for your reply");
-		const sent = screen.find((line) => line.includes("╭─ worker ← scout"));
-		expect(sent?.trimEnd().endsWith("╮")).toBe(true);
-		expect(sent?.startsWith(" ╭")).toBe(false);
-		expect(screen.some((line) => line.trim() === "✓ delivered")).toBe(true);
-		expect(screen.some((line) => line.includes("╭─ worker → scout"))).toBe(true);
+		expect(screen[received + 2]).toContain("#1 · waiting for your reply");
+		const sent = screen.find((line) => line.includes("╭─ scout → worker"));
+		expect(sent?.startsWith(" ╭")).toBe(true);
+		expect(screen.some((line) => line.trim() === "✓ #2 delivered")).toBe(true);
+		expect(screen.some((line) => line.includes("╭─ scout ← worker"))).toBe(true);
+		expect(screen.some((line) => line.includes("#3 · reply to #2"))).toBe(true);
 		expect(screen.join("\n")).not.toContain("<agent_message");
+	});
+
+	it("labels a reply sent with replyTo only with the recipient's name", () => {
+		const subagent = createSubagent("scout", "Map auth flow");
+		const reply = (id: string, replyTo: number): AssistantMessage => ({
+			...assistant(""),
+			content: [{ type: "toolCall", id, name: "chat_send", arguments: { replyTo, text: `answer ${replyTo}` } }],
+		});
+		subagent.messages.push(reply("c1", 1), {
+			role: "toolResult",
+			toolCallId: "c1",
+			toolName: "chat_send",
+			content: [{ type: "text", text: "Message 4 delivered to orchestrator." }],
+			details: { to: "orchestrator", ok: true, outcome: "delivered", messageId: "4" },
+			isError: false,
+			timestamp: 0,
+		});
+		// No result yet: the hub names the sender of message 2.
+		subagent.messages.push(reply("c2", 2));
+		const { view, lines } = createView([subagent], {
+			initialSelection: "scout",
+			chatSenderOf: (id) => (id === "2" ? "worker" : undefined),
+		});
+		view.handleInput(KEYS.enter);
+		const screen = lines().join("\n");
+
+		expect(screen).toContain("╭─ scout → orchestrator");
+		expect(screen).toContain("reply to #1");
+		expect(screen).toContain("╭─ scout → worker");
+		expect(screen).toContain("reply to #2");
 	});
 });
 
@@ -446,23 +480,24 @@ describe("subagent agent view chat tab", () => {
 
 	it("shows one entry per send with markers, wrapping long text under the text column", () => {
 		const chatLog = new ChatLog();
-		chatLog.add(chatEntry({ id: "m1", text: "Check b.ts too" }));
-		chatLog.add(chatEntry({ id: "m2", from: "scout", to: "worker", text: "Ready?", awaitingReply: true }));
-		chatLog.add(chatEntry({ id: "m3", to: "later", text: "Start with a.ts", held: 1 }));
+		chatLog.add(chatEntry({ id: "1", text: "Check b.ts too" }));
+		chatLog.add(chatEntry({ id: "2", from: "scout", to: "worker", text: "Ready?", awaitingReply: true }));
+		chatLog.add(chatEntry({ id: "3", to: "later", text: "Start with a.ts", held: 1, replyTo: "1" }));
 		chatLog.add(chatEntry({ id: "", from: "worker", to: "all", text: "x", refused: "Not allowed." }));
-		chatLog.add(chatEntry({ id: "m5", text: `${"word ".repeat(30)}end` }));
-		const { view, lines } = createView([], { chatLog, isAwaitingReply: (id) => id === "m2" });
+		chatLog.add(chatEntry({ id: "5", text: `${"word ".repeat(30)}end` }));
+		const { view, lines } = createView([], { chatLog, isAwaitingReply: (id) => id === "2" });
 		view.handleInput(KEYS.right);
 		const screen = lines();
 
 		expect(screen[0]).toContain("Chat 5");
 		const body = screen.slice(3).filter((line) => line.trim() !== "");
-		expect(body[0]).toBe(" 12:01   orchestrator → scout  Check b.ts too");
-		expect(body[1]).toBe(" 12:01 ? scout → worker        Ready?");
-		expect(body[2]).toBe(" 12:01 ~ orchestrator → later  Start with a.ts");
-		expect(body[3]).toBe(" 12:01 x worker → all          Not allowed.");
-		expect(body[4].startsWith(" 12:01   orchestrator → scout  word")).toBe(true);
-		expect(body[5]).toMatch(/^ {31}word/);
+		expect(body[0]).toBe(" 12:01   #1 orchestrator → scout  Check b.ts too");
+		expect(body[1]).toBe(" 12:01 ? #2 scout → worker        Ready?");
+		expect(body[2]).toBe(" 12:01 ~ #3 orchestrator → later  ↩ #1 Start with a.ts");
+		expect(body[3]).toBe(" 12:01 x    worker → all          x");
+		expect(body[4]).toBe(`${" ".repeat(34)}✗ Not allowed.`);
+		expect(body[5].startsWith(" 12:01   #5 orchestrator → scout  word")).toBe(true);
+		expect(body[6]).toMatch(/^ {34}word/);
 		expect(body.at(-1)?.trimEnd().endsWith("end")).toBe(true);
 	});
 
@@ -479,13 +514,13 @@ describe("subagent agent view chat tab", () => {
 			].map((match) => Number(match[1]));
 		expect(visible()).toContain(39);
 
-		chatLog.add(chatEntry({ id: "m40", text: "msg-40" }));
+		chatLog.add(chatEntry({ id: "40", text: "msg-40" }));
 		expect(visible()).toContain(40);
 
 		view.handleInput(KEYS.pageUp);
 		const held = visible();
 		expect(held).not.toContain(40);
-		chatLog.add(chatEntry({ id: "m41", text: "msg-41" }));
+		chatLog.add(chatEntry({ id: "41", text: "msg-41" }));
 		expect(visible()).toEqual(held);
 		expect(lines()[1]).toMatch(/↓ \d+ more/);
 	});

@@ -182,9 +182,18 @@ const WaitParams = Type.Object({
 const ListParams = Type.Object({});
 
 const ChatSendParams = Type.Object({
-	to: Type.String({
-		description: 'Recipient: a subagent\'s name, "orchestrator", or "all" for everyone still running',
-	}),
+	to: Type.Optional(
+		Type.String({
+			description:
+				'Recipient: a subagent\'s name, "orchestrator", or "all" for everyone still running. Leave out with replyTo.',
+		}),
+	),
+	replyTo: Type.Optional(
+		Type.Integer({
+			description:
+				"The id of the message you answer, from its <agent_message id> tag, such as 7. The reply goes to its sender.",
+		}),
+	),
 	text: Type.String({
 		description: "The message: short and concrete, such as what you found, where, and what it means for them",
 	}),
@@ -216,6 +225,8 @@ interface ChatToolDetails {
 	to: string;
 	ok: boolean;
 	outcome?: SendOutcome;
+	/** The id the hub gave the sent message. */
+	messageId?: string;
 	message?: ChatDelivery;
 }
 
@@ -513,6 +524,8 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 	let chatHub: ChatHub | undefined;
 	/** Every send in this session, for the agent view's chat tab. Outlives the hub, which is created on first use. */
 	const chatLog = new ChatLog();
+	/** Senders of the chat messages this process received, by id. A subagent process has no hub to ask. */
+	const chatSenders = new Map<string, string>();
 	/**
 	 * Chat messages to the orchestrator that have not reached its context yet: a steer waits for the current tool
 	 * calls to end. `subagent_wait` returns at once while any are unread, so the orchestrator can answer them.
@@ -562,6 +575,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		chatHub?.close();
 		chatHub = undefined;
 		chatLog.clear();
+		chatSenders.clear();
 		unreadChat.clear();
 		chatClient?.close();
 		chatClient = undefined;
@@ -863,13 +877,17 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 	const chatSelf = () => (isSubagentProcess() ? (chatClient?.name ?? "me") : ORCHESTRATOR);
 	/** Whether a message's sender is still blocked waiting for its reply. Only the parent's hub knows. */
 	const isAwaitingReply = (id: string) => chatHub?.isAwaitingReply(id) === true;
+	/** Who sent message `id`, for the recipient label of a reply sent with `replyTo` only. */
+	const chatSenderOf = (id: string) => chatHub?.senderOf(id) ?? chatSenders.get(id);
 
-	registerTool<typeof ChatSendParams, ChatToolDetails>({
+	/** `to`: the recipient the hub resolved, set by the result so the call's bubble can name it. */
+	registerTool<typeof ChatSendParams, ChatToolDetails, { to?: string }>({
 		name: CHAT_SEND_TOOL_NAME,
 		label: "Chat Send",
 		description: [
 			'Send a short chat message to another agent in this session: a subagent by name, "orchestrator", or "all" for everyone still running.',
 			"A busy recipient reads it after its current tool call. Use it for findings, conflicts, and questions that change the recipient's work, not for progress updates.",
+			"Every message has a numeric id. To answer a message, set replyTo to its id instead of to.",
 			"Set waitForReply to block until the recipient answers (or the timeout passes); while you wait, any other message to you ends the wait and is returned instead.",
 			`See who you can message with ${CHAT_PEERS_TOOL_NAME}.`,
 		].join(" "),
@@ -881,6 +899,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const request = {
 				to: params.to,
+				replyTo: params.replyTo === undefined ? undefined : String(params.replyTo),
 				text: params.text,
 				waitForReply: params.waitForReply,
 				timeoutSeconds: params.timeoutSeconds,
@@ -896,22 +915,33 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 					? await hub.send(ORCHESTRATOR, request, signal)
 					: { ok: false, text: "Chat is turned off.", outcome: "refused" };
 			}
+			if (result.message) chatSenders.set(result.message.id, result.message.from);
 			return {
 				content: [{ type: "text", text: result.text }],
-				details: { to: params.to, ok: result.ok, outcome: result.outcome, message: result.message },
+				details: {
+					to: result.to ?? params.to ?? "",
+					ok: result.ok,
+					outcome: result.outcome,
+					messageId: result.messageId,
+					message: result.message,
+				},
 				isError: !result.ok || undefined,
 			};
 		},
 
 		renderCall(args, theme, context) {
-			return renderChatSendCall(args, theme, { ...context, self: chatSelf() });
+			const replyTo = args.replyTo === undefined ? undefined : String(args.replyTo);
+			const recipient = () => context.state.to ?? (replyTo ? chatSenderOf(replyTo) : undefined);
+			return renderChatSendCall(args, theme, { ...context, self: chatSelf(), recipient });
 		},
 
 		renderResult(result, { expanded }, theme, context) {
+			if (result.details?.to) context.state.to = result.details.to;
 			const first = result.content[0];
 			const outcome = {
 				text: first?.type === "text" ? first.text : "",
 				outcome: result.details?.outcome,
+				messageId: result.details?.messageId,
 				message: result.details?.message,
 			};
 			const options = {
@@ -922,7 +952,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 				self: chatSelf(),
 				isAwaitingReply,
 			};
-			return renderChatSendResult(outcome, context.args.to, options, theme);
+			return renderChatSendResult(outcome, result.details?.to ?? context.args.to ?? "?", options, theme);
 		},
 	});
 
@@ -1254,11 +1284,11 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		const senders = [...new Set(unread.map((delivery) => delivery.from))];
 		const waiting = unread
 			.filter((delivery) => delivery.awaitingReply && isAwaitingReply(delivery.id))
-			.map((delivery) => delivery.from);
+			.map((delivery) => `${delivery.from} (on message ${delivery.id})`);
 		const lines = [
 			`Stopped waiting: ${senders.join(", ") || "another agent"} sent you a chat message, shown after this result.`,
 		];
-		if (waiting.length > 0) lines.push(`${[...new Set(waiting)].join(", ")} is blocked waiting for your reply.`);
+		if (waiting.length > 0) lines.push(`Blocked waiting for your reply: ${waiting.join(", ")}.`);
 		lines.push(
 			`The subagents keep running. Answer it or change direction if needed; if you still want their results, call ${SUBAGENT_WAIT_TOOL_NAME} again. Status:`,
 		);
@@ -1699,7 +1729,8 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		const socket = pi.getFlag(CHAT_FLAG);
 		const token = process.env[CHAT_TOKEN_ENV];
 		if (typeof socket === "string" && socket !== "" && token) {
-			const client = new ChatClient(socket, token, (delivery) =>
+			const client = new ChatClient(socket, token, (delivery) => {
+				chatSenders.set(delivery.id, delivery.from);
 				pi.sendMessage(
 					{
 						customType: CHAT_MESSAGE_TYPE,
@@ -1708,8 +1739,8 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 						details: delivery,
 					},
 					{ deliverAs: "steer" },
-				),
-			);
+				);
+			});
 			try {
 				await client.connect();
 				chatClient = client;
@@ -1746,6 +1777,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 								lastViewed = id;
 							},
 							isAwaitingReply,
+							chatSenderOf,
 							chatLog,
 							toolRenderers,
 							close: () => done(undefined),

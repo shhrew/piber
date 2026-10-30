@@ -10,8 +10,12 @@
  * - `ChatClient` lives in a subagent process. It connects with the token it got through `CHAT_TOKEN_ENV` and the
  *   socket path from the `--subagent-chat` flag.
  *
- * The protocol is JSON lines. Client to hub: `hello {token}`, `send {id, to, text, waitForReply?, timeoutSeconds?}`,
- * `cancel {id}`, `peers {id}`. Hub to client: `welcome {name}`, `reply {id, ok, text}`, `deliver {delivery}`.
+ * The protocol is JSON lines. Client to hub: `hello {token}`,
+ * `send {id, to?, replyTo?, text, waitForReply?, timeoutSeconds?}`, `cancel {id}`, `peers {id}`. Hub to client:
+ * `welcome {name}`, `reply {id, ok, text}`, `deliver {delivery}`.
+ *
+ * Message ids: the hub numbers every message (1, 2, ...) and shows the id to the recipient, so it can answer
+ * that message with `replyTo` instead of only naming its sender. A reply goes to the original sender.
  *
  * Delivery: a running, connected subagent gets a message at once (its extension steers it in after the current
  * tool call); a queued, paused, or still-connecting one gets it when it connects; a finished one cannot get it. The
@@ -65,18 +69,20 @@ export function canMessageAnyone(rights: ChatRights): boolean {
 
 /** One message as delivered. `to` is the recipient's name, or `all` for a broadcast. */
 export interface ChatDelivery {
-	/** Unique per send, so a display can ask whether the sender is still waiting on this message. */
+	/** Unique per send, a number such as `7`: what a reply's `replyTo` names. */
 	id: string;
 	from: string;
 	to: string;
 	text: string;
 	/** The sender is blocked in `waitForReply` until the recipient answers. */
 	awaitingReply: boolean;
+	/** The id of the message this one answers. */
+	replyTo?: string;
 }
 
 /** The line asking a recipient to answer a sender blocked in `waitForReply`. */
-function replyRequest(from: string): string {
-	return `${from} is blocked waiting for your reply: answer now with ${CHAT_SEND_TOOL_NAME} to "${from}", even if only to say you got it.`;
+function replyRequest(delivery: ChatDelivery): string {
+	return `${delivery.from} is blocked waiting for your reply: answer now with ${CHAT_SEND_TOOL_NAME} replyTo ${delivery.id}, even if only to say you got it.`;
 }
 
 /**
@@ -86,18 +92,21 @@ function replyRequest(from: string): string {
 export function frameMessage(delivery: ChatDelivery): string {
 	const to = delivery.to === BROADCAST ? BROADCAST : "you";
 	const reply = delivery.awaitingReply
-		? replyRequest(delivery.from)
-		: `Reply with ${CHAT_SEND_TOOL_NAME} only if it is needed.`;
+		? replyRequest(delivery)
+		: `Reply with ${CHAT_SEND_TOOL_NAME} replyTo ${delivery.id} only if it is needed.`;
+	const replyTo = delivery.replyTo ? ` reply_to="${delivery.replyTo}"` : "";
 	return [
-		`<agent_message from="${delivery.from}" to="${to}" awaiting_reply="${delivery.awaitingReply}">`,
+		`<agent_message id="${delivery.id}" from="${delivery.from}" to="${to}"${replyTo} awaiting_reply="${delivery.awaitingReply}">`,
 		delivery.text,
 		"</agent_message>",
 		reply,
 	].join("\n");
 }
 
+/** `to`, `replyTo`, or both: a reply goes to the sender of the message it answers. */
 export interface SendRequest {
-	to: string;
+	to?: string;
+	replyTo?: string;
 	text: string;
 	waitForReply?: boolean;
 	timeoutSeconds?: number;
@@ -124,6 +133,10 @@ export interface SendResult {
 	/** For the sender's model. */
 	text: string;
 	outcome: SendOutcome;
+	/** The id the hub gave the message, when it was sent. */
+	messageId?: string;
+	/** The recipient, resolved from `replyTo` when `to` was not given. */
+	to?: string;
 	/** The reply, or the message that interrupted the wait. */
 	message?: ChatDelivery;
 }
@@ -151,6 +164,7 @@ export interface ChatLogEntry {
 	to: string;
 	text: string;
 	awaitingReply: boolean;
+	replyTo?: string;
 	/** Recipients still holding the message until they start. */
 	held: number;
 	/** Why the hub refused the send. */
@@ -244,6 +258,9 @@ export class ChatHub {
 	private readonly waiters = new Map<string, Waiter>();
 	/** Send times per sender, for the rate limit. */
 	private readonly sendTimes = new Map<string, number[]>();
+	/** Recent messages by id, so a reply can name the one it answers. */
+	private readonly sent = new Map<string, ChatDelivery>();
+	private nextMessageId = 1;
 	private server: net.Server | undefined;
 	private socketDir: string | undefined;
 	private socketPath: string | undefined;
@@ -288,6 +305,7 @@ export class ChatHub {
 		for (const socket of this.sockets.values()) socket.destroy();
 		this.sockets.clear();
 		this.held.clear();
+		this.sent.clear();
 		this.server?.close();
 		this.server = undefined;
 		this.socketPath = undefined;
@@ -299,16 +317,28 @@ export class ChatHub {
 	async send(from: string, request: SendRequest, signal?: AbortSignal): Promise<SendResult> {
 		const config = this.options.config();
 		const text = request.text.trim();
-		const to = request.to.trim();
+		const replyTo = request.replyTo?.trim() || undefined;
+		const original = replyTo ? this.sent.get(replyTo) : undefined;
+		const to = request.to?.trim() || original?.from || "";
 		const awaitingReply = request.waitForReply === true;
 		const record = (id: string, held: number, refused?: string) =>
-			this.options.log?.add({ id, at: Date.now(), from, to, text, awaitingReply, held, refused });
+			this.options.log?.add({ id, at: Date.now(), from, to, text, awaitingReply, replyTo, held, refused });
 		const decline = (reason: string): SendResult => {
 			record("", 0, reason);
 			return refuse(reason);
 		};
 		const rights = from === ORCHESTRATOR ? resolvePermissions(config.orchestratorCanMessage) : this.rights.get(from);
 		if (!rights) return decline(`${from} is not part of this chat.`);
+		if (replyTo) {
+			if (!original) return decline(`There is no message ${replyTo}.`);
+			if (original.to !== from && (original.to !== BROADCAST || original.from === from)) {
+				return decline(`Message ${replyTo} was not sent to you, so you cannot reply to it.`);
+			}
+			if (to !== original.from) {
+				return decline(`Message ${replyTo} is from ${original.from}; a reply goes to its sender. Leave out to.`);
+			}
+		}
+		if (!to) return decline("Set to, or replyTo with the id of the message you answer.");
 		if (!text) return decline("The message is empty.");
 		if (text.length > config.maxMessageLength) {
 			return decline(
@@ -341,7 +371,11 @@ export class ChatHub {
 			);
 		}
 
-		const delivery: ChatDelivery = { id: randomUUID(), from, to, text, awaitingReply };
+		const delivery: ChatDelivery = { id: String(this.nextMessageId++), from, to, text, awaitingReply };
+		if (replyTo) delivery.replyTo = replyTo;
+		this.sent.set(delivery.id, delivery);
+		// Map keys keep insertion order, so the first is the oldest.
+		if (this.sent.size > CHAT_LOG_LIMIT) this.sent.delete(this.sent.keys().next().value ?? "");
 		if (to === BROADCAST) {
 			const recipients = [
 				...(from === ORCHESTRATOR ? [] : [ORCHESTRATOR]),
@@ -357,8 +391,10 @@ export class ChatHub {
 			record(delivery.id, held);
 			return {
 				ok: true,
-				text: `Sent to everyone: ${delivered} delivered${held > 0 ? `, ${held} held until they start` : ""}.`,
+				text: `Message ${delivery.id} sent to everyone: ${delivered} delivered${held > 0 ? `, ${held} held until they start` : ""}.`,
 				outcome: "broadcast",
+				messageId: delivery.id,
+				to,
 			};
 		}
 
@@ -366,13 +402,18 @@ export class ChatHub {
 		record(delivery.id, outcome === "held" ? 1 : 0);
 		const sent =
 			outcome !== "held"
-				? `Delivered to ${to}.`
+				? `Message ${delivery.id} delivered to ${to}.`
 				: this.options.directory.find(to)?.state === "paused"
-					? `Held for ${to}, which is paused; it gets the message when it resumes.`
-					: `Held for ${to}, which has not started yet; it gets the message when it starts.`;
-		if (!request.waitForReply) return { ok: true, text: sent, outcome };
+					? `Message ${delivery.id} held for ${to}, which is paused; it gets the message when it resumes.`
+					: `Message ${delivery.id} held for ${to}, which has not started yet; it gets the message when it starts.`;
+		if (!request.waitForReply) return { ok: true, text: sent, outcome, messageId: delivery.id, to };
 		const timeout = Math.min(request.timeoutSeconds ?? config.replyTimeoutSeconds, config.maxReplyTimeoutSeconds);
 		return this.waitForReply(from, delivery, Math.max(1, timeout), signal);
+	}
+
+	/** Who sent message `id`, while the hub remembers it. */
+	senderOf(id: string): string | undefined {
+		return this.sent.get(id)?.from;
 	}
 
 	/** Whether the sender of message `id` is still blocked waiting for its reply. */
@@ -444,7 +485,7 @@ export class ChatHub {
 				if (timer) clearTimeout(timer);
 				signal?.removeEventListener("abort", onAbort);
 				if (this.waiters.get(from) === waiter) this.waiters.delete(from);
-				resolve(result);
+				resolve({ ...result, messageId: sent.id, to });
 			};
 			const waiter: Waiter = {
 				target: to,
@@ -452,14 +493,20 @@ export class ChatHub {
 				resolve: (incoming) => {
 					if (!incoming.from) {
 						finish({ ok: false, text: "Chat closed while waiting for a reply.", outcome: "stopped" });
-					} else if (incoming.from === to) {
-						finish({ ok: true, text: `${to} replied:\n${incoming.text}`, outcome: "reply", message: incoming });
+					} else if (incoming.from === to && (!incoming.replyTo || incoming.replyTo === sent.id)) {
+						finish({
+							ok: true,
+							text: `${to} replied with message ${incoming.id}:\n${incoming.text}`,
+							outcome: "reply",
+							message: incoming,
+						});
 					} else {
+						const about = incoming.replyTo ? `, replying to message ${incoming.replyTo}` : "";
 						const lines = [
-							`While you waited for ${to}, ${incoming.from} messaged you${incoming.to === BROADCAST ? " (to everyone)" : ""}:`,
+							`While you waited for ${to}, ${incoming.from} sent you message ${incoming.id}${incoming.to === BROADCAST ? " (to everyone)" : ""}${about}:`,
 							incoming.text,
 						];
-						if (incoming.awaitingReply) lines.push(replyRequest(incoming.from));
+						if (incoming.awaitingReply) lines.push(replyRequest(incoming));
 						lines.push(`You stopped waiting for ${to}; its reply will arrive as a chat message.`);
 						finish({ ok: true, text: lines.join("\n"), outcome: "interrupted", message: incoming });
 					}
@@ -471,7 +518,7 @@ export class ChatHub {
 				() =>
 					finish({
 						ok: true,
-						text: `Sent to ${to}. No reply within ${timeoutSeconds} s; a later reply will arrive as a chat message.`,
+						text: `Message ${sent.id} sent to ${to}. No reply within ${timeoutSeconds} s; a later reply will arrive as a chat message.`,
 						outcome: "timeout",
 					}),
 				timeoutSeconds * 1000,
@@ -632,7 +679,8 @@ export class ChatClient {
 				} else if (frame.type === "reply") {
 					const settle = this.pending.get(frame.id);
 					this.pending.delete(frame.id);
-					settle?.({ ok: frame.ok, text: frame.text, outcome: frame.outcome, message: frame.message });
+					const { id: _id, type: _type, ...result } = frame;
+					settle?.(result);
 				} else if (frame.type === "deliver") {
 					this.onDeliver(frame.delivery);
 				}

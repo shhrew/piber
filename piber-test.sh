@@ -10,7 +10,7 @@ usage() {
   echo "Usage: $0 <scenario> [pi-test.sh args...]"
   echo
   echo "Scenarios:"
-  echo "  chat    Subagent chat: subagent to subagent, reply waits, orchestrator replies, held messages, broadcast"
+  echo "  chat    Subagent chat: subagent to subagent, reply waits, replies by message id, held messages, broadcast"
   echo "  skills  Skill search: listing, query and tag ranking, no match, load_skill, tool gating, extraSkillGroups"
   echo "  control Subagent control: start now, pause, resume, terminate, handback, held chat for paused subagents"
   echo "  render  Tool rendering: chat_peers, skill_search, load_skill in the main session and the agent view"
@@ -19,20 +19,25 @@ usage() {
 
 chat_prompt() {
   cat <<'EOF'
-This is a manual test of the subagent chat feature. Follow these steps exactly. Do not edit any files, and tell every subagent not to edit files either.
+This is a manual test of the subagent chat feature. Follow these steps exactly. Do not edit any files, and tell every subagent not to edit files either. Every chat message has a numeric id, shown in its <agent_message id="..."> tag; tell every subagent to answer a message with chat_send replyTo set to that id, leaving out to.
 
 1. In ONE `subagent` call with `background: true`, start these three `worker` subagents in parallel (only two run at once, so charlie should start queued):
-   - name "alpha", task: Do not edit files. Run `grep -rn "class ChatHub" packages/coding-agent/src`. Send the file and line to the orchestrator with chat_send and waitForReply: true, asking "Found ChatHub. Should I also look for ChatClient?". If the answer is yes, find ChatClient the same way. Answer any message that is waiting for your reply. If your wait ends before the orchestrator answers, ask it again with waitForReply. Do not finish until you have the orchestrator's answer. Finish with what you found and every chat message you received, with its sender.
-   - name "bravo", task: Do not edit files. Ask alpha with chat_send and waitForReply: true: "Which file defines ChatHub?". After the reply, run `grep -rn "class ChatBubble" packages/coding-agent/src` and send the result to alpha without waiting. Finish with the reply you got and every chat message you received, with its sender.
-   - name "charlie", task: Do not edit files. First list the chat messages you have already received. Then send "charlie is running" to "all". Finish with every chat message you received, with its sender.
+   - name "alpha", task: Do not edit files. Run `grep -rn "class ChatHub" packages/coding-agent/src`. Send the file and line to the orchestrator with chat_send and waitForReply: true, asking "Found ChatHub. Should I also look for ChatClient?". If the answer is yes, find ChatClient the same way. bravo will ask you two questions: answer each one in its own chat_send with replyTo set to that question's id, the first question first. Answer any other message that is waiting for your reply the same way. If your wait ends before the orchestrator answers, ask it again with waitForReply. Do not finish until you have the orchestrator's answer. Finish with what you found and every chat message you received, with its sender, id, and reply_to if it had one.
+   - name "bravo", task: Do not edit files. Send alpha, without waiting: "Question 1: which file defines ChatClient?". Then ask alpha with chat_send and waitForReply: true: "Question 2: which file defines ChatHub?". Note the id of each message you sent. If your wait ends early, say why, quoting the tool result. Once you have answers to both questions, run `grep -rn "class ChatBubble" packages/coding-agent/src` and send the result to alpha without waiting. Finish with the ids of your two questions, the answer to each and the reply_to it carried, and every chat message you received, with its sender, id, and reply_to if it had one.
+   - name "charlie", task: Do not edit files. First list the chat messages you have already received. Then send "charlie is running" to "all", and note its id. Then run `sleep 30` with bash. Finish with every chat message you received, with its sender, id, and reply_to if it had one.
 2. Right after that call returns, send charlie, without waiting: "Held message: you were queued when this was sent." Then call chat_peers.
-3. Call subagent_wait with no names. A chat message to you ends the wait early; answer it, then call subagent_wait again to keep waiting, until all three have finished.
-4. When alpha asks its question, answer "yes" with chat_send to alpha. Answer any other message that is waiting for your reply with a short acknowledgement.
-5. Once all three have finished, read their results with subagent_result. Then give a checklist of chat paths, each marked worked or failed with the evidence:
+3. Call chat_send with replyTo 999 and text "test". It should be refused, since no message 999 exists. Quote the result verbatim.
+4. Call subagent_wait with no names. A chat message to you ends the wait early; answer it, then call subagent_wait again to keep waiting, until all three have finished.
+5. When alpha asks its question, answer "yes" with chat_send and replyTo set to the id of alpha's question, without to. When charlie's broadcast reaches you, answer "Got it, charlie" with replyTo set to the broadcast's id, without to. Answer any other message that is waiting for your reply with a short acknowledgement, using replyTo.
+6. Once all three have finished, read their results with subagent_result. Then give a checklist of chat paths, each marked worked or failed with the evidence:
    - subagent to subagent (bravo to alpha, without waiting)
    - subagent to subagent with waitForReply (bravo asks alpha)
    - subagent to orchestrator with waitForReply (alpha asks you)
-   - orchestrator to subagent (your reply to alpha)
+   - orchestrator to subagent by replyTo (your reply to alpha carries reply_to equal to its question's id, and ended alpha's wait)
+   - subagent replies by id (alpha answered each of bravo's questions with a reply_to matching that question's id)
+   - a reply to a different message ended a wait early ("replying to message N"), if it happened
+   - reply to a broadcast (only charlie got your answer, with reply_to equal to its broadcast's id)
+   - refused replyTo (step 3: "There is no message 999.")
    - held message for a queued subagent (charlie)
    - broadcast (charlie to all)
    - a reply wait ended early by another message, if it happened

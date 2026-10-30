@@ -435,7 +435,7 @@ describe("list rendering", () => {
 
 describe("chat rendering in the main chat", () => {
 	const received = {
-		id: "m1",
+		id: "1",
 		from: "scout-a",
 		to: "orchestrator",
 		text: "Found it\nin src/a.ts",
@@ -443,27 +443,33 @@ describe("chat rendering in the main chat", () => {
 	};
 	const inbound = { expanded: false, outputPad: 1, self: "orchestrator" };
 
-	it("draws a received message as a bubble on the left, labeled sender → current", () => {
+	it("draws a received message as a bubble on the right, labeled current ← sender", () => {
 		expect(plain(renderChatMessage(received, inbound, theme).render(50))).toEqual([
-			" ╭─ scout-a → orchestrator ─╮",
-			" │ Found it                 │",
-			" │ in src/a.ts              │",
-			" ╰──────────────────────────╯",
+			`${" ".repeat(21)}╭─ orchestrator ← scout-a ─╮`,
+			`${" ".repeat(21)}│ Found it                 │`,
+			`${" ".repeat(21)}│ in src/a.ts              │`,
+			`${" ".repeat(21)}╰───────────────────── #1 ─╯`,
 		]);
+		const reply = { ...received, id: "3", replyTo: "2" };
+		expect(plain(renderChatMessage(reply, inbound, theme).render(50)).at(-1)).toBe(
+			`${" ".repeat(21)}╰─────── #3 · reply to #2 ─╯`,
+		);
 		const broadcast = { ...received, to: "all", text: "Stop" };
-		expect(plain(renderChatMessage(broadcast, inbound, theme).render(50))[0]).toBe(" ╭─ scout-a → everyone ─╮");
+		expect(plain(renderChatMessage(broadcast, inbound, theme).render(50))[0]).toBe(
+			`${" ".repeat(25)}╭─ everyone ← scout-a ─╮`,
+		);
 	});
 
 	it("tells the receiver while the sender waits for a reply, and after", () => {
 		let waiting = true;
 		const bubble = renderChatMessage(
 			{ ...received, awaitingReply: true },
-			{ ...inbound, isAwaitingReply: (id) => waiting && id === "m1" },
+			{ ...inbound, isAwaitingReply: (id) => waiting && id === "1" },
 			theme,
 		);
-		expect(plain(bubble.render(50)).at(-1)).toBe(" ╰─ waiting for your reply ─╯");
+		expect(plain(bubble.render(50)).at(-1)).toBe(`${" ".repeat(16)}╰─ #1 · waiting for your reply ─╯`);
 		waiting = false;
-		expect(plain(bubble.render(50)).at(-1)).toBe(" ╰────── asked for a reply ─╯");
+		expect(plain(bubble.render(50)).at(-1)).toBe(`${" ".repeat(21)}╰─ #1 · asked for a reply ─╯`);
 	});
 
 	it("cuts a long message to a preview until expanded", () => {
@@ -474,40 +480,47 @@ describe("chat rendering in the main chat", () => {
 		expect(plain(renderChatMessage(long, { ...inbound, expanded: true }, theme).render(50))).toHaveLength(12);
 	});
 
-	it("draws a send as a bubble on the right, labeled receiver ← current", () => {
+	it("draws a send as a bubble on the left, labeled current → receiver", () => {
 		const state = { isPartial: true, isError: false, outputPad: 1, expanded: false, self: "orchestrator" };
 		const lines = plain(
 			renderChatSendCall({ to: "worker", text: "Use a.ts", waitForReply: true }, theme, state).render(50),
 		);
 		expect(lines).toEqual([
-			`${" ".repeat(22)}╭─ worker ← orchestrator ─╮`,
-			`${" ".repeat(22)}│ Use a.ts                │`,
-			`${" ".repeat(22)}╰─── waiting for a reply ─╯`,
+			" ╭─ orchestrator → worker ─╮",
+			" │ Use a.ts                │",
+			" ╰─── waiting for a reply ─╯",
 		]);
 		const sent = plain(renderChatSendCall({ to: "worker", text: "Use a.ts" }, theme, state).render(50));
-		expect(sent.at(-1)).toBe(`${" ".repeat(22)}╰─────────────────────────╯`);
+		expect(sent.at(-1)).toBe(" ╰─────────────────────────╯");
+		let recipient: string | undefined;
+		const reply = renderChatSendCall({ replyTo: 4, text: "Yes" }, theme, { ...state, recipient: () => recipient });
+		expect(plain(reply.render(50))[0]).toContain("╭─ orchestrator → ...");
+		recipient = "scout-a";
+		const named = plain(reply.render(50));
+		expect(named[0].trim()).toBe("╭─ orchestrator → scout-a ─╮");
+		expect(named.at(-1)?.trim()).toBe("╰──────────── reply to #4 ─╯");
 	});
 
 	it("puts the outcome under the sent bubble, and the reply below it", () => {
 		const done = { expanded: false, isError: false, isPartial: false, outputPad: 1, self: "orchestrator" };
-		const reply = { id: "m2", from: "worker", to: "orchestrator", text: "yes", awaitingReply: false };
+		const reply = { id: "2", from: "worker", to: "orchestrator", text: "yes", awaitingReply: false, replyTo: "1" };
 		const lines = plain(
 			renderChatSendResult(
-				{ text: "worker replied:\nyes", outcome: "reply", message: reply },
+				{ text: "worker replied with message 2:\nyes", outcome: "reply", messageId: "1", message: reply },
 				"worker",
 				done,
 				theme,
 			).render(50),
 		);
 		expect(lines).toEqual([
-			`${" ".repeat(38)}✓ delivered`,
+			" ✓ #1 delivered",
 			"",
-			" ╭─ worker → orchestrator ─╮",
-			" │ yes                     │",
-			" ╰─────────────────────────╯",
+			`${" ".repeat(22)}╭─ orchestrator ← worker ─╮`,
+			`${" ".repeat(22)}│ yes                     │`,
+			`${" ".repeat(22)}╰────── #2 · reply to #1 ─╯`,
 		]);
 		const held = renderChatSendResult({ text: "", outcome: "held" }, "worker", done, theme);
-		expect(plain(held.render(50))).toEqual([`${" ".repeat(23)}◷ held until worker starts`]);
+		expect(plain(held.render(50))).toEqual([" ◷ held until worker starts"]);
 		const refused = renderChatSendResult(
 			{ text: "You are not allowed to message other subagents.", outcome: "refused" },
 			"worker",

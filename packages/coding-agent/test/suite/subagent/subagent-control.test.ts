@@ -247,7 +247,7 @@ describe("subagent_control tool", () => {
 			].join("\n"),
 		);
 		expect(getMessageText(toolResults(harness, "chat_send")[0])).toBe(
-			"Held for one, which is paused; it gets the message when it resumes.",
+			"Message 1 held for one, which is paused; it gets the message when it resumes.",
 		);
 		const [, pausedWait, finalWait] = toolResults(harness, "subagent_wait");
 		expect(getMessageText(pausedWait)).toBe(

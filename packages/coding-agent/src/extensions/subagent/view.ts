@@ -137,6 +137,8 @@ export interface AgentViewOptions {
 	close: () => void;
 	/** Whether a chat message's sender is still blocked waiting for its reply. */
 	isAwaitingReply?: (id: string) => boolean;
+	/** Who sent chat message `id`, to name the recipient of a reply sent with `replyTo` only. */
+	chatSenderOf?: (id: string) => string | undefined;
 	/** The session's chat messages, for the Chat tab. */
 	chatLog?: ChatLog;
 	/** Renderers of extension tools by name. Built-in tools use their own; others fall back to plain text. */
@@ -160,6 +162,7 @@ export class AgentView implements Component {
 	private readonly close: () => void;
 	private readonly onOpen: (id: string | undefined) => void;
 	private readonly isAwaitingReply: ((id: string) => boolean) | undefined;
+	private readonly chatSenderOf: ((id: string) => string | undefined) | undefined;
 	private readonly scrollbar: ScrollViewScrollbar;
 	private readonly scroll = new TranscriptScroll();
 	private readonly chatLog: ChatLog | undefined;
@@ -198,6 +201,7 @@ export class AgentView implements Component {
 		this.close = options.close;
 		this.onOpen = options.onOpen;
 		this.isAwaitingReply = options.isAwaitingReply;
+		this.chatSenderOf = options.chatSenderOf;
 		this.scrollbar = options.scrollbar;
 		this.input.focused = true;
 		this.input.onSubmit = (value) => this.submit(value);
@@ -497,8 +501,9 @@ export class AgentView implements Component {
 	}
 
 	/**
-	 * One entry per send: ` HH:MM M from → to  text`, the text wrapped under its own column. The marker M is `?`
-	 * while the sender waits for a reply, `~` while a recipient that has not started holds it, `x` when refused.
+	 * One entry per send: ` HH:MM M #id from → to  text`, the text wrapped under its own column, and a reply's text
+	 * starting with `↩ #3`. The marker M is `?` while the sender waits for a reply, `~` while a recipient that has not
+	 * started holds it, `x` when refused. A refused send has no id, and its reason follows the text as `✗ reason`.
 	 */
 	private renderChatEntries(entries: readonly ChatLogEntry[], width: number): string[] {
 		const theme = this.theme;
@@ -506,8 +511,10 @@ export class AgentView implements Component {
 			Math.max(8, Math.floor(width / 3)),
 			Math.max(...entries.map((entry) => visibleWidth(`${entry.from} → ${entry.to}`))),
 		);
-		// " HH:MM M " before the route, two spaces after it.
-		const textColumn = 9 + routeWidth + 2;
+		const label = (id: string) => (id ? `#${id}` : "");
+		const idWidth = Math.max(...entries.map((entry) => label(entry.id).length));
+		// " HH:MM M " and the id before the route, two spaces after it.
+		const textColumn = 9 + idWidth + 1 + routeWidth + 2;
 		const textWidth = Math.max(10, width - textColumn);
 		const indent = " ".repeat(textColumn);
 		return entries.flatMap((entry) => {
@@ -523,10 +530,14 @@ export class AgentView implements Component {
 				routeWidth,
 			);
 			const padding = " ".repeat(Math.max(0, routeWidth - visibleWidth(route)));
-			const text = entry.refused ? theme.fg("error", entry.refused) : oneLine(entry.text);
-			const [first = "", ...rest] = wrapTextWithAnsi(text, textWidth);
+			const reply = entry.replyTo ? theme.fg("dim", `↩ #${entry.replyTo} `) : "";
+			const message = oneLine(entry.text);
+			const text = message ? wrapTextWithAnsi(reply + message, textWidth) : [];
+			const reason = entry.refused ? wrapTextWithAnsi(theme.fg("error", `✗ ${entry.refused}`), textWidth) : [];
+			const [first = "", ...rest] = [...text, ...reason];
+			const id = theme.fg("dim", label(entry.id).padEnd(idWidth));
 			return [
-				` ${theme.fg("dim", clockTime(entry.at))} ${marker} ${route}${padding}  ${first}`,
+				` ${theme.fg("dim", clockTime(entry.at))} ${marker} ${id} ${route}${padding}  ${first}`,
 				...rest.map((line) => indent + line),
 			];
 		});
@@ -592,8 +603,13 @@ export class AgentView implements Component {
 		const toolCalls = new Map<string, ToolExecutionComponent>();
 		/** chat_send calls, drawn as bubbles; their results as the outcome under the bubble. */
 		const chatSends = new Map<string, string>();
-		const answered = new Set<string>();
-		for (const message of subagent.messages) if (message.role === "toolResult") answered.add(message.toolCallId);
+		/** Tool call ids that have a result, with the recipient a chat_send result resolved. */
+		const answered = new Map<string, string | undefined>();
+		for (const message of subagent.messages) {
+			if (message.role !== "toolResult") continue;
+			const to = (message.details as { to?: unknown } | undefined)?.to;
+			answered.set(message.toolCallId, typeof to === "string" && to ? to : undefined);
+		}
 		const chat = { expanded: true, outputPad: 1, self, isAwaitingReply: this.isAwaitingReply };
 		for (const message of subagent.messages) {
 			if (message.role === "custom") {
@@ -606,17 +622,25 @@ export class AgentView implements Component {
 				for (const part of message.content) {
 					if (part.type !== "toolCall") continue;
 					if (part.name === CHAT_SEND_TOOL_NAME) {
-						const to = typeof part.arguments.to === "string" ? part.arguments.to : "?";
+						const replyTo =
+							typeof part.arguments.replyTo === "number" || typeof part.arguments.replyTo === "string"
+								? part.arguments.replyTo
+								: undefined;
+						const to = typeof part.arguments.to === "string" ? part.arguments.to : replyTo ? undefined : "?";
 						const args = {
 							to,
+							replyTo,
 							text: typeof part.arguments.text === "string" ? part.arguments.text : "",
 							waitForReply: part.arguments.waitForReply === true,
 						};
 						// Still waiting while it has no result and the subagent runs; an aborted run leaves none.
 						const isPartial = !answered.has(part.id) && subagent.isRunning;
-						const state = { ...chat, isError: false, isPartial };
+						const recipient = () =>
+							answered.get(part.id) ??
+							(replyTo === undefined ? undefined : this.chatSenderOf?.(String(replyTo)));
+						const state = { ...chat, isError: false, isPartial, recipient };
 						components.push(new Spacer(1), renderChatSendCall(args, theme, state));
-						chatSends.set(part.id, to);
+						chatSends.set(part.id, to ?? "?");
 						continue;
 					}
 					const definition =
@@ -639,13 +663,16 @@ export class AgentView implements Component {
 					components.push(component);
 				}
 			} else if (message.role === "toolResult" && chatSends.has(message.toolCallId)) {
-				const details = message.details as { outcome?: SendOutcome; message?: ChatDelivery } | undefined;
+				const details = message.details as
+					| { to?: string; outcome?: SendOutcome; messageId?: string; message?: ChatDelivery }
+					| undefined;
 				const outcome = {
 					text: message.content.map((part) => (part.type === "text" ? part.text : "")).join("\n"),
 					outcome: details?.outcome,
+					messageId: details?.messageId,
 					message: details?.message,
 				};
-				const to = chatSends.get(message.toolCallId) ?? "?";
+				const to = details?.to || chatSends.get(message.toolCallId) || "?";
 				const options = { ...chat, isError: message.isError, isPartial: false };
 				components.push(renderChatSendResult(outcome, to, options, theme));
 			} else if (message.role === "toolResult") {
