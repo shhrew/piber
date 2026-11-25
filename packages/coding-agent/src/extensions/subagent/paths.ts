@@ -14,8 +14,12 @@
  *   leaves the result for `subagent_wait` and `subagent_result`
  * - `chat`: subagent chat (see `chat.ts`): whether it is enabled, the default `canMessage` for agents without
  *   one, what the orchestrator may message, message limits, and reply-wait timeouts
+ * - `findings`: the findings board (see `findings.ts`): whether it is enabled, how each priority reaches the
+ *   orchestrator, and size limits
+ * - `credentials`: the credential store (see `credentials.ts`): whether it is enabled
  *
- * A trusted project's `.pi/subagents/config.json` overrides any of these fields; within `chat`, any sub-field.
+ * A trusted project's `.pi/subagents/config.json` overrides any of these fields; within `chat` and `findings`, any
+ * sub-field, and within `findings.delivery`, any priority.
  *
  * `system-prompt.md` is the global prompt every subagent gets before its own; a trusted project's
  * `.pi/subagents/system-prompt.md` is appended to it.
@@ -61,12 +65,35 @@ export interface ChatConfig {
 	maxReplyTimeoutSeconds: number;
 }
 
+/** How urgent a finding is. Its priority alone decides whether and when the orchestrator is told. */
+export type FindingPriority = "low" | "medium" | "high" | "critical";
+/** Lowest first, so a priority's index is its rank. */
+export const FINDING_PRIORITIES: readonly FindingPriority[] = ["low", "medium", "high", "critical"];
+
+export interface FindingsConfig {
+	enabled: boolean;
+	/**
+	 * How a finding of each priority reaches the orchestrator: `wake` steers it in at once (starting a turn if it is
+	 * idle) and ends a `subagent_wait`; `notify` adds it to its next turn; `silent` only stores it.
+	 */
+	delivery: Record<FindingPriority, BackgroundCompletion>;
+	maxDescriptionLength: number;
+	/** Size limit of a finding's metadata, as JSON. */
+	maxMetadataBytes: number;
+}
+
+export interface CredentialsConfig {
+	enabled: boolean;
+}
+
 export interface SubagentConfig {
 	coreTools: string[];
 	maxConcurrent: number;
 	defaultMode: SubagentMode;
 	onBackgroundComplete: BackgroundCompletion;
 	chat: ChatConfig;
+	findings: FindingsConfig;
+	credentials: CredentialsConfig;
 }
 
 const DEFAULT_CONFIG: SubagentConfig = {
@@ -82,6 +109,15 @@ const DEFAULT_CONFIG: SubagentConfig = {
 		maxMessagesPerMinute: 10,
 		replyTimeoutSeconds: 120,
 		maxReplyTimeoutSeconds: 600,
+	},
+	findings: {
+		enabled: true,
+		delivery: { critical: "wake", high: "wake", medium: "notify", low: "silent" },
+		maxDescriptionLength: 1000,
+		maxMetadataBytes: 4096,
+	},
+	credentials: {
+		enabled: true,
 	},
 };
 
@@ -118,6 +154,31 @@ function readChatConfig(value: unknown): Partial<ChatConfig> {
 const MODES: readonly SubagentMode[] = ["foreground", "background"];
 const COMPLETIONS: readonly BackgroundCompletion[] = ["wake", "notify", "silent"];
 
+type PartialFindingsConfig = Partial<Omit<FindingsConfig, "delivery">> & {
+	delivery?: Partial<Record<FindingPriority, BackgroundCompletion>>;
+};
+
+function readFindingsConfig(value: unknown): PartialFindingsConfig {
+	if (!value || typeof value !== "object") return {};
+	const fields = value as Record<string, unknown>;
+	const findings: PartialFindingsConfig = {};
+	if (typeof fields.enabled === "boolean") findings.enabled = fields.enabled;
+	if (fields.delivery && typeof fields.delivery === "object") {
+		const delivery = fields.delivery as Record<string, unknown>;
+		findings.delivery = {};
+		for (const priority of FINDING_PRIORITIES) {
+			const completion = delivery[priority];
+			if (COMPLETIONS.includes(completion as BackgroundCompletion)) {
+				findings.delivery[priority] = completion as BackgroundCompletion;
+			}
+		}
+	}
+	for (const key of ["maxDescriptionLength", "maxMetadataBytes"] as const) {
+		if (isPositiveInteger(fields[key])) findings[key] = fields[key];
+	}
+	return findings;
+}
+
 /** Directory holding the bundled `agents/`, `skills/`, and `config.json`. */
 export function getSubagentAssetsDir(): string {
 	if (isBunBinary) return join(getPackageDir(), "subagent");
@@ -126,7 +187,19 @@ export function getSubagentAssetsDir(): string {
 	return join(packageDir, srcOrDist, "extensions", "subagent");
 }
 
-type PartialConfig = Partial<Omit<SubagentConfig, "chat">> & { chat?: Partial<ChatConfig> };
+type PartialConfig = Partial<Omit<SubagentConfig, "chat" | "findings" | "credentials">> & {
+	chat?: Partial<ChatConfig>;
+	findings?: PartialFindingsConfig;
+	credentials?: Partial<CredentialsConfig>;
+};
+
+function readCredentialsConfig(value: unknown): Partial<CredentialsConfig> {
+	if (!value || typeof value !== "object") return {};
+	const fields = value as Record<string, unknown>;
+	const credentials: Partial<CredentialsConfig> = {};
+	if (typeof fields.enabled === "boolean") credentials.enabled = fields.enabled;
+	return credentials;
+}
 
 function readConfig(filePath: string): PartialConfig | undefined {
 	let raw: unknown;
@@ -149,6 +222,8 @@ function readConfig(filePath: string): PartialConfig | undefined {
 		config.onBackgroundComplete = onBackgroundComplete as BackgroundCompletion;
 	}
 	if (fields.chat !== undefined) config.chat = readChatConfig(fields.chat);
+	if (fields.findings !== undefined) config.findings = readFindingsConfig(fields.findings);
+	if (fields.credentials !== undefined) config.credentials = readCredentialsConfig(fields.credentials);
 	return config;
 }
 
@@ -161,6 +236,17 @@ export function loadSubagentConfig(projectDir: string | null): SubagentConfig {
 		...bundled,
 		...project,
 		chat: { ...DEFAULT_CONFIG.chat, ...bundled?.chat, ...project?.chat },
+		findings: {
+			...DEFAULT_CONFIG.findings,
+			...bundled?.findings,
+			...project?.findings,
+			delivery: {
+				...DEFAULT_CONFIG.findings.delivery,
+				...bundled?.findings?.delivery,
+				...project?.findings?.delivery,
+			},
+		},
+		credentials: { ...DEFAULT_CONFIG.credentials, ...bundled?.credentials, ...project?.credentials },
 	};
 }
 

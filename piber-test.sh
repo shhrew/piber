@@ -15,6 +15,8 @@ usage() {
   echo "  control Subagent control: start now, pause, resume, terminate, handback, held chat for paused subagents"
   echo "  render  Tool rendering: chat_peers, skill_search, load_skill in the main session and the agent view"
   echo "  visibility  Prompt visibility: the orchestrator's agent list, and each agent's tools and skills sections"
+  echo "  findings  Subagent findings: priority delivery, wait interruption, ownership, updates, list/get, result summaries"
+  echo "  credentials  Subagent credentials: broadcast to orchestrator and all subagents, held for queued, list/get, persistence"
 }
 
 chat_prompt() {
@@ -169,6 +171,88 @@ This is a manual test of what the orchestrator and each subagent can see in thei
 EOF
 }
 
+findings_prompt() {
+  cat <<'EOF'
+This is a manual test of subagent findings. Follow these steps exactly. Do not edit any files, and tell every subagent not to edit files either. Tell every subagent to quote each tool result verbatim in its final answer. After each step, quote your own tool results verbatim before going on.
+
+1. In ONE `subagent` call with `background: true`, start these three `worker` subagents in parallel:
+   - name "alpha", task: Do not edit files. Make these calls in order:
+     a. add_finding with key "auth.token-cache", priority "critical", description "Session tokens are never invalidated on logout", metadata {file: "src/cache.ts", line: 42, confirmed: true}
+     b. add_finding with key "docs.typo", priority "low", description "Typo in README", metadata {file: "README.md", line: 3}
+     c. update_finding on your finding from (b), with metadata {line: 4, file: null}
+     d. run `sleep 15` with bash
+     e. update_finding on your finding from (b), with priority "high" and description "The typo is in a public API name"
+     f. run `sleep 15` with bash
+     Finish with the id of each finding you added and every tool result.
+   - name "bravo", task: Do not edit files. Run `sleep 10` with bash first. Then:
+     a. list_findings with no arguments
+     b. get_finding with the id of alpha's "auth.token-cache" finding
+     c. update_finding on that finding with priority "low". It should be refused, since alpha owns it.
+     d. add_finding with key "Chat Hub Socket!", priority "medium", description "The hub socket is created lazily", metadata {file: "chat.ts"}
+     e. list_findings with minPriority "high"
+     Finish with every tool result.
+   - name "charlie", task: Do not edit files. Call add_finding with key "misc.note", priority "low", description "Nothing urgent". Finish with its result.
+2. Call subagent_wait with no names. A finding or chat message may end the wait early: quote the heading, call get_finding for each finding id it names, then call subagent_wait again, until all three have finished.
+3. Call update_finding on alpha's "auth.token-cache" finding with priority "low". It should be refused: you do not own it.
+4. Call list_findings with no arguments, then with from "alpha", then with key "auth".
+5. Read every result with subagent_result.
+6. Give a checklist, each item marked worked or failed with the evidence:
+   - ids are integers counting up from 1 across all three subagents
+   - alpha's critical finding reached you as a notice with id, key, priority, and sender only (no description or metadata), and ended subagent_wait early
+   - alpha's low finding (b) and its first update (c) did not notify you
+   - alpha's update (e) raising low to high notified you again, with revision 3, and ended subagent_wait early
+   - update (c) merged metadata: line is 4 and file is gone
+   - bravo's medium finding reached you on a later turn, not as a wake, and did not end subagent_wait
+   - charlie's low finding never notified you
+   - bravo's key "Chat Hub Socket!" was stored normalized as "chat-hub-socket"
+   - bravo could list and get alpha's findings, but its update_finding on alpha's finding was refused
+   - your update_finding (step 3) was refused
+   - list_findings filters: minPriority "high", from "alpha", and key "auth" each returned only matching findings, sorted by priority then id
+   - each subagent_result ends with a summary of that subagent's findings (id, priority, key), including charlie's low one
+7. Finally, print this checklist verbatim for the human tester:
+
+- [ ] main chat: each finding notice is one line, `⚑ #N <priority> · <sender> · <key>`, colored by priority
+- [ ] main chat: add_finding / update_finding / get_finding / list_findings calls are drawn as compact `●` lines, not text blocks
+- [ ] dock: alpha's row shows a ⚑ badge with its count, in the critical color
+- [ ] agent view, Findings tab (→ twice from Agents): every finding listed by priority, with sender, key, and description; Enter shows the description and metadata
+- [ ] agent view, alpha's transcript: its finding calls drawn the same way as in the main chat
+- [ ] persistence: quit, restart with `--continue`, call list_findings: the same findings are listed, and a new add_finding gets the next id
+EOF
+}
+
+credentials_prompt() {
+  cat <<'EOF'
+This is a manual test of subagent credentials. Follow these steps exactly. Do not edit any files, and tell every subagent not to edit files either. These are fake test secrets, not real ones. Tell every subagent to quote each tool result verbatim in its final answer. After each step, quote your own tool results verbatim before going on.
+
+1. In ONE `subagent` call with `background: true`, start these three `worker` subagents in parallel (only two run at once, so charlie should start queued):
+   - name "alpha", task: Do not edit files. Call add_credential with label "GitHub CI Token!", purpose "push to the CI repo", value "ghp_fake_alpha". Then run `sleep 20` with bash. Then call list_credentials. Finish with every tool result and every <agent_credentials> notice you received, quoted verbatim.
+   - name "bravo", task: Do not edit files. Run `sleep 8` with bash first, then call add_credential with label "npm-token", purpose "publish the package", value "npm_fake_bravo". Then call get_credential for alpha's credential id. Finish with every tool result and every <agent_credentials> notice you received, quoted verbatim.
+   - name "charlie", task: Do not edit files. First quote any <agent_credentials> notice you already received (one should have been held while you were queued). Then run `sleep 5` with bash. Finish with every tool result and every notice you received, quoted verbatim.
+2. Call subagent_wait with no names. A credential announcement may end the wait early: quote the heading, call get_credential for each id it names, then call subagent_wait again, until all three have finished.
+3. Call add_credential yourself with label "orchestrator-key", purpose "sign releases", value "sk_fake_orch".
+4. Call list_credentials, then get_credential for every id.
+5. Read every result with subagent_result.
+6. Give a checklist, each item marked worked or failed with the evidence:
+   - ids are integers counting up from 1 across all subagents and the orchestrator
+   - alpha's credential reached you as an <agent_credentials> notice with its value, and ended subagent_wait early
+   - alpha's credential also reached bravo and charlie (quoted in their results)
+   - charlie, queued when alpha added its credential, received the announcement when it started
+   - alpha's label "GitHub CI Token!" was stored normalized as "github-ci-token"
+   - bravo could get_credential alpha's credential and see its value
+   - the credential you added (step 3) was NOT announced back to you, but a running subagent would receive it
+   - list_credentials shows every credential without values; get_credential shows the values
+   - each subagent_result ends with a summary of that subagent's credentials (id, label)
+7. Finally, print this checklist verbatim for the human tester:
+
+- [ ] main chat: each credential announcement is one line, `⚷ #N <label> · <sender> · <purpose>`
+- [ ] main chat: add_credential / get_credential / list_credentials calls are drawn as compact `●` lines, not text blocks
+- [ ] main chat: expanding an announcement or a credential tool result shows the credential as JSON, value included
+- [ ] dock: alpha's row shows a ⚷ badge with its count
+- [ ] agent view, Credentials tab (→ three times from Agents): every credential listed with label, sender, and purpose; Enter shows the value
+- [ ] persistence: quit, restart with `--continue`, call list_credentials: the same credentials are listed, and a new add_credential gets the next id
+EOF
+}
+
 if [[ $# -lt 1 ]]; then
   usage
   exit 1
@@ -192,6 +276,12 @@ case "$SCENARIO" in
     ;;
   visibility)
     PROMPT="$(visibility_prompt)"
+    ;;
+  findings)
+    PROMPT="$(findings_prompt)"
+    ;;
+  credentials)
+    PROMPT="$(credentials_prompt)"
     ;;
   -h | --help)
     usage

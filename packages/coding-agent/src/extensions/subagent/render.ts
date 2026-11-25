@@ -26,6 +26,9 @@ import type { Theme, ThemeColor } from "../../modes/interactive/theme/theme.ts";
 import type { AgentSource } from "./agents.ts";
 import { BROADCAST, type ChatDelivery, type SendOutcome } from "./chat.ts";
 import type { SubagentStatus, SubagentUsage } from "./child.ts";
+import type { Credential, CredentialResult } from "./credentials.ts";
+import { compareFindings, type Finding, type FindingResult } from "./findings.ts";
+import type { BackgroundCompletion, FindingPriority } from "./paths.ts";
 import type { SkillSearchMatch } from "./skills.ts";
 
 /** The frames and timing of pi-tui's `Loader`, the spinner next to "Working", which does not export them. */
@@ -888,5 +891,308 @@ export function renderBackgroundNotice(
 		}),
 	);
 	container.addChild(renderSubagentResult({ mode: "parallel", results }, "", { ...options, isError }, theme));
+	return container;
+}
+
+/** Critical in the error color, high in the warning color, medium in the accent color, low muted. */
+export function priorityColor(priority: FindingPriority): ThemeColor {
+	switch (priority) {
+		case "critical":
+			return "error";
+		case "high":
+			return "warning";
+		case "medium":
+			return "accent";
+		default:
+			return "muted";
+	}
+}
+
+/** `#7 critical auth.token-cache`, the priority in its color. */
+export function formatFindingLabel(finding: Pick<Finding, "id" | "priority" | "key">, theme: Theme): string {
+	return `${theme.fg("dim", `#${finding.id}`)} ${theme.fg(priorityColor(finding.priority), finding.priority)} ${theme.fg("accent", finding.key)}`;
+}
+
+/** A finding in full as indented JSON, for expanded rows. */
+function findingJson(finding: Finding, theme: Theme, indent: number): Component {
+	return new Text(theme.fg("toolOutput", JSON.stringify(finding, null, 2)), indent, 0);
+}
+
+/** `● Add finding(auth.token-cache) critical`. */
+export function renderAddFindingCall(
+	args: { key?: string; priority?: string },
+	theme: Theme,
+	state: CallState,
+): Component {
+	return renderCallLine("Add finding", args.key || "...", args.priority ?? "", theme, state);
+}
+
+/** `● Update finding(#7) priority high · metadata`: the fields the update sets. */
+export function renderUpdateFindingCall(
+	args: { id?: number; key?: string; description?: string; priority?: string; metadata?: unknown },
+	theme: Theme,
+	state: CallState,
+): Component {
+	const changes = [
+		args.priority ? `priority ${args.priority}` : undefined,
+		args.key !== undefined ? "key" : undefined,
+		args.description !== undefined ? "description" : undefined,
+		args.metadata !== undefined ? "metadata" : undefined,
+	].filter(Boolean);
+	return renderCallLine(
+		"Update finding",
+		args.id === undefined ? "..." : `#${args.id}`,
+		changes.join(" · "),
+		theme,
+		state,
+	);
+}
+
+/** `● Get finding(#7, #9)`. */
+export function renderGetFindingCall(args: { ids?: number[] }, theme: Theme, state: CallState): Component {
+	return renderCallLine("Get finding", (args.ids ?? []).map((id) => `#${id}`).join(", ") || "...", "", theme, state);
+}
+
+/** `● List findings(auth) from alpha · high+`, or `● List findings(all)` without filters. */
+export function renderListFindingsCall(
+	args: { from?: string; key?: string; minPriority?: string; after?: number; limit?: number },
+	theme: Theme,
+	state: CallState,
+): Component {
+	const filters = [
+		args.from ? `from ${args.from}` : undefined,
+		args.minPriority ? `${args.minPriority}+` : undefined,
+		args.after !== undefined ? `after #${args.after}` : undefined,
+		args.limit !== undefined ? `up to ${args.limit}` : undefined,
+	].filter(Boolean);
+	const argument = args.key || (filters.length > 0 ? undefined : "all");
+	return renderCallLine("List findings", argument, filters.join(" · "), theme, state);
+}
+
+const DELIVERY_LABELS: Record<BackgroundCompletion, string> = {
+	wake: "orchestrator told",
+	notify: "orchestrator told on its next turn",
+	silent: "stored",
+};
+
+/**
+ * `⎿  #7 critical auth.token-cache · orchestrator told`, or `· revision 2` for an update. Expanded, the description
+ * and metadata follow.
+ */
+export function renderFindingWriteResult(
+	details: FindingResult | undefined,
+	text: string,
+	options: { expanded: boolean; isError: boolean; outputPad: number },
+	theme: Theme,
+): Component {
+	const pad = " ".repeat(options.outputPad);
+	const elbow = `${pad}  ${theme.fg("muted", "⎿")}  `;
+	const finding = details?.ok ? details.findings[0] : undefined;
+	if (!finding || options.isError) {
+		return new SingleLines([elbow + theme.fg(options.isError ? "error" : "dim", text.split("\n")[0] ?? "")]);
+	}
+	const delivery = details?.delivery ?? "silent";
+	const outcome =
+		finding.revision > 1
+			? [`revision ${finding.revision}`, ...(delivery === "silent" ? [] : [DELIVERY_LABELS[delivery]])]
+			: [DELIVERY_LABELS[delivery]];
+	const summary = new SingleLines([
+		`${elbow}${formatFindingLabel(finding, theme)}${theme.fg("dim", ` · ${outcome.join(" · ")}`)}`,
+	]);
+	if (!options.expanded) return summary;
+	const container = new Container();
+	container.addChild(summary);
+	container.addChild(findingJson(finding, theme, options.outputPad + 5));
+	return container;
+}
+
+/**
+ * For `get_finding`, one row per finding with its sender and the start of its description; expanded, each with its
+ * description and metadata in full. For `list_findings`, `⎿  3 findings · #7 critical, #9 high, #2 low`; expanded,
+ * one row per finding.
+ */
+export function renderFindingReadResult(
+	details: FindingResult | undefined,
+	text: string,
+	options: { expanded: boolean; isError: boolean; outputPad: number; list?: boolean },
+	theme: Theme,
+): Component {
+	const pad = " ".repeat(options.outputPad);
+	const elbow = `${pad}  ${theme.fg("muted", "⎿")}  `;
+	const indent = `${pad}     `;
+	const dim = (value: string) => theme.fg("dim", value);
+	const findings = details?.findings ?? [];
+	if (options.isError || findings.length === 0) {
+		return new SingleLines([elbow + theme.fg(options.isError ? "error" : "dim", text.split("\n")[0] ?? "")]);
+	}
+	if (options.list && !options.expanded) {
+		const total = details?.total ?? findings.length;
+		const labels = findings.map(
+			(finding) => `${dim(`#${finding.id}`)} ${theme.fg(priorityColor(finding.priority), finding.priority)}`,
+		);
+		return new SingleLines([
+			`${elbow}${dim(`${total} finding${total === 1 ? "" : "s"} · `)}${labels.join(dim(", "))}`,
+		]);
+	}
+	const row = (finding: Finding, index: number) =>
+		`${index === 0 ? elbow : indent}${formatFindingLabel(finding, theme)}${dim(` · ${finding.from} · ${preview(finding.description, 80)}`)}`;
+	if (options.list || !options.expanded) return new SingleLines(findings.map(row));
+	const container = new Container();
+	findings.forEach((finding, index) => {
+		container.addChild(new SingleLines([row(finding, index)]));
+		container.addChild(findingJson(finding, theme, options.outputPad + 7));
+	});
+	return container;
+}
+
+/**
+ * The notice that tells the orchestrator about findings: `⚑ #7 critical · scout-a · auth.token-cache` per finding.
+ * Expanded, each line is followed by the finding as JSON: its current state from `lookup` when the board still has
+ * it, otherwise the copy the notice was sent with.
+ */
+export function renderFindingNotice(
+	findings: readonly Finding[],
+	options: { expanded: boolean; outputPad: number; lookup?: (id: number) => Finding | undefined },
+	theme: Theme,
+): Component {
+	const pad = " ".repeat(options.outputPad);
+	const dot = theme.fg("dim", " · ");
+	const line = (finding: Finding) => {
+		const color = priorityColor(finding.priority);
+		const revision = finding.revision > 1 ? theme.fg("dim", ` · revision ${finding.revision}`) : "";
+		return `${pad}${theme.fg(color, "⚑")} ${theme.fg("dim", `#${finding.id}`)} ${theme.fg(color, finding.priority)}${dot}${theme.fg("accent", finding.from)}${dot}${finding.key}${revision}`;
+	};
+	const sorted = [...findings].sort(compareFindings);
+	if (!options.expanded) return new SingleLines(sorted.map(line));
+	const container = new Container();
+	for (const finding of sorted) {
+		container.addChild(new SingleLines([line(finding)]));
+		container.addChild(findingJson(options.lookup?.(finding.id) ?? finding, theme, options.outputPad + 2));
+	}
+	return container;
+}
+
+/** A credential in full as indented JSON, for expanded rows. */
+function credentialJson(credential: Credential, theme: Theme, indent: number): Component {
+	return new Text(theme.fg("toolOutput", JSON.stringify(credential, null, 2)), indent, 0);
+}
+
+/** `#3 github-ci-token`. */
+function credentialLabel(credential: Pick<Credential, "id" | "label">, theme: Theme): string {
+	return `${theme.fg("dim", `#${credential.id}`)} ${theme.fg("accent", credential.label)}`;
+}
+
+/** `● Add credential(github-ci-token)`. */
+export function renderAddCredentialCall(args: { label?: string }, theme: Theme, state: CallState): Component {
+	return renderCallLine("Add credential", args.label || "...", "", theme, state);
+}
+
+/** `● Get credential(#3, #5)`. */
+export function renderGetCredentialCall(args: { ids?: number[] }, theme: Theme, state: CallState): Component {
+	return renderCallLine(
+		"Get credential",
+		(args.ids ?? []).map((id) => `#${id}`).join(", ") || "...",
+		"",
+		theme,
+		state,
+	);
+}
+
+/** `● List credentials(from alpha)`, or `● List credentials(all)` without a filter. */
+export function renderListCredentialsCall(
+	args: { from?: string; limit?: number },
+	theme: Theme,
+	state: CallState,
+): Component {
+	const filters = [
+		args.from ? `from ${args.from}` : undefined,
+		args.limit !== undefined ? `up to ${args.limit}` : undefined,
+	].filter(Boolean);
+	return renderCallLine(
+		"List credentials",
+		args.from ? args.from : filters.length > 0 ? undefined : "all",
+		filters.join(" · "),
+		theme,
+		state,
+	);
+}
+
+/** `⎿  #3 github-ci-token · everyone told`. Expanded, the credential as JSON, value included. */
+export function renderCredentialWriteResult(
+	details: CredentialResult | undefined,
+	text: string,
+	options: { expanded: boolean; isError: boolean; outputPad: number },
+	theme: Theme,
+): Component {
+	const pad = " ".repeat(options.outputPad);
+	const elbow = `${pad}  ${theme.fg("muted", "⎿")}  `;
+	const credential = details?.ok ? details.credentials[0] : undefined;
+	if (!credential || options.isError) {
+		return new SingleLines([elbow + theme.fg(options.isError ? "error" : "dim", text.split("\n")[0] ?? "")]);
+	}
+	const summary = new SingleLines([
+		`${elbow}${credentialLabel(credential, theme)}${theme.fg("dim", " · everyone told")}`,
+	]);
+	if (!options.expanded) return summary;
+	const container = new Container();
+	container.addChild(summary);
+	container.addChild(credentialJson(credential, theme, options.outputPad + 5));
+	return container;
+}
+
+/**
+ * For `get_credential`, one row per credential; expanded, each as JSON with its value. For `list_credentials`,
+ * `⎿  2 credentials · #3 github-ci-token, #5 npm-token`; expanded, one row per credential with its purpose.
+ */
+export function renderCredentialReadResult(
+	details: CredentialResult | undefined,
+	text: string,
+	options: { expanded: boolean; isError: boolean; outputPad: number; list?: boolean },
+	theme: Theme,
+): Component {
+	const pad = " ".repeat(options.outputPad);
+	const elbow = `${pad}  ${theme.fg("muted", "⎿")}  `;
+	const indent = `${pad}     `;
+	const dim = (value: string) => theme.fg("dim", value);
+	const credentials = details?.credentials ?? [];
+	if (options.isError || credentials.length === 0) {
+		return new SingleLines([elbow + theme.fg(options.isError ? "error" : "dim", text.split("\n")[0] ?? "")]);
+	}
+	if (options.list && !options.expanded) {
+		const labels = credentials.map((credential) => credentialLabel(credential, theme));
+		return new SingleLines([
+			`${elbow}${dim(`${credentials.length} credential${credentials.length === 1 ? "" : "s"} · `)}${labels.join(dim(", "))}`,
+		]);
+	}
+	const row = (credential: Credential, index: number) =>
+		`${index === 0 ? elbow : indent}${credentialLabel(credential, theme)}${dim(` · ${credential.from} · ${preview(credential.purpose, 80)}`)}`;
+	if (options.list || !options.expanded) return new SingleLines(credentials.map(row));
+	const container = new Container();
+	credentials.forEach((credential, index) => {
+		container.addChild(new SingleLines([row(credential, index)]));
+		container.addChild(credentialJson(credential, theme, options.outputPad + 7));
+	});
+	return container;
+}
+
+/**
+ * The notice announcing new credentials: `⚷ #3 github-ci-token · scout-a · push to the CI repo` per credential.
+ * Expanded, each line is followed by the credential as JSON, value included.
+ */
+export function renderCredentialNotice(
+	credentials: readonly Credential[],
+	options: { expanded: boolean; outputPad: number; lookup?: (id: number) => Credential | undefined },
+	theme: Theme,
+): Component {
+	const pad = " ".repeat(options.outputPad);
+	const dot = theme.fg("dim", " · ");
+	const line = (credential: Credential) =>
+		`${pad}${theme.fg("warning", "⚷")} ${theme.fg("dim", `#${credential.id}`)} ${theme.fg("accent", credential.label)}${dot}${theme.fg("accent", credential.from)}${dot}${theme.fg("dim", preview(credential.purpose, 60))}`;
+	if (!options.expanded) return new SingleLines(credentials.map(line));
+	const container = new Container();
+	for (const credential of credentials) {
+		container.addChild(new SingleLines([line(credential)]));
+		container.addChild(credentialJson(options.lookup?.(credential.id) ?? credential, theme, options.outputPad + 2));
+	}
 	return container;
 }

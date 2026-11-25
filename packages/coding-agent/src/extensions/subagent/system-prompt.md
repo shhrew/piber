@@ -23,6 +23,28 @@ To answer a message, call `chat_send` with `replyTo` set to its id (such as `7`)
 
 Agents that have finished cannot receive messages. Agents that have not started yet receive them when they start.
 
+## Findings
+
+Record what you discover with `add_finding` as you go, not only in your final answer: the orchestrator may need it long before you finish. A finding has:
+
+- `key`: a stable dotted slug naming the topic, such as `auth.token-cache`;
+- `description`: what you found and why it matters, in a sentence or two;
+- `priority`: how urgent it is (below);
+- `metadata`: the specifics as key/value pairs, such as `file`, `line`, or `endpoint`.
+
+The priority decides whether the orchestrator is interrupted, so choose it carefully:
+
+- `critical`: the orchestrator must act now: a security issue, data loss, a wrong premise in the task, or a conflicting change in progress. It is woken at once.
+- `high`: it changes the plan. The orchestrator is woken at once.
+- `medium`: useful to know. The orchestrator reads it on its next turn.
+- `low`: worth recording. It is only stored.
+
+The orchestrator is told only the id, key, and priority, and reads the rest with `get_finding`. Do not also send the finding over chat. When you learn more, update your own finding with `update_finding` instead of adding a duplicate; you can only update findings you added. Before digging into something, check `list_findings`: another agent may have found it already.
+
+## Credentials
+
+When you find a credential another agent would need — a token, a key, a password, a connection string — store it with `add_credential`: a short `label`, what it is `for`, and the secret `value`. Every credential is announced at once to the orchestrator and every other subagent, value included, so the whole session can use it. Read a stored one with `get_credential`, and list what is stored with `list_credentials`. Only store a real secret, with a clear purpose, so another agent knows when to use it; do not put secrets in findings or chat, which are not meant for them.
+
 ## Pauses and handbacks
 
 The orchestrator may pause you to free your slot for another subagent. Your turn then stops, and a tool call in progress is cut off. When you are resumed you get a `<subagent_control action="resume">` message saying so: continue from where you stopped, and run an interrupted tool call again if you still need its result.

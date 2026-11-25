@@ -7,6 +7,8 @@ import type { ToolRenderers } from "../../../src/core/extensions/types.ts";
 import { KeybindingsManager } from "../../../src/core/keybindings.ts";
 import { ChatLog, type ChatLogEntry } from "../../../src/extensions/subagent/chat.ts";
 import { Subagent, type SubagentOptions } from "../../../src/extensions/subagent/child.ts";
+import { CredentialStore } from "../../../src/extensions/subagent/credentials.ts";
+import { FindingStore } from "../../../src/extensions/subagent/findings.ts";
 import { SubagentRegistry } from "../../../src/extensions/subagent/registry.ts";
 import { renderSkillSearchCall, renderSkillSearchResult } from "../../../src/extensions/subagent/render.ts";
 import { SlotPool } from "../../../src/extensions/subagent/slots.ts";
@@ -97,6 +99,8 @@ function createView(
 		isAwaitingReply?: (id: string) => boolean;
 		chatSenderOf?: (id: string) => string | undefined;
 		chatLog?: ChatLog;
+		findings?: FindingStore;
+		credentials?: CredentialStore;
 		toolRenderers?: ReadonlyMap<string, ToolRenderers>;
 	} = {},
 ) {
@@ -117,6 +121,8 @@ function createView(
 		isAwaitingReply: options.isAwaitingReply,
 		chatSenderOf: options.chatSenderOf,
 		chatLog: options.chatLog,
+		findings: options.findings,
+		credentials: options.credentials,
 		toolRenderers: options.toolRenderers,
 	});
 	const lines = () => view.render(80).map((line) => stripVTControlCharacters(line));
@@ -523,5 +529,104 @@ describe("subagent agent view chat tab", () => {
 		chatLog.add(chatEntry({ id: "41", text: "msg-41" }));
 		expect(visible()).toEqual(held);
 		expect(lines()[1]).toMatch(/↓ \d+ more/);
+	});
+});
+
+describe("subagent agent view findings tab", () => {
+	const fields = { metadata: {}, createdAt: 0, updatedAt: new Date(2026, 0, 1, 12, 1).getTime(), revision: 1 };
+
+	it("is the tab after Chat, and the agent-view key returns to Chat", () => {
+		const { view, lines, closed } = createView([], { chatLog: new ChatLog(), findings: new FindingStore() });
+		view.handleInput(KEYS.right);
+		view.handleInput(KEYS.right);
+		expect(lines()[0]).toContain("Agents   Chat   Findings");
+		expect(lines()[1]).toContain("← chat");
+		expect(lines().join("\n")).toContain("No findings in this session yet.");
+
+		view.handleInput(KEYS.left);
+		expect(lines()[1]).toContain("← agents");
+		view.handleInput(KEYS.right);
+		view.handleInput(KEYS.escape);
+		expect(closed()).toBe(true);
+	});
+
+	it("lists findings by priority, moves the selection, and expands the selected one", () => {
+		const findings = new FindingStore();
+		findings.create({ ...fields, from: "alpha", key: "docs.typo", description: "Typo in README", priority: "low" });
+		findings.create({
+			...fields,
+			from: "bravo",
+			key: "auth.token-cache",
+			description: "Tokens are never invalidated",
+			priority: "critical",
+			metadata: { file: "src/cache.ts", line: 42 },
+		});
+		const { view, lines } = createView([], { findings });
+		view.handleInput(KEYS.right);
+		view.handleInput(KEYS.right);
+
+		expect(lines()[0]).toContain("Findings 2");
+		const body = () =>
+			lines()
+				.slice(3)
+				.filter((line) => line.trim() !== "");
+		expect(body()[0]).toBe("›12:01 #2 critical bravo auth.token-cache  Tokens are never invalidated");
+		expect(body()[1]).toBe(" 12:01 #1 low      alpha docs.typo  Typo in README");
+
+		view.handleInput(KEYS.enter);
+		expect(body().slice(1, 4)).toEqual([
+			"      Tokens are never invalidated",
+			"      file: src/cache.ts",
+			"      line: 42",
+		]);
+		view.handleInput(KEYS.down);
+		expect(body()[4].startsWith("›12:01 #1 low")).toBe(true);
+		view.handleInput(KEYS.enter);
+		expect(body()[5]).toBe("      Typo in README");
+	});
+});
+
+describe("subagent agent view credentials tab", () => {
+	it("is the tab after Findings, lists credentials, and expands the selected value", () => {
+		const credentials = new CredentialStore();
+		credentials.create({
+			from: "alpha",
+			label: "ci-token",
+			purpose: "push to CI",
+			value: "ghp_secret",
+			createdAt: new Date(2026, 0, 1, 12, 1).getTime(),
+		});
+		credentials.create({
+			from: "bravo",
+			label: "npm-token",
+			purpose: "publish",
+			value: "npm_zzz",
+			createdAt: new Date(2026, 0, 1, 12, 2).getTime(),
+		});
+		const { view, lines, closed } = createView([], {
+			chatLog: new ChatLog(),
+			findings: new FindingStore(),
+			credentials,
+		});
+
+		view.handleInput(KEYS.right);
+		view.handleInput(KEYS.right);
+		view.handleInput(KEYS.right);
+		expect(lines()[0]).toContain("Agents   Chat   Findings   Credentials 2");
+		const body = () =>
+			lines()
+				.slice(3)
+				.filter((line) => line.trim() !== "");
+		expect(body()[0]).toBe("›12:01 #1 ci-token  alpha  push to CI");
+		expect(body()[1]).toBe(" 12:02 #2 npm-token bravo  publish");
+
+		view.handleInput(KEYS.enter);
+		expect(body()[1]).toBe("      value: ghp_secret");
+		expect(body()[2]).toBe(" 12:02 #2 npm-token bravo  publish");
+
+		// Left goes back to Findings, not out.
+		view.handleInput(KEYS.left);
+		expect(lines()[1]).toContain("→ credentials");
+		expect(closed()).toBe(false);
 	});
 });

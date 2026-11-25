@@ -24,7 +24,7 @@ You are a Symfony developer...
 
 ### Global subagent prompt
 
-`system-prompt.md` in this directory goes at the start of every subagent's prompt: what working as a subagent means, and how to use chat. A trusted project's `.pi/subagents/system-prompt.md` is appended to it. The full prompt is the global prompt, then the agent's own prompt, then its skills section, then a generated chat section with the subagent's chat name and who it may message.
+`system-prompt.md` in this directory goes at the start of every subagent's prompt: what working as a subagent means, and how to use chat, findings, and credentials. A trusted project's `.pi/subagents/system-prompt.md` is appended to it. The full prompt is the global prompt, then the agent's own prompt, then its skills section, then a generated chat section with the subagent's chat name and who it may message.
 
 Agents are loaded from two places:
 
@@ -41,6 +41,9 @@ A subagent gets, in order:
 2. The agent's `tools`.
 3. The call's `extraTools`.
 4. `skill_search` and `load_skill`, when the agent has skill groups.
+5. `chat_send` and `chat_peers`, when the agent may send chat messages.
+6. `add_finding`, `update_finding`, `get_finding`, and `list_findings`, when findings are enabled.
+7. `add_credential`, `get_credential`, and `list_credentials`, when credentials are enabled.
 
 Extension and MCP tools work when the child process loads the same extensions. The `subagent` tool is never passed to a subagent, so subagents cannot start further subagents.
 
@@ -188,6 +191,86 @@ Reply with chat_send replyTo 4 only if it is needed.
 
 **How it works.** The parent runs a chat hub on a local socket (a Unix socket in a private temporary directory, or a named pipe on Windows) and gives each subagent process the socket path and a secret token (in the `PI_SUBAGENT_CHAT_TOKEN` environment variable). The hub checks every message's permissions and limits, so a subagent cannot impersonate another or go past its `canMessage`.
 
+## Findings
+
+Agents record what they discover on a findings board shared by the session, so the orchestrator hears about urgent discoveries while a long subagent is still working, and can look up any finding later instead of digging through chat.
+
+| Tool | Parameters | Use |
+|---|---|---|
+| `add_finding` | `key`, `description`, `priority`, `metadata` (optional) | Add a finding. Returns its id. |
+| `update_finding` | `id`, and any of `key`, `description`, `priority`, `metadata` | Change a finding you added. |
+| `get_finding` | `ids` | Read findings in full. |
+| `list_findings` | `from`, `key` (a prefix), `minPriority`, `after` (an id), `limit` (all optional) | List findings, highest priority first. |
+
+A finding has:
+
+- `id`: an integer the board assigns, 1, 2, and so on, in the order findings are added in the session;
+- `from`: the agent that added it, taken from its chat token, so it cannot be forged;
+- `key`: a slug such as `auth.token-cache`, lowercased, with characters other than letters, digits, `.`, `_`, and `-` dropped;
+- `description`: what was found and why it matters;
+- `priority`: `low`, `medium`, `high`, or `critical`;
+- `metadata`: key/value details, such as `file` and `line`; values are strings, numbers, or booleans;
+- `revision`: 1 when added, one more with each update.
+
+```
+scout-a  add_finding {key: "auth.token-cache", priority: "critical",
+                      description: "Session tokens are never invalidated on logout",
+                      metadata: {file: "src/cache.ts", line: 42}}
+         → Added finding 7 (critical). The orchestrator was told.
+orch     <agent_findings>
+         <finding id="7" from="scout-a" priority="critical" key="auth.token-cache"/>
+         </agent_findings>
+orch     get_finding {ids: [7]} → the description and metadata
+```
+
+**Delivery.** Priority alone decides whether the orchestrator is told, as `findings.delivery` sets. By default:
+
+| Priority | Delivery | What happens |
+|---|---|---|
+| `critical`, `high` | `wake` | The notice is steered in after the orchestrator's current tool call, or starts a turn when it is idle. It also ends a `subagent_wait`, like a chat message. |
+| `medium` | `notify` | The notice is added to the orchestrator's next turn. Findings within half a second share one notice. |
+| `low` | `silent` | Only stored. |
+
+The notice names each finding's id, sender, priority, and key, never its description or metadata, so it stays small; the orchestrator reads the rest with `get_finding`. Findings the orchestrator adds itself are never delivered to it. An update is delivered only when the new priority has a stronger delivery than the old one (low to high, say), so a subagent refining a finding does not wake the orchestrator again; its notice carries `revision`.
+
+**Ownership.** Every agent can list and read every finding. Only the agent that added a finding can update it. An update merges `metadata` into the finding's metadata, and a key set to `null` removes it; other fields are replaced. A subagent continued with `session` keeps its name, so it can still update its earlier findings.
+
+**Summaries.** `subagent_result` and the background completion notice end with a line per subagent that added findings, such as `Findings by scout-a: 7 critical auth.token-cache, 9 low docs.typo.` Status lines in `subagent_wait`, `subagent_list`, and notices count them: `done, 3 turns; 2 findings (1 critical)`. Low findings are not lost when a final answer leaves them out.
+
+**Limits.** Descriptions longer than `findings.maxDescriptionLength` characters, and metadata larger than `findings.maxMetadataBytes` as JSON, are refused.
+
+**Persistence.** Findings are appended to `findings.jsonl` in the session's subagent directory (see [Sessions](#sessions)), one line per add or update. A resumed session loads them, keeping the last revision of each, and new ids continue after the highest. Without a session file, findings are kept in memory only. A subagent in a resumed session that takes the name of an earlier one can update that one's findings.
+
+**How it works.** The board lives in the parent. Subagents reach it over the chat hub's socket, which runs while chat or findings is enabled, so with chat turned off a subagent still joins the hub for findings. Subagents get the finding tools whenever findings are enabled; no permission is needed.
+
+## Credentials
+
+A credential store, also shared by the session, for secrets an agent finds and what they are for: a token, a key, a password, a connection string. Unlike a finding, a new credential is announced to the orchestrator AND every other subagent at once, value included, so a swarm that discovers a secret can all use it without asking.
+
+| Tool | Parameters | Use |
+|---|---|---|
+| `add_credential` | `label`, `purpose`, `value` | Store a credential. Returns its id. |
+| `get_credential` | `ids` | Read credentials in full, value included. |
+| `list_credentials` | `from`, `limit` (both optional) | List credentials, without their values. |
+
+A credential has:
+
+- `id`: an integer the store assigns, 1, 2, and so on;
+- `from`: the agent that added it, taken from its chat token, so it cannot be forged;
+- `label`: a slug such as `github-ci-token`, normalized like a finding key;
+- `purpose`: what the credential is for;
+- `value`: the secret itself.
+
+Credentials are immutable: to change one, add a new one.
+
+**Delivery.** Adding a credential tells the orchestrator (steered in after its current tool call, or starting a turn when it is idle, and ending a `subagent_wait`, like an urgent finding) and every other subagent still running, queued, or paused. A subagent not started yet gets it when it starts; a paused one when it resumes. The announcement carries the value, so every agent can use the credential as soon as it is stored. A subagent does not receive its own credential back, and the orchestrator is not told about one it added itself. Status summaries in `subagent_result` and the completion notice list a subagent's credentials by id and label.
+
+**Secrets on disk and in context.** This is a deliberately unguarded store: values are written to `credentials.jsonl` in the session's subagent directory in plaintext, reach every agent's context, and appear in `PIBER_DEBUG` dumps. Treat a session directory that holds credentials as secret. `list_credentials` leaves the value out, but `get_credential` and the announcement include it.
+
+**Persistence.** Credentials are appended to `credentials.jsonl` next to the findings (see [Sessions](#sessions)). A resumed session loads them and continues the ids. Without a session file, they are kept in memory only.
+
+**How it works.** The store lives in the parent, served over the same hub socket as chat and findings; the hub runs while chat, findings, or credentials is enabled. Subagents get the credential tools whenever credentials are enabled; no permission is needed.
+
 ## Configuration
 
 `config.json` in this directory sets defaults for every subagent. A trusted project can override any field in `.pi/subagents/config.json`.
@@ -206,6 +289,15 @@ Reply with chat_send replyTo 4 only if it is needed.
 		"maxMessagesPerMinute": 10,
 		"replyTimeoutSeconds": 120,
 		"maxReplyTimeoutSeconds": 600
+	},
+	"findings": {
+		"enabled": true,
+		"delivery": { "critical": "wake", "high": "wake", "medium": "notify", "low": "silent" },
+		"maxDescriptionLength": 1000,
+		"maxMetadataBytes": 4096
+	},
+	"credentials": {
+		"enabled": true
 	}
 }
 ```
@@ -216,13 +308,15 @@ Reply with chat_send replyTo 4 only if it is needed.
 | `maxConcurrent` | How many subagent processes may run at once in a session. It must be a positive integer; other values are ignored. |
 | `defaultMode` | `"foreground"` or `"background"`: how a `subagent` call runs when it does not set `background`. |
 | `chat` | Subagent chat (see [Chat](#chat)): `enabled`; `defaultCanMessage` for agents without `canMessage`; `orchestratorCanMessage`; `maxMessageLength` in characters; `maxMessagesPerMinute` per agent; `replyTimeoutSeconds` and `maxReplyTimeoutSeconds` for `waitForReply`. A project's `chat` object overrides individual fields. |
+| `findings` | The findings board (see [Findings](#findings)): `enabled`; `delivery`, `wake`, `notify`, or `silent` for each priority; `maxDescriptionLength` in characters; `maxMetadataBytes` as JSON. A project's `findings` object overrides individual fields, and its `delivery` individual priorities. |
+| `credentials` | The credential store (see [Credentials](#credentials)): `enabled`. A project can turn it off with `{ "enabled": false }`. |
 | `onBackgroundComplete` | What happens when a background subagent finishes and nothing has reported it: `"wake"` posts a notice at once, starting a turn if the orchestrator is idle or queuing it after the current one; `"notify"` posts it with the next turn; `"silent"` posts nothing, leaving the result to `subagent_wait` and `subagent_result`. |
 
 `maxConcurrent` covers every subagent the session starts: parallel tasks, separate `subagent` calls, `session` continuations, and follow-ups sent from the agent view. A subagent beyond the limit waits in a queue with the status `queued` (`◷`), and starts in order when a running one finishes. Esc in the agent view, or aborting the parent's tool call, removes it from the queue. A queued subagent cannot be steered until it starts. The orchestrator can reorder this with `subagent_control` (see [Controlling subagents](#controlling-subagents)). The limit is read again before each run, so editing `config.json` takes effect for the next subagent.
 
 ## Sessions
 
-Each subagent keeps a normal Pi session file in `<parent session dir>/subagents/<parent session id>/`, named `<name>: <description>`. The tool result tells the parent model the subagent's name so it can send a follow-up with `session`. You can open any subagent session later with `pi --session <path>`. When the parent runs without a session file (`--no-session`), subagents do not keep one either.
+Each subagent keeps a normal Pi session file in `<parent session dir>/subagents/<parent session id>/`, named `<name>: <description>`. The tool result tells the parent model the subagent's name so it can send a follow-up with `session`. You can open any subagent session later with `pi --session <path>`. When the parent runs without a session file (`--no-session`), subagents do not keep one either. The same directory holds the session's `findings.jsonl` and `credentials.jsonl` (see [Findings](#findings) and [Credentials](#credentials)).
 
 The child process runs only while the subagent works. A follow-up starts a new process on the same session file.
 
@@ -273,7 +367,7 @@ Rows beyond the fourth are reached by moving the selection; the dock shows how m
 
 ## Agent view
 
-Press `←` while the editor is empty (keybinding `app.agents.view`, configurable in `keybindings.json`). The view has two tabs, **Agents** and **Chat**; it opens on Agents, and `→` (keybinding `app.agents.chat`) switches to Chat.
+Press `←` while the editor is empty (keybinding `app.agents.view`, configurable in `keybindings.json`). The view has four tabs, **Agents**, **Chat**, **Findings**, and **Credentials**; it opens on Agents, `→` (keybinding `app.agents.chat`) shows the next tab, and `←` the previous one.
 
 The Agents tab lists the main session at the top, then the subagents started in this session under **In progress**, **Queued**, **Paused**, and **Completed** (empty sections are hidden), each by name, description, and agent. Running subagents show a spinner, queued ones `◷`, paused ones `‖`, and finished ones `✓`, or `✗` when they failed or were aborted. Section headers are not selectable: ↑ and ↓ move between rows, and the selection stays on a subagent as it moves from one section to the next. It starts on the session you last opened in it: the main session at first, then whichever subagent (or the main session) you opened most recently. Going back from a subagent returns to the list on that subagent, unless it was opened from the dock: then going back returns to the main session.
 
@@ -303,6 +397,23 @@ The Chat tab lists every chat message sent in this session, oldest first, includ
 
 The message id follows the marker; a refused send has none, and a reply's text starts with `↩` and the id it answers. The marker after the time is `?` while the sender waits for a reply, `~` while a recipient that has not started yet holds the message, and `x` for a refused send, which shows the reason in red under the text. The log scrolls like the transcript and follows new messages until you scroll up. It keeps the last 500 messages and is cleared when a new session starts.
 
+The Findings tab lists every finding in the session, highest priority first, one row each with the time it last changed, its id, priority (critical red, high yellow, medium in the accent color, low muted), sender, key, and the start of its description. `↑` and `↓` select a finding, and `Enter` shows or hides its whole description, metadata, and revision under the row. The tab label shows the count.
+
+```
+ Agents   Chat 3   Findings 2
+ ↑↓ select · enter show details · ← chat · esc close
+
+›12:01 #2 critical bravo auth.token-cache  Tokens are never invalidated
+      Tokens are never invalidated
+      file: src/cache.ts
+      line: 42
+ 12:03 #1 low      alpha docs.typo  Typo in README
+```
+
+In the main chat, a finding notice is one line per finding: `⚑ #7 critical · scout-a · auth.token-cache`, in the priority's color. The finding tools are drawn as call lines (`● Add finding(auth.token-cache) critical`, `⎿  #7 critical auth.token-cache · orchestrator told`). Clicking a notice or a finding tool's result, or pressing the expand key, shows each finding in full as JSON: a notice shows the finding as it is now, a tool result as the tool returned it. In the dock, a subagent that added findings has a badge with their count, in the color of the highest priority: `⚑2`.
+
+The **Credentials** tab lists every credential, one row each with the time it was added, its id, label, sender, and purpose; `Enter` shows or hides its value. In the main chat, a credential announcement is one line per credential: `⚷ #3 github-ci-token · scout-a · push to the CI repo`; expanding it, or a credential tool's result, shows the credential as JSON with its value. A subagent that stored credentials has a second dock badge, `⚷N`.
+
 Dialogs from a subagent's extensions (confirm, select, input) appear in the parent, prefixed with the agent name. So do their warning and error notifications; info notifications, such as per-run token statistics, are dropped.
 
 ## Debugging
@@ -319,7 +430,7 @@ Every request to the model is written there as JSON, with the system prompt, too
 
 | File | Purpose |
 |---|---|
-| `index.ts` | Tools (`subagent`, `subagent_wait`, `subagent_result`, `subagent_list`, `subagent_control`, and the skill tools), run planning, background notices, and the agent-view trigger |
+| `index.ts` | Tools (`subagent`, `subagent_wait`, `subagent_result`, `subagent_list`, `subagent_control`, and the skill, chat, finding, and credential tools), run planning, background, finding, and credential notices, and the agent-view trigger |
 | `agents.ts` | Agent discovery |
 | `skills.ts` | Skill groups, tags, and search |
 | `child.ts` | One subagent process and its transcript, and pausing, resuming, and handing back |
@@ -329,6 +440,8 @@ Every request to the model is written there as JSON, with the system prompt, too
 | `dock.ts` | The dock under the composer |
 | `slots.ts` | The `maxConcurrent` slot queue |
 | `chat.ts` | The chat hub, the subagents' chat client, permissions, and message framing |
+| `findings.ts` | The findings board and store, ownership and limits, persistence, and notice framing |
+| `credentials.ts` | The credential store and board, persistence, and announcement framing |
 | `system-prompt.md` | The global subagent prompt |
 | `render.ts` | Tool call and result rendering |
 | `paths.ts` | Bundled asset location, `config.json`, and the global prompt |

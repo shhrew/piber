@@ -150,7 +150,7 @@ On native Windows, `app.suspend` has no default because Windows terminals do not
 | Keybinding id | Default | Description |
 |--------|---------|-------------|
 | `app.agents.view` | `left` | Open the agent view (with an empty editor); in the view, go back or close |
-| `app.agents.chat` | `right` | Show the chat tab in the agent view |
+| `app.agents.chat` | `right` | Show the next tab in the agent view: Chat, then Findings |
 
 ### Models and Thinking
 

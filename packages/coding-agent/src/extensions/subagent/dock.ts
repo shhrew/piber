@@ -1,9 +1,12 @@
 /**
  * The subagent dock: a short list under the composer with one line per active subagent.
  *
- *     ⠋ a-scout  Read a.txt · Thinking · 2 turns · 8s
+ *     ⠋ a-scout  ⚑2 Read a.txt · Thinking · 2 turns · 8s
  *     ✓ b-scout  Read b.txt · Done · 3 turns · 12s
  *     ◷ 3 queued
+ *
+ * A subagent that added findings gets a `⚑` badge with their count, in the color of the highest priority among them,
+ * and a `⚷` badge with the count of credentials it stored.
  *
  * It lists running subagents, then ones that finished in the last `FADE_MS`, at most `MAX_ROWS` at a time, and
  * renders nothing when there is nothing to show. Queued and paused subagents appear only as counts.
@@ -16,11 +19,14 @@ import type { Component, KeybindingsManager, TUI } from "@earendil-works/pi-tui"
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { Subagent } from "./child.ts";
+import type { CredentialStore } from "./credentials.ts";
+import { compareFindings, type FindingStore } from "./findings.ts";
 import type { SubagentRegistry } from "./registry.ts";
 import {
 	currentPhase,
 	describeRowStatus,
 	formatPhase,
+	priorityColor,
 	SPINNER_INTERVAL_MS,
 	type SubagentRow,
 	statusIcon,
@@ -38,18 +44,35 @@ export class SubagentDock implements Component {
 	private readonly tui: TUI;
 	private readonly theme: Theme;
 	private readonly registry: SubagentRegistry;
+	private readonly findings: FindingStore | undefined;
+	private readonly credentials: CredentialStore | undefined;
 	private readonly unsubscribe: () => void;
 	private timer: NodeJS.Timeout | undefined;
 	private focusedId: string | undefined;
 
-	constructor(tui: TUI, theme: Theme, registry: SubagentRegistry) {
+	constructor(
+		tui: TUI,
+		theme: Theme,
+		registry: SubagentRegistry,
+		findings?: FindingStore,
+		credentials?: CredentialStore,
+	) {
 		this.tui = tui;
 		this.theme = theme;
 		this.registry = registry;
-		this.unsubscribe = registry.onChange(() => {
+		this.findings = findings;
+		this.credentials = credentials;
+		const stopRegistry = registry.onChange(() => {
 			this.scheduleTick();
 			this.tui.requestRender();
 		});
+		const stopFindings = findings?.onChange(() => this.tui.requestRender());
+		const stopCredentials = credentials?.onChange(() => this.tui.requestRender());
+		this.unsubscribe = () => {
+			stopRegistry();
+			stopFindings?.();
+			stopCredentials?.();
+		};
 		this.scheduleTick();
 	}
 
@@ -146,8 +169,13 @@ export class SubagentDock implements Component {
 			);
 			const prefix = focused ? theme.fg("accent", "› ") : "  ";
 			const description = theme.fg("dim", `${subagent.options.description} ·`);
+			const findings = this.findings?.byCreator(subagent.id) ?? [];
+			const top = [...findings].sort(compareFindings)[0];
+			const findingBadge = top ? `${theme.fg(priorityColor(top.priority), `⚑${findings.length}`)} ` : "";
+			const credentials = this.credentials?.byCreator(subagent.id) ?? [];
+			const credentialBadge = credentials.length > 0 ? `${theme.fg("warning", `⚷${credentials.length}`)} ` : "";
 			return truncateToWidth(
-				`${prefix}${statusIcon(row.status, theme)} ${name}  ${description} ${describeRowStatus(row, theme, now)}`,
+				`${prefix}${statusIcon(row.status, theme)} ${name}  ${findingBadge}${credentialBadge}${description} ${describeRowStatus(row, theme, now)}`,
 				width,
 			);
 		});

@@ -11,5 +11,14 @@
 		"maxMessagesPerMinute": 10,
 		"replyTimeoutSeconds": 120,
 		"maxReplyTimeoutSeconds": 600
+	},
+	"findings": {
+		"enabled": true,
+		"delivery": { "critical": "wake", "high": "wake", "medium": "notify", "low": "silent" },
+		"maxDescriptionLength": 1000,
+		"maxMetadataBytes": 4096
+	},
+	"credentials": {
+		"enabled": true
 	}
 }

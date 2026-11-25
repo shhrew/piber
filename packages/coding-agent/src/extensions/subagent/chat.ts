@@ -11,8 +11,15 @@
  *   socket path from the `--subagent-chat` flag.
  *
  * The protocol is JSON lines. Client to hub: `hello {token}`,
- * `send {id, to?, replyTo?, text, waitForReply?, timeoutSeconds?}`, `cancel {id}`, `peers {id}`. Hub to client:
- * `welcome {name}`, `reply {id, ok, text}`, `deliver {delivery}`.
+ * `send {id, to?, replyTo?, text, waitForReply?, timeoutSeconds?}`, `cancel {id}`, `peers {id}`,
+ * `finding {id, request}`, `credential {id, request}`. Hub to client: `welcome {name}`, `reply {id, ok, text}`,
+ * `deliver {delivery}`, `finding_reply {id, result}`, `credential_reply {id, result}`,
+ * `credential_deliver {credential}`.
+ *
+ * Findings (see `findings.ts`) and credentials (see `credentials.ts`) use the same socket, so the hub knows who adds
+ * one from its token. The hub runs while chat, findings, or credentials is enabled; with chat off, sends and peer
+ * lists are refused. A new credential is pushed to every connected subagent with `credential_deliver`, and held for
+ * ones not started yet, like a chat message.
  *
  * Message ids: the hub numbers every message (1, 2, ...) and shows the id to the recipient, so it can answer
  * that message with `replyTo` instead of only naming its sender. A reply goes to the original sender.
@@ -33,6 +40,8 @@ import * as net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { attachJsonlLineReader, serializeJsonLine } from "../../modes/rpc/jsonl.ts";
+import type { Credential, CredentialBoard, CredentialRequest, CredentialResult } from "./credentials.ts";
+import type { FindingBoard, FindingRequest, FindingResult } from "./findings.ts";
 import type { ChatConfig, ChatPermission } from "./paths.ts";
 
 export const ORCHESTRATOR = "orchestrator";
@@ -220,6 +229,10 @@ export interface ChatHubOptions {
 	deliverToOrchestrator: (delivery: ChatDelivery) => void;
 	/** Records every send, refused ones included. */
 	log?: ChatLog;
+	/** Serves subagents' finding tools. Without it, finding requests are refused. */
+	findings?: FindingBoard;
+	/** Serves subagents' credential tools. Without it, credential requests are refused. */
+	credentials?: CredentialBoard;
 }
 
 interface Waiter {
@@ -233,18 +246,25 @@ type ClientFrame =
 	| { type: "hello"; token: string }
 	| ({ type: "send"; id: string } & SendRequest)
 	| { type: "cancel"; id: string }
-	| { type: "peers"; id: string };
+	| { type: "peers"; id: string }
+	| { type: "finding"; id: string; request: FindingRequest }
+	| { type: "credential"; id: string; request: CredentialRequest };
 
 type HubFrame =
 	| { type: "welcome"; name: string }
 	| ({ type: "reply"; id: string } & SendResult)
-	| { type: "deliver"; delivery: ChatDelivery };
+	| { type: "deliver"; delivery: ChatDelivery }
+	| { type: "finding_reply"; id: string; result: FindingResult }
+	| { type: "credential_reply"; id: string; result: CredentialResult }
+	| { type: "credential_deliver"; credential: Credential };
 
 function write(socket: net.Socket, frame: ClientFrame | HubFrame): void {
 	if (!socket.destroyed && socket.writable) socket.write(serializeJsonLine(frame));
 }
 
 const refuse = (text: string): SendResult => ({ ok: false, text, outcome: "refused" });
+const refuseFinding = (text: string): FindingResult => ({ ok: false, text, findings: [] });
+const refuseCredential = (text: string): CredentialResult => ({ ok: false, text, credentials: [] });
 
 export class ChatHub {
 	private readonly options: ChatHubOptions;
@@ -254,6 +274,8 @@ export class ChatHub {
 	private readonly sockets = new Map<string, net.Socket>();
 	/** Messages for subagents that are queued or not connected yet. */
 	private readonly held = new Map<string, ChatDelivery[]>();
+	/** Credential announcements for subagents that are queued or not connected yet. */
+	private readonly heldCredentials = new Map<string, Credential[]>();
 	/** Agents blocked in `waitForReply`, by name. */
 	private readonly waiters = new Map<string, Waiter>();
 	/** Send times per sender, for the rate limit. */
@@ -305,6 +327,7 @@ export class ChatHub {
 		for (const socket of this.sockets.values()) socket.destroy();
 		this.sockets.clear();
 		this.held.clear();
+		this.heldCredentials.clear();
 		this.sent.clear();
 		this.server?.close();
 		this.server = undefined;
@@ -316,6 +339,7 @@ export class ChatHub {
 	/** Send a message from `from` (a subagent name, or `orchestrator`), checking its permissions and the limits. */
 	async send(from: string, request: SendRequest, signal?: AbortSignal): Promise<SendResult> {
 		const config = this.options.config();
+		if (!config.enabled) return refuse("Chat is turned off.");
 		const text = request.text.trim();
 		const replyTo = request.replyTo?.trim() || undefined;
 		const original = replyTo ? this.sent.get(replyTo) : undefined;
@@ -425,6 +449,7 @@ export class ChatHub {
 	/** The agents `from` may message and their state, for `chat_peers`. */
 	peers(from: string): string {
 		const config = this.options.config();
+		if (!config.enabled) return "Chat is turned off.";
 		const rights = from === ORCHESTRATOR ? resolvePermissions(config.orchestratorCanMessage) : this.rights.get(from);
 		if (!rights || !canMessageAnyone(rights)) return "You cannot send chat messages.";
 		const lines = [
@@ -448,6 +473,24 @@ export class ChatHub {
 		}
 		if (rights.broadcast) lines.push(`- ${BROADCAST}: everyone still running, at once`);
 		return lines.join("\n");
+	}
+
+	/**
+	 * Announce a new credential to every subagent except `from`: delivered to running ones at once, held for ones
+	 * not started or paused until they connect or resume. The orchestrator is told separately, by the board's owner.
+	 */
+	broadcastCredential(credential: Credential, from: string): void {
+		for (const peer of this.options.directory.list()) {
+			if (peer.name === from || peer.state === "finished") continue;
+			const socket = this.sockets.get(peer.name);
+			if (socket && peer.state === "running") {
+				write(socket, { type: "credential_deliver", credential });
+			} else {
+				const queue = this.heldCredentials.get(peer.name) ?? [];
+				queue.push(credential);
+				this.heldCredentials.set(peer.name, queue);
+			}
+		}
 	}
 
 	/** Hand `delivery` to one recipient: end its wait, deliver it now, or hold it until it connects. */
@@ -566,6 +609,10 @@ export class ChatHub {
 					this.options.log?.markDelivered(delivery.id);
 				}
 				this.held.delete(member.name);
+				for (const credential of this.heldCredentials.get(member.name) ?? []) {
+					write(socket, { type: "credential_deliver", credential });
+				}
+				this.heldCredentials.delete(member.name);
 				return;
 			}
 			// Nothing but hello is accepted before the token is known.
@@ -591,6 +638,15 @@ export class ChatHub {
 					text: this.peers(member.name),
 					outcome: "delivered",
 				});
+			} else if (frame.type === "finding") {
+				const result =
+					this.options.findings?.handle(member.name, frame.request) ?? refuseFinding("Findings are turned off.");
+				write(socket, { type: "finding_reply", id: frame.id, result });
+			} else if (frame.type === "credential") {
+				const result =
+					this.options.credentials?.handle(member.name, frame.request) ??
+					refuseCredential("Credentials are turned off.");
+				write(socket, { type: "credential_reply", id: frame.id, result });
 			}
 		});
 		socket.on("close", () => {
@@ -606,15 +662,24 @@ export class ChatClient {
 	private readonly socketPath: string;
 	private readonly token: string;
 	private readonly onDeliver: (delivery: ChatDelivery) => void;
+	private readonly onCredential: ((credential: Credential) => void) | undefined;
 	private socket: net.Socket | undefined;
 	private readonly pending = new Map<string, (result: SendResult) => void>();
+	private readonly pendingFindings = new Map<string, (result: FindingResult) => void>();
+	private readonly pendingCredentials = new Map<string, (result: CredentialResult) => void>();
 	private nextId = 1;
 	name: string | undefined;
 
-	constructor(socketPath: string, token: string, onDeliver: (delivery: ChatDelivery) => void) {
+	constructor(
+		socketPath: string,
+		token: string,
+		onDeliver: (delivery: ChatDelivery) => void,
+		onCredential?: (credential: Credential) => void,
+	) {
 		this.socketPath = socketPath;
 		this.token = token;
 		this.onDeliver = onDeliver;
+		this.onCredential = onCredential;
 	}
 
 	/** Connect and authenticate, retrying briefly in case the hub is still starting. Resolves with this agent's name. */
@@ -655,6 +720,28 @@ export class ChatClient {
 		});
 	}
 
+	/** Send a finding tool's request to the hub, which runs it as this subagent. */
+	finding(request: FindingRequest): Promise<FindingResult> {
+		const id = String(this.nextId++);
+		const socket = this.socket;
+		if (!socket || socket.destroyed) return Promise.resolve(refuseFinding("Findings are not connected."));
+		return new Promise((resolve) => {
+			this.pendingFindings.set(id, resolve);
+			write(socket, { type: "finding", id, request });
+		});
+	}
+
+	/** Send a credential tool's request to the hub, which runs it as this subagent. */
+	credential(request: CredentialRequest): Promise<CredentialResult> {
+		const id = String(this.nextId++);
+		const socket = this.socket;
+		if (!socket || socket.destroyed) return Promise.resolve(refuseCredential("Credentials are not connected."));
+		return new Promise((resolve) => {
+			this.pendingCredentials.set(id, resolve);
+			write(socket, { type: "credential", id, request });
+		});
+	}
+
 	close(): void {
 		this.socket?.destroy();
 		this.socket = undefined;
@@ -683,6 +770,16 @@ export class ChatClient {
 					settle?.(result);
 				} else if (frame.type === "deliver") {
 					this.onDeliver(frame.delivery);
+				} else if (frame.type === "finding_reply") {
+					const settle = this.pendingFindings.get(frame.id);
+					this.pendingFindings.delete(frame.id);
+					settle?.(frame.result);
+				} else if (frame.type === "credential_reply") {
+					const settle = this.pendingCredentials.get(frame.id);
+					this.pendingCredentials.delete(frame.id);
+					settle?.(frame.result);
+				} else if (frame.type === "credential_deliver") {
+					this.onCredential?.(frame.credential);
 				}
 			});
 			socket.on("connect", () => write(socket, { type: "hello", token: this.token }));
@@ -698,6 +795,10 @@ export class ChatClient {
 				if (this.socket === socket) this.socket = undefined;
 				for (const settle of this.pending.values()) settle(refuse("Chat connection closed."));
 				this.pending.clear();
+				for (const settle of this.pendingFindings.values()) settle(refuseFinding("Chat connection closed."));
+				this.pendingFindings.clear();
+				for (const settle of this.pendingCredentials.values()) settle(refuseCredential("Chat connection closed."));
+				this.pendingCredentials.clear();
 			});
 		});
 	}

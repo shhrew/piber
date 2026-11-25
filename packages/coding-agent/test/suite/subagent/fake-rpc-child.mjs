@@ -6,6 +6,8 @@
 // - notify: send an info and a warning notification, then answer like echo
 // - auto: answer like echo, but after 1.5 s when the message contains "slow". With --subagent-chat, it joins the
 //   parent's chat hub, and a message containing "tell orchestrator: <text>" sends <text> to the orchestrator first.
+//   Each "add finding: <priority> <key>" in the message adds a finding with that priority and key, after 0.3 s.
+//   Each "add credential: <label>" adds a credential with that label, value "secret-<label>", after 0.3 s.
 import { connect } from "node:net";
 import { createInterface } from "node:readline";
 
@@ -84,6 +86,21 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 				if (tell && chat) {
 					chat.write(`${JSON.stringify({ type: "send", id: "1", to: "orchestrator", text: tell[1] })}\n`);
 				}
+				// After a moment, so the orchestrator is already waiting when they arrive.
+				const findings = [...command.message.matchAll(/add finding: (\w+) ([\w.-]+)/g)];
+				setTimeout(() => {
+					for (const [index, finding] of findings.entries()) {
+						const request = { action: "add", key: finding[2], priority: finding[1], description: `About ${finding[2]}` };
+						chat?.write(`${JSON.stringify({ type: "finding", id: `f${index}`, request })}\n`);
+					}
+				}, 300);
+				const creds = [...command.message.matchAll(/add credential: ([\w.-]+)/g)];
+				setTimeout(() => {
+					for (const [index, cred] of creds.entries()) {
+						const request = { action: "add", label: cred[1], purpose: `use ${cred[1]}`, value: `secret-${cred[1]}` };
+						chat?.write(`${JSON.stringify({ type: "credential", id: `c${index}`, request })}\n`);
+					}
+				}, 300);
 				const delay = command.message.includes("slow") ? 1500 : 0;
 				setTimeout(() => reply(`echo: ${command.message}`), delay);
 			}

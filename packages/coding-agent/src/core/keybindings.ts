@@ -86,7 +86,7 @@ const APP_KEYBINDINGS = {
 	},
 	"app.agents.chat": {
 		defaultKeys: "right",
-		description: "Show the chat tab in the agent view",
+		description: "Show the next tab in the agent view: Chat, then Findings",
 	},
 	"app.tree.foldOrUp": {
 		defaultKeys: process.platform === "darwin" ? ["alt+left", "ctrl+left"] : ["ctrl+left", "alt+left"],

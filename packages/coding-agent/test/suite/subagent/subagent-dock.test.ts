@@ -5,7 +5,9 @@ import type { TUI } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../../../src/core/keybindings.ts";
 import { Subagent, type SubagentOptions } from "../../../src/extensions/subagent/child.ts";
+import { CredentialStore } from "../../../src/extensions/subagent/credentials.ts";
 import { FADE_MS, MAX_ROWS, SubagentDock } from "../../../src/extensions/subagent/dock.ts";
+import { FindingStore } from "../../../src/extensions/subagent/findings.ts";
 import { SubagentRegistry } from "../../../src/extensions/subagent/registry.ts";
 import {
 	currentPhase,
@@ -79,6 +81,25 @@ afterEach(async () => {
 });
 
 describe("subagent dock", () => {
+	it("marks subagents that added findings with a count badge", () => {
+		const registry = new SubagentRegistry();
+		registry.add(finished("finder", 1000));
+		registry.add(finished("quiet", 2000));
+		const findings = new FindingStore();
+		const fields = { description: "x", metadata: {}, createdAt: 0, updatedAt: 0, revision: 1 };
+		findings.create({ ...fields, from: "finder", key: "a.b", priority: "low" });
+		findings.create({ ...fields, from: "finder", key: "c.d", priority: "critical" });
+		const credentials = new CredentialStore();
+		credentials.create({ from: "finder", label: "ci-token", purpose: "push", value: "x", createdAt: 0 });
+		const dock = new SubagentDock(tui, theme, registry, findings, credentials);
+
+		const lines = plain(dock.render(120));
+		expect(lines[0]).toContain("finder  ⚑2 ⚷1 Job finder · Done");
+		expect(lines[1]).toContain("quiet   Job quiet · Done");
+		expect(dock.render(120)[0]).toContain(theme.fg("error", "⚑2"));
+		dock.dispose();
+	});
+
 	it("renders nothing without active or recently finished subagents", () => {
 		const registry = new SubagentRegistry();
 		registry.add(finished("old", FADE_MS + 1000));

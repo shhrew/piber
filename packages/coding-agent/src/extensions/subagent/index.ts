@@ -6,6 +6,10 @@
  *   tools, skill groups, and session file. Modes: single, parallel, and chain.
  * - `skill_search` and `load_skill` serve a subagent's skill groups. They are registered inactive and are
  *   enabled only in subagent processes, through the `--tools` list the parent passes.
+ * - `add_finding`, `update_finding`, `get_finding`, and `list_findings` serve the session's findings board (see
+ *   `findings.ts`), in the parent directly and in subagents over the chat hub's socket.
+ * - `add_credential`, `get_credential`, and `list_credentials` serve the session's credential store (see
+ *   `credentials.ts`); a new credential is announced to the orchestrator and every subagent at once.
  * - The agent view (`app.agents.view` pressed with an empty editor) lists the main session and its
  *   subagents, shows a subagent's live transcript, and steers it.
  *
@@ -50,10 +54,44 @@ import {
 	type SendResult,
 } from "./chat.ts";
 import { emptyUsage, SKILL_GROUPS_FLAG, SUBAGENT_FLAG, Subagent } from "./child.ts";
+import {
+	ADD_CREDENTIAL_TOOL_NAME,
+	CREDENTIAL_NOTICE_TYPE,
+	CREDENTIAL_TOOL_NAMES,
+	CREDENTIALS_FILE,
+	type Credential,
+	CredentialBoard,
+	type CredentialRequest,
+	type CredentialResult,
+	CredentialStore,
+	frameCredentialNotice,
+	GET_CREDENTIAL_TOOL_NAME,
+	LIST_CREDENTIALS_TOOL_NAME,
+	summarizeCredentials,
+} from "./credentials.ts";
 import { SubagentDock } from "./dock.ts";
+import {
+	ADD_FINDING_TOOL_NAME,
+	countFindings,
+	FINDING_NOTICE_TYPE,
+	FINDING_TOOL_NAMES,
+	FINDINGS_FILE,
+	type Finding,
+	FindingBoard,
+	type FindingRequest,
+	type FindingResult,
+	FindingStore,
+	frameFindingNotice,
+	GET_FINDING_TOOL_NAME,
+	LIST_FINDINGS_TOOL_NAME,
+	summarizeFindings,
+	UPDATE_FINDING_TOOL_NAME,
+} from "./findings.ts";
 import {
 	type BackgroundCompletion,
 	type ChatConfig,
+	type CredentialsConfig,
+	type FindingsConfig,
 	loadGlobalSystemPrompt,
 	loadSubagentConfig,
 	parseNameList,
@@ -64,12 +102,24 @@ import {
 	getFinalOutput,
 	isFailedRun,
 	type LoadSkillDetails,
+	renderAddCredentialCall,
+	renderAddFindingCall,
 	renderBackgroundNotice,
 	renderCallLine,
 	renderChatMessage,
 	renderChatPeersResult,
 	renderChatSendCall,
 	renderChatSendResult,
+	renderCredentialNotice,
+	renderCredentialReadResult,
+	renderCredentialWriteResult,
+	renderFindingNotice,
+	renderFindingReadResult,
+	renderFindingWriteResult,
+	renderGetCredentialCall,
+	renderGetFindingCall,
+	renderListCredentialsCall,
+	renderListFindingsCall,
 	renderListResult,
 	renderLoadSkillCall,
 	renderLoadSkillResult,
@@ -77,6 +127,7 @@ import {
 	renderSkillSearchResult,
 	renderSubagentCall,
 	renderSubagentResult,
+	renderUpdateFindingCall,
 	renderWaitCall,
 	renderWaitResult,
 	type SkillSearchDetails,
@@ -211,6 +262,74 @@ const ChatSendParams = Type.Object({
 
 const ChatPeersParams = Type.Object({});
 
+const PRIORITY_DESCRIPTION =
+	"critical: the orchestrator must act now (wakes it); high: changes the plan (wakes it); medium: useful, read on its next turn; low: record only";
+const FindingPriorityParam = (description: string) =>
+	Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("critical")], {
+		description,
+	});
+const FindingKeyParam = Type.String({
+	description: "A short dotted slug naming the topic, such as auth.token-cache",
+});
+const FindingDescriptionParam = Type.String({
+	description: "What you found and why it matters, in a sentence or two. Put specifics in metadata.",
+});
+const MetadataValue = Type.Union([Type.String(), Type.Number(), Type.Boolean()]);
+
+const AddFindingParams = Type.Object({
+	key: FindingKeyParam,
+	description: FindingDescriptionParam,
+	priority: FindingPriorityParam(PRIORITY_DESCRIPTION),
+	metadata: Type.Optional(
+		Type.Record(Type.String(), MetadataValue, {
+			description: "Details as key/value pairs, such as file, line, or endpoint",
+		}),
+	),
+});
+
+const UpdateFindingParams = Type.Object({
+	id: Type.Integer({ description: "The id of a finding you added" }),
+	key: Type.Optional(FindingKeyParam),
+	description: Type.Optional(FindingDescriptionParam),
+	priority: Type.Optional(
+		FindingPriorityParam(
+			`${PRIORITY_DESCRIPTION}. Raising it to a level that tells the orchestrator sooner tells it again.`,
+		),
+	),
+	metadata: Type.Optional(
+		Type.Record(Type.String(), Type.Union([Type.String(), Type.Number(), Type.Boolean(), Type.Null()]), {
+			description: "Merged into the finding's metadata; set a key to null to remove it",
+		}),
+	),
+});
+
+const GetFindingParams = Type.Object({
+	ids: Type.Array(Type.Integer(), { minItems: 1, description: "Ids of the findings to read, such as [7]" }),
+});
+
+const ListFindingsParams = Type.Object({
+	from: Type.Optional(Type.String({ description: "Only findings added by this agent, such as scout-a" })),
+	key: Type.Optional(Type.String({ description: "Only findings whose key starts with this, such as auth" })),
+	minPriority: Type.Optional(FindingPriorityParam("Only findings of this priority or higher")),
+	after: Type.Optional(Type.Integer({ description: "Only findings with a higher id, to see what is new" })),
+	limit: Type.Optional(Type.Integer({ description: "Maximum findings to list. Default: 50" })),
+});
+
+const AddCredentialParams = Type.Object({
+	label: Type.String({ description: "A short slug naming the credential, such as github-ci-token" }),
+	purpose: Type.String({ description: "What the credential is for, so another agent knows when to use it" }),
+	value: Type.String({ description: "The secret itself. It is shared with the orchestrator and every subagent." }),
+});
+
+const GetCredentialParams = Type.Object({
+	ids: Type.Array(Type.Integer(), { minItems: 1, description: "Ids of the credentials to read, such as [3]" }),
+});
+
+const ListCredentialsParams = Type.Object({
+	from: Type.Optional(Type.String({ description: "Only credentials added by this agent, such as scout-a" })),
+	limit: Type.Optional(Type.Integer({ description: "Maximum credentials to list. Default: 50" })),
+});
+
 const SkillSearchParams = Type.Object({
 	query: Type.Optional(Type.String({ description: "Words to match against skill names, descriptions, and tags" })),
 	tags: Type.Optional(Type.Array(Type.String(), { description: "Tags to match, such as php or symfony" })),
@@ -331,17 +450,21 @@ function statusDetails(subagent: Subagent): SubagentRunDetails {
 	return { ...details, messages: last ? [last] : [] };
 }
 
-/** One line per subagent for the orchestrator: `- name (description): done, 3 turns`. */
-function statusLine(subagent: Subagent): string {
+/**
+ * One line per subagent for the orchestrator: `- name (description): done, 3 turns`, with
+ * `; 2 findings (1 critical)` when it added findings.
+ */
+function statusLine(subagent: Subagent, findings: readonly Finding[]): string {
 	const label = `- ${subagent.id} (${subagent.options.description})`;
-	if (subagent.isQueued) return `${label}: queued`;
-	if (subagent.isPaused) return `${label}: paused`;
-	if (subagent.isRunning) return `${label}: running`;
+	const counted = (line: string) => (findings.length > 0 ? `${line}; ${countFindings(findings)}` : line);
+	if (subagent.isQueued) return counted(`${label}: queued`);
+	if (subagent.isPaused) return counted(`${label}: paused`);
+	if (subagent.isRunning) return counted(`${label}: running`);
 	if (subagent.status === "failed") {
-		return `${label}: failed${subagent.errorMessage ? `: ${subagent.errorMessage.split("\n")[0]}` : ""}`;
+		return counted(`${label}: failed${subagent.errorMessage ? `: ${subagent.errorMessage.split("\n")[0]}` : ""}`);
 	}
 	const turns = subagent.usage.turns;
-	return `${label}: ${subagent.status}${turns ? `, ${turns} turn${turns > 1 ? "s" : ""}` : ""}`;
+	return counted(`${label}: ${subagent.status}${turns ? `, ${turns} turn${turns > 1 ? "s" : ""}` : ""}`);
 }
 
 function isSettled(subagent: Subagent): boolean {
@@ -366,6 +489,12 @@ function failedRun(request: RunRequest, id: string, errorMessage: string): Subag
 		errorMessage,
 		step: request.step,
 	};
+}
+
+/** Where a session keeps its subagents' sessions and its findings, or undefined when it has no session file. */
+function subagentSessionDir(ctx: ExtensionContext): string | undefined {
+	if (!ctx.sessionManager.getSessionFile()) return undefined;
+	return path.join(ctx.sessionManager.getSessionDir(), "subagents", ctx.sessionManager.getSessionId());
 }
 
 /** Output for the parent model: the final text, or the error, plus how to continue the session. */
@@ -436,6 +565,10 @@ export interface SubagentRunPlan {
 	systemPrompt: string;
 	/** What the subagent may message, or undefined when chat is turned off. */
 	chatRights: ChatRights | undefined;
+	/** Whether the subagent gets the finding tools. */
+	findings: boolean;
+	/** Whether the subagent gets the credential tools. */
+	credentials: boolean;
 }
 
 /** The chat part of a subagent's prompt: its name and who it may message. */
@@ -453,8 +586,9 @@ export function chatPromptSection(name: string, rights: ChatRights): string {
 
 /**
  * What a subagent runs with: the core tools from `config.json`, then the agent's tools, then the call's
- * `extraTools`, plus `skill_search` and `load_skill` when it has skill groups and the chat tools when it may send
- * messages; and the global prompt, the agent's prompt, and a skills section.
+ * `extraTools`, plus `skill_search` and `load_skill` when it has skill groups, the chat tools when it may send
+ * messages, the finding tools when findings are enabled, and the credential tools when credentials are enabled; and
+ * the global prompt, the agent's prompt, and a skills section.
  */
 export function planSubagentRun(
 	agent: AgentConfig,
@@ -469,12 +603,24 @@ export function planSubagentRun(
 		? resolvePermissions(agent.canMessage ?? config.chat.defaultCanMessage)
 		: undefined;
 	const chatTools = chatRights && canMessageAnyone(chatRights) ? [CHAT_SEND_TOOL_NAME, CHAT_PEERS_TOOL_NAME] : [];
+	const findingTools = config.findings.enabled ? FINDING_TOOL_NAMES : [];
+	const credentialTools = config.credentials.enabled ? CREDENTIAL_TOOL_NAMES : [];
 	return {
-		tools: unique([...config.coreTools, ...agent.tools, ...(request.extraTools ?? []), ...skillTools, ...chatTools]),
+		tools: unique([
+			...config.coreTools,
+			...agent.tools,
+			...(request.extraTools ?? []),
+			...skillTools,
+			...chatTools,
+			...findingTools,
+			...credentialTools,
+		]),
 		skillGroups,
 		catalog,
 		systemPrompt: buildSystemPrompt(agent, catalog, loadGlobalSystemPrompt(projectDir)),
 		chatRights,
+		findings: config.findings.enabled,
+		credentials: config.credentials.enabled,
 	};
 }
 
@@ -517,10 +663,16 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 	/** The subagent last opened in the agent view, where the view starts next time. Undefined is the main session. */
 	let lastViewed: string | undefined;
 
-	/** The chat config at load time, for which tools start active; runs read the project's config. */
+	/** The chat and findings config at load time, for which tools start active; runs read the project's config. */
 	const bundledChat = loadSubagentConfig(null).chat;
-	/** The project whose config the chat hub reads, from the latest run or chat call. */
-	let chatProjectDir: string | null = null;
+	const bundledFindings = loadSubagentConfig(null).findings;
+	const bundledCredentials = loadSubagentConfig(null).credentials;
+	/** The project whose config the chat hub and the findings board read, from the latest run, chat, or finding call. */
+	let hubProjectDir: string | null = null;
+	const trackProject = (ctx: ExtensionContext): string | null => {
+		hubProjectDir = ctx.isProjectTrusted() ? findProjectSubagentsDir(ctx.cwd) : null;
+		return hubProjectDir;
+	};
 	let chatHub: ChatHub | undefined;
 	/** Every send in this session, for the agent view's chat tab. Outlives the hub, which is created on first use. */
 	const chatLog = new ChatLog();
@@ -531,8 +683,95 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 	 * calls to end. `subagent_wait` returns at once while any are unread, so the orchestrator can answer them.
 	 */
 	const unreadChat = new Map<string, ChatDelivery>();
-	/** Called with each chat message to the orchestrator; `subagent_wait` listens to stop waiting. */
-	const chatListeners = new Set<(delivery: ChatDelivery) => void>();
+	/** Findings that wake the orchestrator and have not reached its context yet; they end `subagent_wait` like chat. */
+	const unreadFindings = new Map<number, Finding>();
+	/** Called with each chat message or waking finding for the orchestrator; `subagent_wait` listens to stop waiting. */
+	const inboxListeners = new Set<() => void>();
+
+	/** Findings that reach the orchestrator on its next turn, batched into one notice. */
+	const queuedFindings: Finding[] = [];
+	let findingTimer: NodeJS.Timeout | undefined;
+	const postFindings = (findings: Finding[], delivery: "wake" | "notify") =>
+		pi.sendMessage(
+			{
+				customType: FINDING_NOTICE_TYPE,
+				content: frameFindingNotice(findings),
+				display: true,
+				details: { findings },
+			},
+			delivery === "wake" ? { triggerTurn: true, deliverAs: "steer" } : { deliverAs: "nextTurn" },
+		);
+	/** Every finding of this session. Subagent processes keep none: theirs live in the parent's board. */
+	const findingStore = new FindingStore();
+	const findingBoard = new FindingBoard({
+		store: findingStore,
+		config: (): FindingsConfig => loadSubagentConfig(hubProjectDir).findings,
+		deliver: (finding, delivery) => {
+			if (delivery === "wake") {
+				// Sent at once, not batched: a wait it ends must find the notice right after its result.
+				unreadFindings.set(finding.id, finding);
+				postFindings([finding], "wake");
+				for (const listener of [...inboxListeners]) listener();
+				return;
+			}
+			queuedFindings.push(finding);
+			findingTimer ??= setTimeout(() => {
+				findingTimer = undefined;
+				postFindings(queuedFindings.splice(0), "notify");
+			}, NOTICE_BATCH_MS);
+		},
+	});
+	const resetFindings = () => {
+		unreadFindings.clear();
+		unreadCredentials.clear();
+		queuedFindings.length = 0;
+		if (findingTimer) clearTimeout(findingTimer);
+		findingTimer = undefined;
+	};
+	/** `statusLine` with the subagent's findings counted. */
+	const describeStatus = (subagent: Subagent) => statusLine(subagent, findingStore.byCreator(subagent.id));
+	/** `Findings: 7 critical auth.token-cache, ...` for a subagent that added any, or "". */
+	const findingsSummary = (subagent: Subagent): string => {
+		const findings = findingStore.byCreator(subagent.id);
+		return findings.length > 0
+			? `Findings by ${subagent.id}: ${summarizeFindings(findings)}. Read them with ${GET_FINDING_TOOL_NAME}.`
+			: "";
+	};
+
+	/** Credentials announced to the orchestrator and not reached its context yet; they end `subagent_wait` like chat. */
+	const unreadCredentials = new Map<number, Credential>();
+	const postCredential = (credentials: Credential[]) =>
+		pi.sendMessage(
+			{
+				customType: CREDENTIAL_NOTICE_TYPE,
+				content: frameCredentialNotice(credentials),
+				display: true,
+				details: { credentials },
+			},
+			{ triggerTurn: true, deliverAs: "steer" },
+		);
+	/** Every credential of this session. Subagent processes keep none: theirs live in the parent's store. */
+	const credentialStore = new CredentialStore();
+	const credentialBoard = new CredentialBoard({
+		store: credentialStore,
+		config: (): CredentialsConfig => loadSubagentConfig(hubProjectDir).credentials,
+		announce: (credential, from) => {
+			// The adder already has it. Tell the orchestrator (unless it is the adder) and every other subagent.
+			if (from !== ORCHESTRATOR) {
+				unreadCredentials.set(credential.id, credential);
+				postCredential([credential]);
+				for (const listener of [...inboxListeners]) listener();
+			}
+			chatHub?.broadcastCredential(credential, from);
+		},
+	});
+	/** `Credentials by scout-a: 3 github-ci-token, ...` for a subagent that added any, or "". */
+	const credentialsSummary = (subagent: Subagent): string => {
+		const credentials = credentialStore.byCreator(subagent.id);
+		return credentials.length > 0
+			? `Credentials by ${subagent.id}: ${summarizeCredentials(credentials)}. Read them with ${GET_CREDENTIAL_TOOL_NAME}.`
+			: "";
+	};
 	const chatPeer = (subagent: Subagent): ChatPeer => ({
 		name: subagent.id,
 		description: subagent.options.description,
@@ -546,14 +785,19 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		},
 		list: () => registry.list().map(chatPeer),
 	};
-	/** The session's chat hub, created on first use, or undefined when chat is turned off for the project. */
-	const chatHubFor = (ctx: ExtensionContext): ChatHub | undefined => {
-		chatProjectDir = ctx.isProjectTrusted() ? findProjectSubagentsDir(ctx.cwd) : null;
-		if (!loadSubagentConfig(chatProjectDir).chat.enabled) return undefined;
+	/**
+	 * The session's hub, created on first use, or undefined when chat, findings, and credentials are all off for the
+	 * project. With chat off, it refuses chat sends but still serves the finding and credential tools.
+	 */
+	const hubFor = (ctx: ExtensionContext): ChatHub | undefined => {
+		const config = loadSubagentConfig(trackProject(ctx));
+		if (!config.chat.enabled && !config.findings.enabled && !config.credentials.enabled) return undefined;
 		chatHub ??= new ChatHub({
 			directory: chatDirectory,
-			config: (): ChatConfig => loadSubagentConfig(chatProjectDir).chat,
+			config: (): ChatConfig => loadSubagentConfig(hubProjectDir).chat,
 			log: chatLog,
+			findings: findingBoard,
+			credentials: credentialBoard,
 			// Steers the orchestrator while it works, and starts a turn when it is idle.
 			deliverToOrchestrator: (delivery) => {
 				unreadChat.set(delivery.id, delivery);
@@ -566,7 +810,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 					},
 					{ triggerTurn: true, deliverAs: "steer" },
 				);
-				for (const listener of [...chatListeners]) listener(delivery);
+				for (const listener of [...inboxListeners]) listener();
 			},
 		});
 		return chatHub;
@@ -577,6 +821,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		chatLog.clear();
 		chatSenders.clear();
 		unreadChat.clear();
+		resetFindings();
 		chatClient?.close();
 		chatClient = undefined;
 	};
@@ -626,16 +871,14 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		reportDiagnostics(plan.catalog, ctx);
 		const inheritsModel = !agent.model;
 		const parentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-		const parentSessionFile = ctx.sessionManager.getSessionFile();
-		const sessionDir = parentSessionFile
-			? path.join(ctx.sessionManager.getSessionDir(), "subagents", ctx.sessionManager.getSessionId())
-			: undefined;
+		const sessionDir = subagentSessionDir(ctx);
 
 		const id = registry.createId(request.name ?? agent.name);
-		// Every subagent joins the chat when it is on, so others can message it even if it may not send.
-		const hub = plan.chatRights ? chatHubFor(ctx) : undefined;
-		const chat =
-			hub && plan.chatRights ? { socket: hub.address(), token: hub.register(id, plan.chatRights) } : undefined;
+		// Every subagent joins the hub when chat or findings is on, so others can message it even if it may not send.
+		const hub = plan.chatRights || plan.findings || plan.credentials ? hubFor(ctx) : undefined;
+		const chat = hub
+			? { socket: hub.address(), token: hub.register(id, plan.chatRights ?? resolvePermissions([])) }
+			: undefined;
 		const systemPrompt =
 			chat && plan.chatRights
 				? `${plan.systemPrompt}\n\n${chatPromptSection(id, plan.chatRights)}`
@@ -742,7 +985,9 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 				// what is expected; without that, models remark on a "user message" that is not from the user.
 				'<system_notice from="subagents">',
 				"Background subagents you started have finished:",
-				...subagents.map(statusLine),
+				...subagents.map(describeStatus),
+				...subagents.map(findingsSummary).filter(Boolean),
+				...subagents.map(credentialsSummary).filter(Boolean),
 				`If the user's request needs their results, read them with ${SUBAGENT_RESULT_TOOL_NAME} and continue. Otherwise no reply is needed.`,
 				"</system_notice>",
 			].join("\n");
@@ -843,7 +1088,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 
 		const lines: string[] = [];
 		if (started.length > 0) {
-			lines.push("Started in the background:", ...started.map(statusLine));
+			lines.push("Started in the background:", ...started.map(describeStatus));
 			if (mode === "chain") lines.push("Later chain steps start as earlier ones finish.");
 			lines.push(
 				`They keep working while you continue. To collect them, call ${SUBAGENT_WAIT_TOOL_NAME} (it returns once all of them have finished), then ${SUBAGENT_RESULT_TOOL_NAME}.`,
@@ -910,7 +1155,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 					? await chatClient.send(request, signal)
 					: { ok: false, text: "Chat is not connected.", outcome: "refused" };
 			} else {
-				const hub = chatHubFor(ctx);
+				const hub = hubFor(ctx);
 				result = hub
 					? await hub.send(ORCHESTRATOR, request, signal)
 					: { ok: false, text: "Chat is turned off.", outcome: "refused" };
@@ -969,7 +1214,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			let text: string;
 			if (isSubagentProcess()) text = chatClient ? await chatClient.peers() : "Chat is not connected.";
-			else text = chatHubFor(ctx)?.peers(ORCHESTRATOR) ?? "Chat is turned off.";
+			else text = hubFor(ctx)?.peers(ORCHESTRATOR) ?? "Chat is turned off.";
 			return { content: [{ type: "text", text }], details: undefined };
 		},
 
@@ -990,6 +1235,241 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 	pi.registerMessageRenderer<ChatDelivery>(CHAT_MESSAGE_TYPE, (message, options, theme) =>
 		message.details
 			? renderChatMessage(message.details, { ...options, self: chatSelf(), isAwaitingReply }, theme)
+			: undefined,
+	);
+
+	// --- Findings -------------------------------------------------------------------------------------------
+
+	/** Run a finding tool: in a subagent through the parent's hub, in the orchestrator on the board itself. */
+	const runFinding = async (request: FindingRequest, ctx: ExtensionContext): Promise<FindingResult> => {
+		if (isSubagentProcess()) {
+			return chatClient
+				? chatClient.finding(request)
+				: { ok: false, text: "Findings are not connected.", findings: [] };
+		}
+		trackProject(ctx);
+		return findingBoard.handle(ORCHESTRATOR, request);
+	};
+	const findingToolResult = (result: FindingResult) => ({
+		content: [{ type: "text" as const, text: result.text }],
+		details: result,
+		isError: !result.ok || undefined,
+	});
+	const resultText = (result: AgentToolResult<unknown>) => {
+		const first = result.content[0];
+		return first?.type === "text" ? first.text : "";
+	};
+
+	registerTool<typeof AddFindingParams, FindingResult>({
+		name: ADD_FINDING_TOOL_NAME,
+		label: "Add Finding",
+		description: [
+			"Record a finding on the session's findings board: a short dotted key, a description, a priority, and key/value metadata. Returns its id.",
+			"The priority decides whether the orchestrator is told: critical and high wake it at once, medium reaches it on its next turn, low is only stored.",
+			`Every agent can read the board with ${LIST_FINDINGS_TOOL_NAME} and ${GET_FINDING_TOOL_NAME}. Refine your own finding with ${UPDATE_FINDING_TOOL_NAME} instead of adding a duplicate.`,
+		].join(" "),
+		promptSnippet: "Record a finding on the shared findings board",
+		parameters: AddFindingParams,
+		defaultActive: bundledFindings.enabled,
+		renderShell: "self",
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return findingToolResult(await runFinding({ action: "add", ...params }, ctx));
+		},
+
+		renderCall(args, theme, context) {
+			return renderAddFindingCall(args, theme, context);
+		},
+
+		renderResult(result, { expanded }, theme, context) {
+			const options = { expanded, isError: context.isError, outputPad: context.outputPad };
+			return renderFindingWriteResult(result.details, resultText(result), options, theme);
+		},
+	});
+
+	registerTool<typeof UpdateFindingParams, FindingResult>({
+		name: UPDATE_FINDING_TOOL_NAME,
+		label: "Update Finding",
+		description: [
+			"Update a finding you added: its key, description, priority, or metadata. Metadata is merged; set a key to null to remove it.",
+			"Only the agent that added a finding can update it.",
+			"The orchestrator is told again only when the new priority reaches it sooner than the old one did.",
+		].join(" "),
+		promptSnippet: "Update a finding you added",
+		parameters: UpdateFindingParams,
+		defaultActive: bundledFindings.enabled,
+		renderShell: "self",
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return findingToolResult(await runFinding({ action: "update", ...params }, ctx));
+		},
+
+		renderCall(args, theme, context) {
+			return renderUpdateFindingCall(args, theme, context);
+		},
+
+		renderResult(result, { expanded }, theme, context) {
+			const options = { expanded, isError: context.isError, outputPad: context.outputPad };
+			return renderFindingWriteResult(result.details, resultText(result), options, theme);
+		},
+	});
+
+	registerTool<typeof GetFindingParams, FindingResult>({
+		name: GET_FINDING_TOOL_NAME,
+		label: "Get Finding",
+		description: "Read findings in full by id: key, priority, who added it, description, and metadata.",
+		promptSnippet: "Read findings by id",
+		parameters: GetFindingParams,
+		defaultActive: bundledFindings.enabled,
+		renderShell: "self",
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return findingToolResult(await runFinding({ action: "get", ids: params.ids }, ctx));
+		},
+
+		renderCall(args, theme, context) {
+			return renderGetFindingCall(args, theme, context);
+		},
+
+		renderResult(result, { expanded }, theme, context) {
+			const options = { expanded, isError: context.isError, outputPad: context.outputPad };
+			return renderFindingReadResult(result.details, resultText(result), options, theme);
+		},
+	});
+
+	registerTool<typeof ListFindingsParams, FindingResult>({
+		name: LIST_FINDINGS_TOOL_NAME,
+		label: "List Findings",
+		description: [
+			"List the session's findings, highest priority first: each one's id, priority, key, who added it, and the start of its description.",
+			`Filter by the agent that added them, a key prefix, a minimum priority, or ids after one you have seen. Read one in full with ${GET_FINDING_TOOL_NAME}.`,
+		].join(" "),
+		promptSnippet: "List the session's findings",
+		parameters: ListFindingsParams,
+		defaultActive: bundledFindings.enabled,
+		renderShell: "self",
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return findingToolResult(await runFinding({ action: "list", ...params }, ctx));
+		},
+
+		renderCall(args, theme, context) {
+			return renderListFindingsCall(args, theme, context);
+		},
+
+		renderResult(result, { expanded }, theme, context) {
+			const options = { expanded, isError: context.isError, outputPad: context.outputPad, list: true };
+			return renderFindingReadResult(result.details, resultText(result), options, theme);
+		},
+	});
+
+	pi.registerMessageRenderer<{ findings: Finding[] }>(FINDING_NOTICE_TYPE, (message, options, theme) =>
+		message.details
+			? renderFindingNotice(message.details.findings, { ...options, lookup: (id) => findingStore.get(id) }, theme)
+			: undefined,
+	);
+
+	// --- Credentials ----------------------------------------------------------------------------------------
+
+	/** Run a credential tool: in a subagent through the parent's hub, in the orchestrator on the board itself. */
+	const runCredential = async (request: CredentialRequest, ctx: ExtensionContext): Promise<CredentialResult> => {
+		if (isSubagentProcess()) {
+			return chatClient
+				? chatClient.credential(request)
+				: { ok: false, text: "Credentials are not connected.", credentials: [] };
+		}
+		trackProject(ctx);
+		return credentialBoard.handle(ORCHESTRATOR, request);
+	};
+	const credentialToolResult = (result: CredentialResult) => ({
+		content: [{ type: "text" as const, text: result.text }],
+		details: result,
+		isError: !result.ok || undefined,
+	});
+
+	registerTool<typeof AddCredentialParams, CredentialResult>({
+		name: ADD_CREDENTIAL_TOOL_NAME,
+		label: "Add Credential",
+		description: [
+			"Store a credential you found on the session's credential store: a short label, what it is for, and the secret value. Returns its id.",
+			"Every credential is announced at once to the orchestrator and every other subagent, value included, so they can all use it.",
+			`Read a stored credential's value with ${GET_CREDENTIAL_TOOL_NAME}, and list them with ${LIST_CREDENTIALS_TOOL_NAME}.`,
+		].join(" "),
+		promptSnippet: "Store a credential for the whole session",
+		parameters: AddCredentialParams,
+		defaultActive: bundledCredentials.enabled,
+		renderShell: "self",
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return credentialToolResult(await runCredential({ action: "add", ...params }, ctx));
+		},
+
+		renderCall(args, theme, context) {
+			return renderAddCredentialCall(args, theme, context);
+		},
+
+		renderResult(result, { expanded }, theme, context) {
+			const options = { expanded, isError: context.isError, outputPad: context.outputPad };
+			return renderCredentialWriteResult(result.details, resultText(result), options, theme);
+		},
+	});
+
+	registerTool<typeof GetCredentialParams, CredentialResult>({
+		name: GET_CREDENTIAL_TOOL_NAME,
+		label: "Get Credential",
+		description: "Read credentials in full by id: label, who added it, what it is for, and the secret value.",
+		promptSnippet: "Read credentials by id",
+		parameters: GetCredentialParams,
+		defaultActive: bundledCredentials.enabled,
+		renderShell: "self",
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return credentialToolResult(await runCredential({ action: "get", ids: params.ids }, ctx));
+		},
+
+		renderCall(args, theme, context) {
+			return renderGetCredentialCall(args, theme, context);
+		},
+
+		renderResult(result, { expanded }, theme, context) {
+			const options = { expanded, isError: context.isError, outputPad: context.outputPad };
+			return renderCredentialReadResult(result.details, resultText(result), options, theme);
+		},
+	});
+
+	registerTool<typeof ListCredentialsParams, CredentialResult>({
+		name: LIST_CREDENTIALS_TOOL_NAME,
+		label: "List Credentials",
+		description: [
+			"List the session's credentials: each one's id, label, who added it, and what it is for, without the value.",
+			`Filter by the agent that added them. Read a value with ${GET_CREDENTIAL_TOOL_NAME}.`,
+		].join(" "),
+		promptSnippet: "List the session's credentials",
+		parameters: ListCredentialsParams,
+		defaultActive: bundledCredentials.enabled,
+		renderShell: "self",
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return credentialToolResult(await runCredential({ action: "list", ...params }, ctx));
+		},
+
+		renderCall(args, theme, context) {
+			return renderListCredentialsCall(args, theme, context);
+		},
+
+		renderResult(result, { expanded }, theme, context) {
+			const options = { expanded, isError: context.isError, outputPad: context.outputPad, list: true };
+			return renderCredentialReadResult(result.details, resultText(result), options, theme);
+		},
+	});
+
+	pi.registerMessageRenderer<{ credentials: Credential[] }>(CREDENTIAL_NOTICE_TYPE, (message, options, theme) =>
+		message.details
+			? renderCredentialNotice(
+					message.details.credentials,
+					{ ...options, lookup: (id) => credentialStore.get(id) },
+					theme,
+				)
 			: undefined,
 	);
 
@@ -1279,16 +1759,36 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		},
 	});
 
-	/** The heading of a wait that a chat message ended. The messages themselves follow the tool result. */
-	const chatInterruption = (unread: ChatDelivery[]): string => {
-		const senders = [...new Set(unread.map((delivery) => delivery.from))];
-		const waiting = unread
-			.filter((delivery) => delivery.awaitingReply && isAwaitingReply(delivery.id))
-			.map((delivery) => `${delivery.from} (on message ${delivery.id})`);
-		const lines = [
-			`Stopped waiting: ${senders.join(", ") || "another agent"} sent you a chat message, shown after this result.`,
-		];
-		if (waiting.length > 0) lines.push(`Blocked waiting for your reply: ${waiting.join(", ")}.`);
+	/**
+	 * The heading of a wait that a chat message or a waking finding ended. The messages and finding notices themselves
+	 * follow the tool result.
+	 */
+	const inboxInterruption = (unread: ChatDelivery[], findings: Finding[], credentials: Credential[]): string => {
+		const lines: string[] = [];
+		if (unread.length > 0 || (findings.length === 0 && credentials.length === 0)) {
+			const senders = [...new Set(unread.map((delivery) => delivery.from))];
+			lines.push(
+				`Stopped waiting: ${senders.join(", ") || "another agent"} sent you a chat message, shown after this result.`,
+			);
+			const waiting = unread
+				.filter((delivery) => delivery.awaitingReply && isAwaitingReply(delivery.id))
+				.map((delivery) => `${delivery.from} (on message ${delivery.id})`);
+			if (waiting.length > 0) lines.push(`Blocked waiting for your reply: ${waiting.join(", ")}.`);
+		}
+		if (findings.length > 0) {
+			const added = findings.map((finding) => `${finding.from} added ${finding.priority} finding ${finding.id}`);
+			lines.push(
+				`Stopped waiting: ${added.join(", ")}, shown after this result. Read it with ${GET_FINDING_TOOL_NAME}.`,
+			);
+		}
+		if (credentials.length > 0) {
+			const added = credentials.map(
+				(credential) => `${credential.from} stored credential ${credential.id} (${credential.label})`,
+			);
+			lines.push(
+				`Stopped waiting: ${added.join(", ")}, shown after this result. Read it with ${GET_CREDENTIAL_TOOL_NAME}.`,
+			);
+		}
 		lines.push(
 			`The subagents keep running. Answer it or change direction if needed; if you still want their results, call ${SUBAGENT_WAIT_TOOL_NAME} again. Status:`,
 		);
@@ -1302,7 +1802,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 			"Wait until subagents finish: the named ones, or every subagent still running or queued.",
 			"By default it returns only once ALL targets have finished.",
 			"Set returnOnFirst only to handle results one at a time as each subagent finishes.",
-			"A chat message to you ends the wait early, so you can answer it or change direction; the subagents keep running, and you may call it again to keep waiting.",
+			"A chat message to you, or a finding urgent enough to wake you, ends the wait early, so you can answer it or change direction; the subagents keep running, and you may call it again to keep waiting.",
 			`Paused subagents are not waited for, since they only continue once resumed with ${SUBAGENT_CONTROL_TOOL_NAME}.`,
 			`Returns each target's status. Then read finished subagents' results with ${SUBAGENT_RESULT_TOOL_NAME}.`,
 		].join(" "),
@@ -1362,15 +1862,15 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 				const idle = !list.some(isActive) && (params.names !== undefined || !chainsBusy);
 				return idle || (mode === "any" && list.some(isSettled));
 			};
-			// Ends when the targets finish, the call is aborted, or a chat message to the orchestrator arrives.
-			const ending = await new Promise<"done" | "aborted" | "chat">((resolve) => {
+			// Ends when the targets finish, the call is aborted, or a chat message or waking finding arrives.
+			const ending = await new Promise<"done" | "aborted" | "inbox">((resolve) => {
 				let finished = false;
-				const finish = (reason: "done" | "aborted" | "chat") => {
+				const finish = (reason: "done" | "aborted" | "inbox") => {
 					if (finished) return;
 					finished = true;
 					unsubscribe();
 					chainListeners.delete(check);
-					chatListeners.delete(onChat);
+					inboxListeners.delete(onInbox);
 					signal?.removeEventListener("abort", onAbort);
 					resolve(reason);
 				};
@@ -1379,14 +1879,14 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 					if (done()) finish("done");
 				};
 				const onAbort = () => finish("aborted");
-				const onChat = () => finish("chat");
+				const onInbox = () => finish("inbox");
 				const unsubscribe = registry.onChange(check);
 				chainListeners.add(check);
-				chatListeners.add(onChat);
+				inboxListeners.add(onInbox);
 				signal?.addEventListener("abort", onAbort, { once: true });
 				if (signal?.aborted) finish("aborted");
 				else check();
-				if (unreadChat.size > 0) finish("chat");
+				if (unreadChat.size > 0 || unreadFindings.size > 0 || unreadCredentials.size > 0) finish("inbox");
 			});
 
 			const list = [...targets.values()];
@@ -1396,14 +1896,18 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 			const heading =
 				ending === "aborted"
 					? "Stopped waiting."
-					: ending === "chat"
-						? chatInterruption([...unreadChat.values()])
+					: ending === "inbox"
+						? inboxInterruption(
+								[...unreadChat.values()],
+								[...unreadFindings.values()],
+								[...unreadCredentials.values()],
+							)
 						: paused.length > 0 && !(mode === "any" && finished.length > 0)
 							? "No target is running or queued."
 							: mode === "any"
 								? "A subagent finished."
 								: "All targets finished.";
-			const lines = [heading, ...list.map(statusLine)];
+			const lines = [heading, ...list.map(describeStatus)];
 			if (finished.length > 0) {
 				const names = finished.map((subagent) => subagent.id).join(", ");
 				lines.push(`Read results with ${SUBAGENT_RESULT_TOOL_NAME}: ${names}.`);
@@ -1479,8 +1983,9 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 				read++;
 				reported.add(subagent.key);
 				resultsRead.add(subagent.key);
+				const summary = [findingsSummary(subagent), credentialsSummary(subagent)].filter(Boolean).join("\n\n");
 				sections.push(
-					`### ${subagent.id} (${subagent.status})\n\n${truncateOutput(runOutput(toDetails(subagent)))}`,
+					`### ${subagent.id} (${subagent.status})\n\n${truncateOutput(runOutput(toDetails(subagent)))}${summary ? `\n\n${summary}` : ""}`,
 				);
 			}
 			return {
@@ -1533,8 +2038,8 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 			const pausedCount = paused.length > 0 ? `${paused.length} paused, ` : "";
 			const heading = `Subagents: ${running.length} running, ${queued.length} queued, ${pausedCount}${finished.length} finished (${unread.length} result${unread.length === 1 ? "" : "s"} not read).`;
 			const lines = subagents.map((subagent) => {
-				if (!isSettled(subagent)) return statusLine(subagent);
-				return `${statusLine(subagent)}; result ${resultsRead.has(subagent.key) ? "read" : "not read"}`;
+				if (!isSettled(subagent)) return describeStatus(subagent);
+				return `${describeStatus(subagent)}; result ${resultsRead.has(subagent.key) ? "read" : "not read"}`;
 			});
 			return {
 				content: [{ type: "text", text: [heading, ...lines].join("\n") }],
@@ -1666,9 +2171,17 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 
 	pi.on("message_start", (event) => {
 		const message = event.message;
-		if (message.role !== "custom" || message.customType !== CHAT_MESSAGE_TYPE) return;
-		const id = (message.details as ChatDelivery | undefined)?.id;
-		if (id) unreadChat.delete(id);
+		if (message.role !== "custom") return;
+		if (message.customType === CHAT_MESSAGE_TYPE) {
+			const id = (message.details as ChatDelivery | undefined)?.id;
+			if (id) unreadChat.delete(id);
+		} else if (message.customType === FINDING_NOTICE_TYPE) {
+			const findings = (message.details as { findings?: Finding[] } | undefined)?.findings ?? [];
+			for (const finding of findings) unreadFindings.delete(finding.id);
+		} else if (message.customType === CREDENTIAL_NOTICE_TYPE) {
+			const credentials = (message.details as { credentials?: Credential[] } | undefined)?.credentials ?? [];
+			for (const credential of credentials) unreadCredentials.delete(credential.id);
+		}
 	});
 
 	// A subagent's own prompt replaces pi's default one, which drops its rules and skills sections.
@@ -1699,9 +2212,23 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		const agents = discoverAgents(ctx.cwd, ctx.isProjectTrusted()).agents;
 		if (agents.length === 0) return;
 		const lines = agents.map((agent) => `- ${agent.name}: ${agent.description}`);
+		const findings = pi.getActiveTools().includes(GET_FINDING_TOOL_NAME)
+			? [
+					"",
+					`Subagents record findings on a shared board. You are told about urgent ones by id; read them with ${GET_FINDING_TOOL_NAME}, and see them all with ${LIST_FINDINGS_TOOL_NAME}.`,
+				]
+			: [];
+		const credentials = pi.getActiveTools().includes(GET_CREDENTIAL_TOOL_NAME)
+			? [
+					"",
+					`Subagents share credentials they find. Each is announced to you with its value; read any later with ${GET_CREDENTIAL_TOOL_NAME}, and see them all with ${LIST_CREDENTIALS_TOOL_NAME}.`,
+				]
+			: [];
 		event.systemPromptOptions.sections[SUBAGENTS_SECTION] = [
 			"Agents you can start with the subagent tool:",
 			...lines,
+			...findings,
+			...credentials,
 		].join("\n");
 	});
 
@@ -1713,6 +2240,8 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		orchestratorBusy = false;
 		// A steer the run never delivered (dropped by an abort, say) must not end every later wait at once.
 		unreadChat.clear();
+		unreadFindings.clear();
+		unreadCredentials.clear();
 		if (pendingNotices.length > 0 && !noticeTimer) flushNotices();
 	});
 
@@ -1720,6 +2249,10 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		resetBackground();
 		registry.clear();
 		closeChat();
+		// A resumed session gets its findings and credentials back; ids continue after the highest one.
+		const boardDir = subagentId() ? undefined : subagentSessionDir(ctx);
+		findingStore.open(boardDir ? path.join(boardDir, FINDINGS_FILE) : undefined);
+		credentialStore.open(boardDir ? path.join(boardDir, CREDENTIALS_FILE) : undefined);
 		lastViewed = undefined;
 		stopListening?.();
 		stopListening = undefined;
@@ -1729,18 +2262,33 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		const socket = pi.getFlag(CHAT_FLAG);
 		const token = process.env[CHAT_TOKEN_ENV];
 		if (typeof socket === "string" && socket !== "" && token) {
-			const client = new ChatClient(socket, token, (delivery) => {
-				chatSenders.set(delivery.id, delivery.from);
-				pi.sendMessage(
-					{
-						customType: CHAT_MESSAGE_TYPE,
-						content: frameMessage(delivery),
-						display: true,
-						details: delivery,
-					},
-					{ deliverAs: "steer" },
-				);
-			});
+			const client = new ChatClient(
+				socket,
+				token,
+				(delivery) => {
+					chatSenders.set(delivery.id, delivery.from);
+					pi.sendMessage(
+						{
+							customType: CHAT_MESSAGE_TYPE,
+							content: frameMessage(delivery),
+							display: true,
+							details: delivery,
+						},
+						{ deliverAs: "steer" },
+					);
+				},
+				(credential) => {
+					pi.sendMessage(
+						{
+							customType: CREDENTIAL_NOTICE_TYPE,
+							content: frameCredentialNotice([credential]),
+							display: true,
+							details: { credentials: [credential] },
+						},
+						{ deliverAs: "steer" },
+					);
+				},
+			);
 			try {
 				await client.connect();
 				chatClient = client;
@@ -1755,7 +2303,7 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		ctx.ui.setWidget(
 			DOCK_WIDGET_KEY,
 			(tui, theme) => {
-				dock = new SubagentDock(tui, theme, registry);
+				dock = new SubagentDock(tui, theme, registry, findingStore, credentialStore);
 				return dock;
 			},
 			{ placement: "belowEditor" },
@@ -1779,6 +2327,8 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 							isAwaitingReply,
 							chatSenderOf,
 							chatLog,
+							findings: findingStore,
+							credentials: credentialStore,
 							toolRenderers,
 							close: () => done(undefined),
 						}),
@@ -1818,6 +2368,8 @@ function setupSubagents(pi: ExtensionAPI, options: SubagentExtensionOptions): vo
 		resetBackground();
 		registry.clear();
 		closeChat();
+		findingStore.open(undefined);
+		credentialStore.open(undefined);
 		stopListening?.();
 		stopListening = undefined;
 		if (ctx.hasUI) ctx.ui.setWidget(DOCK_WIDGET_KEY, undefined);

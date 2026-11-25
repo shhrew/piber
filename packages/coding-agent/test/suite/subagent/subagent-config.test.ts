@@ -267,6 +267,13 @@ describe("subagent run planning", () => {
 			"load_skill",
 			"chat_send",
 			"chat_peers",
+			"add_finding",
+			"update_finding",
+			"get_finding",
+			"list_findings",
+			"add_credential",
+			"get_credential",
+			"list_credentials",
 		]);
 		expect(plan.skillGroups).toEqual(["review", "extra"]);
 		expect(plan.systemPrompt).toContain("You are a senior code reviewer.");
@@ -282,7 +289,18 @@ describe("subagent run planning", () => {
 
 		const plan = planSubagentRun(planner, {}, subagentsDir);
 
-		expect(plan.tools).toEqual(["read", "chat_send", "chat_peers"]);
+		expect(plan.tools).toEqual([
+			"read",
+			"chat_send",
+			"chat_peers",
+			"add_finding",
+			"update_finding",
+			"get_finding",
+			"list_findings",
+			"add_credential",
+			"get_credential",
+			"list_credentials",
+		]);
 		expect(plan.systemPrompt).not.toContain("## Pinned skills");
 	});
 

@@ -1,10 +1,15 @@
 /**
- * The agent view: a full-screen overlay with two tabs, Agents and Chat.
+ * The agent view: a full-screen overlay with four tabs, Agents, Chat, Findings, and Credentials.
  *
  * Agents: the main session and its subagents. Up/down select, Enter opens, the chat-tab key shows Chat, Esc or
  * the agent-view key closes.
  * Chat: every chat message in the session, one compact entry each, scrolled like a transcript. The agent-view
- * key returns to Agents; Esc closes.
+ * key returns to Agents, the chat-tab key shows Findings; Esc closes.
+ * Findings: every finding in the session, highest priority first. Up/down select, Enter shows or hides the
+ * selected finding's description and metadata, the chat-tab key shows Credentials, the agent-view key returns to
+ * Chat; Esc closes.
+ * Credentials: every credential in the session. Up/down select, Enter shows or hides the selected credential's
+ * value, the agent-view key returns to Findings; Esc closes.
  * Subagent: live transcript with an input line. Enter steers a running subagent, resumes a paused one with the
  * input, or starts a follow-up run on an idle one; Esc aborts a running or paused subagent or goes back; the agent-view key goes back. Back is
  * the list, or the main session when the subagent was opened from the dock.
@@ -37,9 +42,12 @@ import { UserMessageComponent } from "../../modes/interactive/components/user-me
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import { CHAT_SEND_TOOL_NAME, type ChatDelivery, type ChatLog, type ChatLogEntry, type SendOutcome } from "./chat.ts";
 import type { Subagent } from "./child.ts";
+import type { CredentialStore } from "./credentials.ts";
+import { compareFindings, type FindingStore } from "./findings.ts";
 import type { SubagentRegistry } from "./registry.ts";
 import {
 	formatUsageStats,
+	priorityColor,
 	renderChatMessage,
 	renderChatSendCall,
 	renderChatSendResult,
@@ -47,7 +55,7 @@ import {
 	statusIcon,
 } from "./render.ts";
 
-type Tab = "agents" | "chat";
+type Tab = "agents" | "chat" | "findings" | "credentials";
 
 /** Lines kept from the previous page when paging, as in the fullscreen transcript. */
 const PAGE_SCROLL_OVERLAP = 4;
@@ -141,6 +149,10 @@ export interface AgentViewOptions {
 	chatSenderOf?: (id: string) => string | undefined;
 	/** The session's chat messages, for the Chat tab. */
 	chatLog?: ChatLog;
+	/** The session's findings, for the Findings tab. */
+	findings?: FindingStore;
+	/** The session's credentials, for the Credentials tab. */
+	credentials?: CredentialStore;
 	/** Renderers of extension tools by name. Built-in tools use their own; others fall back to plain text. */
 	toolRenderers?: ReadonlyMap<string, ToolRenderers>;
 }
@@ -168,6 +180,16 @@ export class AgentView implements Component {
 	private readonly chatLog: ChatLog | undefined;
 	private readonly toolRenderers: ReadonlyMap<string, ToolRenderers> | undefined;
 	private readonly chatScroll = new TranscriptScroll();
+	private readonly findings: FindingStore | undefined;
+	private readonly credentials: CredentialStore | undefined;
+	/** The selected finding's id; undefined selects the first. */
+	private selectedFinding: number | undefined;
+	/** Findings whose description and metadata are shown. */
+	private readonly expandedFindings = new Set<number>();
+	/** The selected credential's id; undefined selects the first. */
+	private selectedCredential: number | undefined;
+	/** Credentials whose value is shown. */
+	private readonly expandedCredentials = new Set<number>();
 	private tab: Tab = "agents";
 	private scrollbarTimer: NodeJS.Timeout | undefined;
 	/** Opened straight onto a subagent, as from the dock: going back closes the view instead of showing the list. */
@@ -206,12 +228,18 @@ export class AgentView implements Component {
 		this.input.focused = true;
 		this.input.onSubmit = (value) => this.submit(value);
 		this.chatLog = options.chatLog;
+		this.findings = options.findings;
+		this.credentials = options.credentials;
 		this.toolRenderers = options.toolRenderers;
 		const stopRegistry = registry.onChange(() => this.tui.requestRender());
 		const stopChat = this.chatLog?.onChange(() => this.tui.requestRender());
+		const stopFindings = this.findings?.onChange(() => this.tui.requestRender());
+		const stopCredentials = this.credentials?.onChange(() => this.tui.requestRender());
 		this.unsubscribe = () => {
 			stopRegistry();
 			stopChat?.();
+			stopFindings?.();
+			stopCredentials?.();
 		};
 		this.animation = setInterval(() => {
 			if (this.registry.list().some((subagent) => subagent.isRunning)) this.tui.requestRender();
@@ -237,6 +265,8 @@ export class AgentView implements Component {
 	handleInput(data: string): void {
 		if (this.open) this.handleSessionInput(data, this.open);
 		else if (this.tab === "chat") this.handleChatInput(data);
+		else if (this.tab === "findings") this.handleFindingsInput(data);
+		else if (this.tab === "credentials") this.handleCredentialsInput(data);
 		else this.handleListInput(data);
 		this.tui.requestRender();
 	}
@@ -247,6 +277,10 @@ export class AgentView implements Component {
 			this.scrollTranscript(() => this.scroll.scrollBy(event.wheelDelta ?? 0));
 		} else if (this.tab === "chat") {
 			this.scrollTranscript(() => this.chatScroll.scrollBy(event.wheelDelta ?? 0));
+		} else if (this.tab === "findings") {
+			this.moveFindingSelection(Math.sign(event.wheelDelta));
+		} else if (this.tab === "credentials") {
+			this.moveCredentialSelection(Math.sign(event.wheelDelta));
 		} else {
 			this.moveSelection(Math.sign(event.wheelDelta), false);
 		}
@@ -259,7 +293,11 @@ export class AgentView implements Component {
 			? this.renderSession(width, height, this.open)
 			: this.tab === "chat"
 				? this.renderChat(width, height)
-				: this.renderList(width, height);
+				: this.tab === "findings"
+					? this.renderFindings(width, height)
+					: this.tab === "credentials"
+						? this.renderCredentials(width, height)
+						: this.renderList(width, height);
 		while (lines.length < height) lines.push("");
 		return lines.slice(0, height).map((line) => truncateToWidth(line, width));
 	}
@@ -325,8 +363,78 @@ export class AgentView implements Component {
 	private handleChatInput(data: string): void {
 		const kb = this.keybindings;
 		if (kb.matches(data, "app.agents.view")) this.tab = "agents";
+		else if (kb.matches(data, "app.agents.chat")) this.tab = "findings";
 		else if (kb.matches(data, "tui.select.cancel")) this.close();
 		else this.handleScrollKey(data, this.chatScroll);
+	}
+
+	private handleFindingsInput(data: string): void {
+		const kb = this.keybindings;
+		if (kb.matches(data, "app.agents.view")) {
+			this.tab = "chat";
+		} else if (kb.matches(data, "app.agents.chat")) {
+			this.tab = "credentials";
+		} else if (kb.matches(data, "tui.select.cancel")) {
+			this.close();
+		} else if (kb.matches(data, "tui.select.up")) {
+			this.moveFindingSelection(-1);
+		} else if (kb.matches(data, "tui.select.down")) {
+			this.moveFindingSelection(1);
+		} else if (kb.matches(data, "tui.select.confirm")) {
+			const id = this.currentFinding();
+			if (id === undefined) return;
+			if (this.expandedFindings.has(id)) this.expandedFindings.delete(id);
+			else this.expandedFindings.add(id);
+		}
+	}
+
+	/** Findings in display order: highest priority first, then oldest first. */
+	private sortedFindings() {
+		return (this.findings?.list() ?? []).sort(compareFindings);
+	}
+
+	/** The selected finding's id, falling back to the first when the selection is gone. */
+	private currentFinding(): number | undefined {
+		const findings = this.sortedFindings();
+		return findings.find((finding) => finding.id === this.selectedFinding)?.id ?? findings[0]?.id;
+	}
+
+	private moveFindingSelection(delta: number): void {
+		const ids = this.sortedFindings().map((finding) => finding.id);
+		if (ids.length === 0) return;
+		const current = Math.max(0, ids.indexOf(this.currentFinding() ?? -1));
+		this.selectedFinding = ids[Math.max(0, Math.min(ids.length - 1, current + delta))];
+	}
+
+	private handleCredentialsInput(data: string): void {
+		const kb = this.keybindings;
+		if (kb.matches(data, "app.agents.view")) {
+			this.tab = "findings";
+		} else if (kb.matches(data, "tui.select.cancel")) {
+			this.close();
+		} else if (kb.matches(data, "tui.select.up")) {
+			this.moveCredentialSelection(-1);
+		} else if (kb.matches(data, "tui.select.down")) {
+			this.moveCredentialSelection(1);
+		} else if (kb.matches(data, "tui.select.confirm")) {
+			const id = this.currentCredential();
+			if (id === undefined) return;
+			if (this.expandedCredentials.has(id)) this.expandedCredentials.delete(id);
+			else this.expandedCredentials.add(id);
+		}
+	}
+
+	/** The selected credential's id, falling back to the first when the selection is gone. */
+	private currentCredential(): number | undefined {
+		const credentials = this.credentials?.list() ?? [];
+		return credentials.find((credential) => credential.id === this.selectedCredential)?.id ?? credentials[0]?.id;
+	}
+
+	private moveCredentialSelection(delta: number): void {
+		const ids = (this.credentials?.list() ?? []).map((credential) => credential.id);
+		if (ids.length === 0) return;
+		const current = Math.max(0, ids.indexOf(this.currentCredential() ?? -1));
+		this.selectedCredential = ids[Math.max(0, Math.min(ids.length - 1, current + delta))];
 	}
 
 	/** Scroll `scroll` for the `tui.altScreen.*` keys. False when `data` is not one of them. */
@@ -405,7 +513,12 @@ export class AgentView implements Component {
 			name === this.tab ? theme.fg("accent", theme.bold(label)) : theme.fg("dim", label);
 		const count = this.chatLog?.entries().length ?? 0;
 		const chat = tab("chat", "Chat") + (count > 0 ? theme.fg("dim", ` ${count}`) : "");
-		return [` ${tab("agents", "Agents")}   ${chat}`, theme.fg("dim", ` ${hint}`), ""];
+		const findingCount = this.findings?.list().length ?? 0;
+		const findings = tab("findings", "Findings") + (findingCount > 0 ? theme.fg("dim", ` ${findingCount}`) : "");
+		const credentialCount = this.credentials?.list().length ?? 0;
+		const credentials =
+			tab("credentials", "Credentials") + (credentialCount > 0 ? theme.fg("dim", ` ${credentialCount}`) : "");
+		return [` ${tab("agents", "Agents")}   ${chat}   ${findings}   ${credentials}`, theme.fg("dim", ` ${hint}`), ""];
 	}
 
 	private renderList(width: number, height: number): string[] {
@@ -491,13 +604,100 @@ export class AgentView implements Component {
 				: this.renderChatEntries(entries, bodyWidth);
 		const below = this.chatScroll.linesBelow;
 		const title = this.renderTitle(
-			["← agents · pgup/pgdn/wheel scroll · esc close", ...(below > 0 ? [`↓ ${below} more`] : [])].join(" · "),
+			["← agents · → findings · pgup/pgdn/wheel scroll · esc close", ...(below > 0 ? [`↓ ${below} more`] : [])].join(
+				" · ",
+			),
 		);
 		const bodyHeight = Math.max(1, height - title.length);
 		const top = this.chatScroll.layout(body.length, bodyHeight);
 		const visible = body.slice(top, top + bodyHeight);
 		while (visible.length < bodyHeight) visible.push("");
 		return [...title, ...this.withScrollbar(visible, bodyWidth, body.length, top, this.chatScroll)];
+	}
+
+	/**
+	 * One row per finding: ` HH:MM #id priority from key  description`, the selected one marked `›`. An expanded
+	 * finding shows its whole description and its metadata under the row. Long lists scroll to keep the selection
+	 * in view.
+	 */
+	private renderFindings(width: number, height: number): string[] {
+		const theme = this.theme;
+		const title = this.renderTitle("↑↓ select · enter show details · ← chat · → credentials · esc close");
+		const findings = this.sortedFindings();
+		if (findings.length === 0) return [...title, theme.fg("muted", "  No findings in this session yet.")];
+		const selected = this.currentFinding();
+		const idWidth = Math.max(...findings.map((finding) => `#${finding.id}`.length));
+		const fromWidth = Math.min(20, Math.max(...findings.map((finding) => finding.from.length)));
+		const priorityWidth = Math.max(...findings.map((finding) => finding.priority.length));
+		const indent = "      ";
+		const lines: string[] = [];
+		/** The last line of the selected finding, so its details stay in view when expanded. */
+		let selectedLine = 0;
+		for (const finding of findings) {
+			const isSelected = finding.id === selected;
+			const marker = isSelected ? theme.fg("accent", "›") : " ";
+			const id = theme.fg("dim", `#${finding.id}`.padEnd(idWidth));
+			const priority = theme.fg(priorityColor(finding.priority), finding.priority.padEnd(priorityWidth));
+			const from = theme.fg("accent", truncateToWidth(finding.from, fromWidth).padEnd(fromWidth));
+			const key = isSelected ? theme.bold(finding.key) : finding.key;
+			const row = `${marker}${theme.fg("dim", clockTime(finding.updatedAt))} ${id} ${priority} ${from} ${key}  ${theme.fg("dim", oneLine(finding.description))}`;
+			lines.push(truncateToWidth(row, width));
+			if (this.expandedFindings.has(finding.id)) {
+				const room = Math.max(10, width - indent.length);
+				for (const line of wrapTextWithAnsi(finding.description, room)) lines.push(indent + line);
+				for (const [name, value] of Object.entries(finding.metadata)) {
+					for (const line of wrapTextWithAnsi(`${theme.fg("muted", `${name}:`)} ${String(value)}`, room)) {
+						lines.push(indent + line);
+					}
+				}
+				if (finding.revision > 1) lines.push(indent + theme.fg("dim", `revision ${finding.revision}`));
+			}
+			if (isSelected) selectedLine = lines.length - 1;
+		}
+		const rows = Math.max(1, height - title.length);
+		const start = Math.max(0, Math.min(selectedLine - rows + 1, lines.length - rows));
+		return [...title, ...lines.slice(start, start + rows)];
+	}
+
+	/**
+	 * One row per credential: ` HH:MM #id label from  purpose`, the selected one marked `\u203a`. An expanded
+	 * credential shows its value under the row. Long lists scroll to keep the selection in view.
+	 */
+	private renderCredentials(width: number, height: number): string[] {
+		const theme = this.theme;
+		const title = this.renderTitle(
+			"\u2191\u2193 select \u00b7 enter show value \u00b7 \u2190 findings \u00b7 esc close",
+		);
+		const credentials = this.credentials?.list() ?? [];
+		if (credentials.length === 0) return [...title, theme.fg("muted", "  No credentials in this session yet.")];
+		const selected = this.currentCredential();
+		const idWidth = Math.max(...credentials.map((credential) => `#${credential.id}`.length));
+		const fromWidth = Math.min(20, Math.max(...credentials.map((credential) => credential.from.length)));
+		const labelWidth = Math.min(28, Math.max(...credentials.map((credential) => credential.label.length)));
+		const indent = "      ";
+		const lines: string[] = [];
+		/** The last line of the selected credential, so its value stays in view when expanded. */
+		let selectedLine = 0;
+		for (const credential of credentials) {
+			const isSelected = credential.id === selected;
+			const marker = isSelected ? theme.fg("accent", "\u203a") : " ";
+			const id = theme.fg("dim", `#${credential.id}`.padEnd(idWidth));
+			const labelText = truncateToWidth(credential.label, labelWidth).padEnd(labelWidth);
+			const label = theme.fg("accent", isSelected ? theme.bold(labelText) : labelText);
+			const from = theme.fg("accent", truncateToWidth(credential.from, fromWidth).padEnd(fromWidth));
+			const row = `${marker}${theme.fg("dim", clockTime(credential.createdAt))} ${id} ${label} ${from}  ${theme.fg("dim", oneLine(credential.purpose))}`;
+			lines.push(truncateToWidth(row, width));
+			if (this.expandedCredentials.has(credential.id)) {
+				const room = Math.max(10, width - indent.length);
+				for (const line of wrapTextWithAnsi(`${theme.fg("muted", "value:")} ${credential.value}`, room)) {
+					lines.push(indent + line);
+				}
+			}
+			if (isSelected) selectedLine = lines.length - 1;
+		}
+		const rows = Math.max(1, height - title.length);
+		const start = Math.max(0, Math.min(selectedLine - rows + 1, lines.length - rows));
+		return [...title, ...lines.slice(start, start + rows)];
 	}
 
 	/**
